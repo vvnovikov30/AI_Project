@@ -23,3 +23,9 @@ htmlcov/
 # Временные файлы Office и Windows
 ~$*
 Thumbs.db*.html
+*.html
+
+# Общее хранилище данных и генерируемые отчеты
+/data/
+*.xlsx
+*.pdf
