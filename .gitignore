@@ -1,1 +1,25 @@
 .aider*
+# Виртуальные окружения
+.venv/
+venv/
+ENV/
+
+# Кэш Python и pytest
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.hypothesis/
+
+# Отчеты о покрытии
+.coverage
+htmlcov/
+# Внешние документы и аналитика
+/*.md
+!sst-audit/**/*.md
+/РИД_патент/
+/testsmet/
+*.docx
+*.json
+# Временные файлы Office и Windows
+~$*
+Thumbs.db*.html
