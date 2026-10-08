@@ -9,55 +9,87 @@ class UnitNormalizer:
 
     @staticmethod
     def normalize(raw_unit: str, base_qty: Decimal) -> Tuple[UnitClass, Decimal, Decimal]:
-        u_lower = raw_unit.lower().strip()
-        
-        # Area
-        if u_lower in ("м2", "кв. м", "м.кв."):
+        if not raw_unit:
+            return UnitClass.UNKNOWN, base_qty, Decimal("1.0")
+
+        # 1. Первичная нормализация: нижний регистр, схлопывание пробелов и неразрывных пробелов
+        u_raw = re.sub(r"\s+", " ", str(raw_unit).replace("\xa0", " ")).lower().strip()
+
+        # 2. Вспомогательная форма без точек для гибкого сопоставления ('10 шт.' -> '10 шт')
+        u_no_dots = re.sub(r"\s+", " ", u_raw.replace(".", "")).strip()
+
+        # --- Площадь (AREA) ---
+        if u_raw in ("м2", "кв. м", "кв.м", "м.кв.") or u_no_dots in ("кв м", "м кв"):
             return UnitClass.AREA, base_qty, Decimal("1.0")
-        if u_lower == "100 м2":
+        if u_raw in ("100 м2", "100м2", "100 кв. м", "100 кв.м") or u_no_dots in ("100 кв м", "100кв м"):
             return UnitClass.AREA, base_qty * Decimal("100.0"), Decimal("100.0")
-        if u_lower == "1000 м2":
+        if u_raw in ("1000 м2", "1000м2", "1000 кв. м") or u_no_dots == "1000 кв м":
             return UnitClass.AREA, base_qty * Decimal("1000.0"), Decimal("1000.0")
-            
-        # Volume
-        if u_lower in ("м3", "куб. м", "м.куб."):
+
+        # --- Объем (VOLUME) ---
+        if u_raw in ("м3", "куб. м", "куб.м", "м.куб.") or u_no_dots in ("куб м", "м куб"):
             return UnitClass.VOLUME, base_qty, Decimal("1.0")
-        if u_lower == "10 м3":
+        if u_raw in ("10 м3", "10м3", "10 куб. м") or u_no_dots == "10 куб м":
             return UnitClass.VOLUME, base_qty * Decimal("10.0"), Decimal("10.0")
-        if u_lower == "100 м3":
+        if u_raw in ("100 м3", "100м3", "100 куб. м") or u_no_dots == "100 куб м":
             return UnitClass.VOLUME, base_qty * Decimal("100.0"), Decimal("100.0")
-            
-        # Mass
-        if u_lower in ("кг", "килограмм"):
+
+        # --- Масса (MASS) ---
+        if u_raw in ("кг", "килограмм") or u_no_dots == "кг":
             return UnitClass.MASS, base_qty, Decimal("1.0")
-        if u_lower in ("т", "тн"):
+        if u_raw in ("т", "тн", "тонн", "тонна") or u_no_dots in ("т", "тн"):
             return UnitClass.MASS, base_qty * Decimal("1000.0"), Decimal("1000.0")
-            
-        # Count
-        if u_lower in ("шт", "штук"):
+
+        # --- Длина (LENGTH) ---
+        if u_raw in ("м", "м.", "м.п.", "пог. м", "пог.м") or u_no_dots in ("м", "мп", "пог м"):
+            return UnitClass.LENGTH, base_qty, Decimal("1.0")
+        if u_raw in ("100 м", "100м", "100 м.", "100 м.п.", "100 пог. м") or u_no_dots in ("100 м", "100м", "100 мп", "100 пог м"):
+            return UnitClass.LENGTH, base_qty * Decimal("100.0"), Decimal("100.0")
+        if u_raw in ("км", "1000 м", "1000м") or u_no_dots in ("км", "1000 м", "1000м"):
+            return UnitClass.LENGTH, base_qty * Decimal("1000.0"), Decimal("1000.0")
+
+        # --- Количество / Штучные изделия (COUNT) ---
+        # Базовая единица (1 шт / компл / устройство / wm)
+        if (
+            u_raw in ("шт", "шт.", "штук", "штука", "1 шт", "1 шт.", "устройство", "1 устройство", "компл", "компл.", "комплект", "wm")
+            or u_no_dots in ("шт", "1 шт", "устройство", "1 устройство", "компл", "комплект")
+        ):
             return UnitClass.COUNT, base_qty, Decimal("1.0")
-        if u_lower == "100 шт":
+
+        # 10 шт. (монтажные расценки ТСН/ГЭСН)
+        if u_raw in ("10 шт", "10 шт.", "10шт") or u_no_dots in ("10 шт", "10шт"):
+            return UnitClass.COUNT, base_qty * Decimal("10.0"), Decimal("10.0")
+
+        # 100 шт. / 100 перемычек
+        if (
+            u_raw in ("100 шт", "100 шт.", "100шт", "100 перемычек")
+            or u_no_dots in ("100 шт", "100шт", "100 перемычек")
+        ):
             return UnitClass.COUNT, base_qty * Decimal("100.0"), Decimal("100.0")
-        if u_lower == "1000 шт" or u_lower == "тыс. шт":
+
+        # 1000 шт. / тыс. шт
+        if (
+            u_raw in ("1000 шт", "1000 шт.", "1000шт", "тыс. шт", "тыс.шт", "тыс шт")
+            or u_no_dots in ("1000 шт", "1000шт", "тыс шт")
+        ):
             return UnitClass.COUNT, base_qty * Decimal("1000.0"), Decimal("1000.0")
-            
+
         return UnitClass.UNKNOWN, base_qty, Decimal("1.0")
 
 
 class DimensionLockExtractor:
-    """Извлечение технических параметров (DN, PN, класс бетона, диаметр арматуры) через RegEx."""
+    """Извлечение технических параметров (DN, PN, класс бетона, диаметр арматуры/труб) через RegEx."""
 
     @staticmethod
     def extract(text: str) -> Dict[str, str]:
-        """Извлекает ключевые технические параметры (DN, PN, класс бетона, диаметр арматуры) через RegEx."""
         dims: Dict[str, str] = {}
         upper_text = text.upper()
 
-        dn_match = re.search(r"(?:DN|ДУ)\s*(\d+)", upper_text)
+        dn_match = re.search(r"(?:DN|ДУ)\s*[-=:]?\s*(\d+)", upper_text)
         if dn_match:
             dims["DN"] = dn_match.group(1)
 
-        pn_match = re.search(r"(?:PN|РУ)\s*(\d+)", upper_text)
+        pn_match = re.search(r"(?:PN|РУ)\s*[-=:]?\s*(\d+)", upper_text)
         if pn_match:
             dims["PN"] = pn_match.group(1)
 
@@ -71,8 +103,8 @@ class DimensionLockExtractor:
             if m_match:
                 dims["CONCRETE"] = f"М{m_match.group(1)}"
 
-        # Учет верхнего регистра для знаков ø (Ø) и ф (Ф) после вызова .upper()
-        rebar_match = re.search(r"(?:[øØфФdD]|диаметр)\s*(\d+(?:\.\d+)?)", upper_text)
+        # Диаметры: арматура (ø, ф), трубы и гофротрубы (d-20, диам 20, диаметр 20)
+        rebar_match = re.search(r"(?:[ØøФф]|(?:\b(?:D|ДИАМЕТР|ДИАМ)\b))\s*[-=:]?\s*(\d+(?:\.\d+)?)", upper_text)
         if rebar_match:
             dims["REBAR_DIA"] = rebar_match.group(1)
 
