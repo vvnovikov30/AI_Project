@@ -9,7 +9,7 @@ from collections.abc import Generator
 from decimal import Decimal
 import os
 import sqlite3
-from typing import Any
+from typing import Any, TypeAlias
 
 from hypothesis import Phase, settings
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -45,13 +45,13 @@ _selected_profile: str = os.getenv("HYPOTHESIS_PROFILE", "dev")
 settings.load_profile(_selected_profile)
 
 # ----------------------------------------------------------------------
-# 2. PEP 695 Псевдонимы типов и Pydantic v2 DTO для тестов
+# 2. Обратно-совместимые псевдонимы типов (Python 3.10+) и Pydantic v2 DTO
 # ----------------------------------------------------------------------
 
-type Quantity = Decimal
-type Multiplier = Decimal
-type Price = Decimal
-type DimensionDict = dict[str, str]
+Quantity: TypeAlias = Decimal
+Multiplier: TypeAlias = Decimal
+Price: TypeAlias = Decimal
+DimensionDict: TypeAlias = dict[str, str]
 
 
 class StrictCellPointerSchema(BaseModel):
