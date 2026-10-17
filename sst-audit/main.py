@@ -18,14 +18,20 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 import sqlite3
+import sys
 from typing import Any, Final, Optional, Sequence
 import uuid
 
+from rich.console import Console
+from rich.table import Table
+
 import cli_review
 import db
+import dispatcher
 import exporter
 from evaluator import DiscrepancyDetector
 from matcher import CascadeMatcher
@@ -45,6 +51,7 @@ MATCH_METHOD_CASCADE: Final[str] = "FUZZY_CASCADE"
 MATCH_METHOD_NO_CANDIDATE: Final[str] = "NO_CANDIDATE"
 MATCH_METHOD_NO_MATCH: Final[str] = "NO_MATCH"
 MATCH_METHOD_REVERSE: Final[str] = "REVERSE_PASS"
+BATCH_ERROR_LOG: Final[str] = "batch_errors.log"
 
 RULE_BY_SEVERITY: Final[dict[CollisionSeverity, str]] = {
     CollisionSeverity.CRITICAL: "VOLUME_DELTA_CRITICAL",
@@ -63,6 +70,7 @@ class SessionConfig:
     smeta_path: str
     db_path: str = db.DEFAULT_DB_PATH
     session_id: Optional[str] = None
+    smeta_sheet: Optional[str] = None
 
     def resolved_session_id(self) -> str:
         """Возвращает заданный идентификатор либо генерирует новый."""
@@ -330,7 +338,11 @@ def run_pipeline(
     if rd_items is None:
         rd_items = PDFSpecParser(config.rd_path).extract_items()
     if smeta_items is None:
-        smeta_items = LSRParser(config.smeta_path).parse()
+        smeta_parser = LSRParser(config.smeta_path)
+        if config.smeta_sheet is None:
+            smeta_items = smeta_parser.parse()
+        else:
+            smeta_items = smeta_parser.parse(sheet_name=config.smeta_sheet)
 
     rd_items = list(rd_items)
     smeta_items = list(smeta_items)
@@ -343,6 +355,7 @@ def run_pipeline(
             config.project_name,
             config.rd_path,
             config.smeta_path,
+            smeta_sheet=config.smeta_sheet,
         )
         rd_saved = db.save_rd_items(
             conn,
@@ -444,6 +457,209 @@ def run_pipeline(
     )
 
 
+@dataclass(frozen=True)
+class BatchSectionResult:
+    """Результат обработки одного раздела в ночном пакетном режиме."""
+
+    pdf_path: Path
+    sheet_name: str
+    confidence: float
+    session_id: str
+    result: Optional[PipelineResult] = None
+    error: Optional[str] = None
+
+    @property
+    def succeeded(self) -> bool:
+        """Признак успешной обработки раздела."""
+        return self.error is None and self.result is not None
+
+
+@dataclass(frozen=True)
+class BatchSummary:
+    """Итоговая статистика пакетного прогона."""
+
+    total: int
+    succeeded: int
+    failed: int
+    hitl_pending: int
+    sections: tuple[BatchSectionResult, ...] = ()
+    output_path: Optional[Path] = None
+
+    @property
+    def successful_session_ids(self) -> list[str]:
+        """Идентификаторы успешно завершенных сессий."""
+        return [
+            section.session_id for section in self.sections if section.succeeded
+        ]
+
+
+def _append_batch_error(
+    log_path: Path,
+    pdf_path: Path,
+    sheet_name: str,
+    error: BaseException,
+) -> None:
+    """Пишет ошибку раздела в stderr и накопительный ``batch_errors.log``."""
+    message = f"{type(error).__name__}: {error}"
+    print(
+        f"[ERROR] {pdf_path.name} -> {sheet_name}: {message}",
+        file=sys.stderr,
+    )
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as stream:
+            stream.write(
+                f"{datetime.now().isoformat(timespec='seconds')}\t"
+                f"{pdf_path}\t{sheet_name}\t{message}\n"
+            )
+    except OSError as log_error:
+        print(
+            f"[ERROR] Не удалось записать {log_path}: {log_error}",
+            file=sys.stderr,
+        )
+
+
+def _render_mapping_table(
+    pairs: Sequence[tuple[Path, str, float]],
+    console: Console,
+) -> None:
+    """Показывает сводную таблицу сопоставления PDF и листов сметы."""
+    table = Table(
+        title="Сопоставление томов РД и листов сметы",
+        show_lines=False,
+    )
+    table.add_column("Том РД (PDF)", style="cyan", no_wrap=False)
+    table.add_column("Лист сметы", style="magenta")
+    table.add_column("Уверенность", justify="right", style="green")
+
+    for pdf_path, sheet_name, confidence in pairs:
+        table.add_row(pdf_path.name, sheet_name, f"{confidence:.1f}%")
+    console.print(table)
+
+
+def run_batch_pipeline(
+    conn: sqlite3.Connection,
+    *,
+    project_name: str,
+    batch_dir: str | Path,
+    smeta_path: str | Path,
+    db_path: str = db.DEFAULT_DB_PATH,
+    headless: bool = True,
+    reviewer: str = "Оператор ПТО",
+    output_path: Optional[str | Path] = None,
+    error_log_path: str | Path = BATCH_ERROR_LOG,
+    console: Optional[Console] = None,
+    project_dispatcher: Optional[dispatcher.ProjectDispatcher] = None,
+) -> BatchSummary:
+    """Обрабатывает папку с томами РД в пакетном (ночном) режиме.
+
+    Один раздел = изолированная сессия SQLite. Ошибка парсинга или расчета
+    одного тома не прерывает обработку остальных: она пишется в stderr и
+    ``batch_errors.log``. В headless-режиме HITL-опрос не запускается,
+    непонятные связи остаются в БД со статусом ``HITL_PENDING`` до утра.
+    """
+    console = console or Console()
+    smeta_file = Path(smeta_path)
+    resolver = project_dispatcher or dispatcher.ProjectDispatcher()
+
+    pairs = resolver.match_volumes(Path(batch_dir), smeta_file)
+    if not pairs:
+        console.print(
+            "[yellow]Не найдено ни одной пары PDF ↔ лист ЛС. "
+            "Проверьте имена томов и заголовки A8/A9 сметы.[/yellow]"
+        )
+        return BatchSummary(total=0, succeeded=0, failed=0, hitl_pending=0)
+
+    _render_mapping_table(pairs, console)
+
+    results: list[BatchSectionResult] = []
+    log_path = Path(error_log_path)
+
+    for pdf_path, sheet_name, confidence in pairs:
+        session_id = uuid.uuid4().hex
+        config = SessionConfig(
+            project_name=project_name,
+            rd_path=str(pdf_path),
+            smeta_path=str(smeta_file),
+            db_path=db_path,
+            session_id=session_id,
+            smeta_sheet=sheet_name,
+        )
+        try:
+            pipeline_result = run_pipeline(
+                conn,
+                config,
+                interactive=not headless,
+                reviewer=reviewer,
+            )
+        except Exception as error:  # noqa: BLE001 - ночной прогон не должен падать
+            _append_batch_error(log_path, pdf_path, sheet_name, error)
+            results.append(
+                BatchSectionResult(
+                    pdf_path=pdf_path,
+                    sheet_name=sheet_name,
+                    confidence=confidence,
+                    session_id=session_id,
+                    error=f"{type(error).__name__}: {error}",
+                )
+            )
+            continue
+
+        results.append(
+            BatchSectionResult(
+                pdf_path=pdf_path,
+                sheet_name=sheet_name,
+                confidence=confidence,
+                session_id=session_id,
+                result=pipeline_result,
+            )
+        )
+
+    succeeded = [section for section in results if section.succeeded]
+    failed = [section for section in results if not section.succeeded]
+    hitl_pending = sum(
+        section.result.hitl_pending
+        for section in succeeded
+        if section.result is not None
+    )
+
+    summary = BatchSummary(
+        total=len(results),
+        succeeded=len(succeeded),
+        failed=len(failed),
+        hitl_pending=hitl_pending,
+        sections=tuple(results),
+    )
+    console.print(
+        f"Всего разделов: {summary.total} | Успешно: {summary.succeeded} | "
+        f"С ошибками: {summary.failed} | "
+        f"Требуют верификации утром: {summary.hitl_pending} позиций."
+    )
+
+    target: Optional[Path] = None
+    if output_path is not None and succeeded:
+        target = exporter.export_sessions_to_excel(
+            conn,
+            summary.successful_session_ids,
+            output_path,
+        )
+        console.print(f"Многолистовая ведомость сформирована: {target}")
+    elif output_path is not None:
+        console.print(
+            "[yellow]Ведомость не сформирована: нет успешно обработанных "
+            "разделов.[/yellow]"
+        )
+
+    return BatchSummary(
+        total=summary.total,
+        succeeded=summary.succeeded,
+        failed=summary.failed,
+        hitl_pending=summary.hitl_pending,
+        sections=summary.sections,
+        output_path=target,
+    )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Точка входа all-in-one CLI: ingest -> match -> HITL -> export."""
     parser = argparse.ArgumentParser(
@@ -461,13 +677,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument(
         "--rd",
-        required=True,
+        default=None,
         help="Путь к рабочей документации / спецификации (.pdf)",
+    )
+    parser.add_argument(
+        "--batch-dir",
+        dest="batch_dir",
+        default=None,
+        help="Папка с томами РД (.pdf) для ночного пакетного прогона",
     )
     parser.add_argument(
         "--smeta",
         required=True,
         help="Путь к локальной смете (.xlsx)",
+    )
+    parser.add_argument(
+        "--sheet",
+        default=None,
+        help="Конкретный лист сметы для точечного запуска",
     )
     parser.add_argument(
         "--db",
@@ -478,13 +705,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--session-id", default=None, help="Идентификатор сессии")
     parser.add_argument(
         "--out",
-        default=exporter.DEFAULT_OUTPUT,
-        help="Итоговая ведомость аудита (.xlsx)",
+        default=None,
+        help=(
+            "Итоговая ведомость аудита (.xlsx); в пакетном режиме — "
+            "многолистовая книга по разделам"
+        ),
     )
     parser.add_argument(
         "--no-review",
         action="store_true",
         help="Не запускать терминальное HITL-ревью (для автоматизации/CI)",
+    )
+    parser.add_argument(
+        "--headless",
+        "--no-interactive",
+        dest="headless",
+        action="store_true",
+        help=(
+            "Полный запрет опроса оператора: HITL сохраняется в БД "
+            "со статусом HITL_PENDING (для ночных прогонов по расписанию)"
+        ),
     )
     parser.add_argument(
         "--interactive",
@@ -498,16 +738,55 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    for flag, path in (("--rd", args.rd), ("--smeta", args.smeta)):
-        if not Path(path).is_file():
-            parser.error(f"Файл не найден: {flag} {path}")
+    smeta_path = Path(args.smeta)
+    if not smeta_path.is_file():
+        parser.error(f"Файл не найден: --smeta {smeta_path}")
+
+    if args.batch_dir:
+        batch_dir = Path(args.batch_dir)
+        if not batch_dir.is_dir():
+            parser.error(f"Папка не найдена: --batch-dir {batch_dir}")
+        if args.rd:
+            parser.error("--rd не используется вместе с --batch-dir")
+        if args.sheet:
+            parser.error("--sheet не используется с --batch-dir: лист определяется автоматически")
+        if args.session_id:
+            parser.error("--session-id не используется с --batch-dir: сессии создаются изолированно")
+
+        conn = db.get_connection(args.db_path)
+        try:
+            headless = bool(args.headless or args.no_review)
+            summary = run_batch_pipeline(
+                conn,
+                project_name=args.project_name,
+                batch_dir=batch_dir,
+                smeta_path=smeta_path,
+                db_path=args.db_path,
+                headless=headless,
+                reviewer=args.reviewer,
+                output_path=args.out,
+            )
+        except (OSError, ValueError, sqlite3.Error) as error:
+            print(f"[ERROR] Пакетный прогон не выполнен: {error}", file=sys.stderr)
+            return 1
+        finally:
+            conn.close()
+
+        return 0 if summary.failed == 0 else 1
+
+    if not args.rd:
+        parser.error("--rd обязателен для одиночного запуска (либо укажите --batch-dir)")
+    rd_path = Path(args.rd)
+    if not rd_path.is_file():
+        parser.error(f"Файл не найден: --rd {rd_path}")
 
     config = SessionConfig(
         project_name=args.project_name,
-        rd_path=args.rd,
-        smeta_path=args.smeta,
+        rd_path=str(rd_path),
+        smeta_path=str(smeta_path),
         db_path=args.db_path,
         session_id=args.session_id,
+        smeta_sheet=args.sheet,
     )
 
     conn = db.get_connection(args.db_path)
@@ -515,7 +794,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         result = run_pipeline(
             conn,
             config,
-            interactive=not args.no_review,
+            interactive=not (args.no_review or args.headless),
             reviewer=args.reviewer,
         )
         print(
@@ -533,7 +812,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"HITL_PENDING: {result.hitl_pending}"
         )
         target = exporter.export_audit_to_excel(
-            conn, result.session_id, args.out
+            conn,
+            result.session_id,
+            args.out or exporter.DEFAULT_OUTPUT,
         )
         print(f"Ведомость сформирована: {target}")
     finally:
