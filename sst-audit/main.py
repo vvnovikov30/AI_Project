@@ -1,7 +1,7 @@
 import os
 import argparse
 from decimal import Decimal
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple, Dict
 import pandas as pd
 
 from models import NormalizedItem, CollisionRecord, CollisionSeverity
@@ -11,10 +11,10 @@ from evaluator import DiscrepancyDetector
 
 
 class AuditOrchestrator:
-    """Координатор конвейера сверки сметы и проектной спецификации с поддержкой HITL."""
+    """Координатор конвейера сверки сметы и проектной спецификации с поддержкой двухфазной реконсиляции."""
 
     FUZZY_ACCEPTANCE_THRESHOLD = 85.0
-    FUZZY_SUSPECT_THRESHOLD = 70.0
+    FUZZY_SUSPECT_THRESHOLD = 50.0
 
     def __init__(self, lsr_path: str, spec_path: str, interactive: bool = True):
         self.lsr_path = lsr_path
@@ -70,49 +70,51 @@ class AuditOrchestrator:
         spec_items = self.spec_parser.extract_items()
         print(f"    Найдено позиций в спецификации: {len(spec_items)}")
 
-        collisions: List[CollisionRecord] = []
+        # Разделение сметы на материальные ресурсы и расценки работ
+        resource_items = [it for it in lsr_items if it.is_resource]
+        work_items = [it for it in lsr_items if not it.is_resource]
+
         matched_spec_ids: Set[str] = set()
+        # Реестр подтвержденных ресурсов: {lsr_raw_id: (spec_item, collision_record)}
+        matched_resources: Dict[str, Tuple[NormalizedItem, CollisionRecord]] = {}
+        collisions: List[CollisionRecord] = []
 
-        print("[*] Сопоставление номенклатуры и анализ коллизий...")
-
-        # 1. Прямой проход: сверка сметных позиций с проектом
-        for lsr in lsr_items:
-            # Собираем скоринг по всем позициям проекта
+        # =========================================================================
+        # ФАЗА 1: ФИЗИЧЕСКИЙ АУДИТ РЕСУРСОВ (Оборудование / Материалы <-> Проект)
+        # =========================================================================
+        print(f"\n[*] Фаза 1: Сверка материальных ресурсов ({len(resource_items)} позиций)...")
+        for lsr in resource_items:
             scored_candidates: List[Tuple[NormalizedItem, float]] = []
             for spec in spec_items:
                 score = CascadeMatcher.calculate_score(lsr, spec)
                 if score >= self.FUZZY_SUSPECT_THRESHOLD:
                     scored_candidates.append((spec, score))
 
-            # Сортируем кандидатов по убыванию сходства
             scored_candidates.sort(key=lambda x: x[1], reverse=True)
 
             best_match: Optional[NormalizedItem] = scored_candidates[0][0] if scored_candidates else None
             best_score: float = scored_candidates[0][1] if scored_candidates else 0.0
 
-            # Сценарий А: Автоматическое принятие (>= 85.0%)
+            # Автоматическое принятие (>= 85.0%)
             if best_score >= self.FUZZY_ACCEPTANCE_THRESHOLD and best_match:
                 matched_spec_ids.add(best_match.raw_id)
                 record = DiscrepancyDetector.evaluate(lsr, best_match, Decimal(str(best_score)))
+                matched_resources[lsr.raw_id] = (best_match, record)
                 collisions.append(record)
 
-            # Сценарий Б: Серая зона (70.0% - 84.9%) -> Human-in-the-Loop
+            # Серая зона (70.0% - 84.9%) -> Human-in-the-Loop
             elif self.FUZZY_SUSPECT_THRESHOLD <= best_score < self.FUZZY_ACCEPTANCE_THRESHOLD and best_match:
                 confirmed_spec: Optional[NormalizedItem] = None
-
                 if self.interactive:
-                    # Показываем оператору топ-3 лучших кандидатов
-                    top_candidates = scored_candidates[:3]
-                    confirmed_spec = self._prompt_operator_review(lsr, top_candidates)
-                
+                    confirmed_spec = self._prompt_operator_review(lsr, scored_candidates[:3])
+
                 if confirmed_spec:
                     matched_spec_ids.add(confirmed_spec.raw_id)
-                    # После подтверждения человеком отправляем на расчет расхождения
                     record = DiscrepancyDetector.evaluate(lsr, confirmed_spec, Decimal(str(best_score)))
                     record.description = f"[HITL Подтверждено] {record.description}"
+                    matched_resources[lsr.raw_id] = (confirmed_spec, record)
                     collisions.append(record)
                 else:
-                    # Оператор отклонил сопоставление (или режим non-interactive)
                     collisions.append(CollisionRecord(
                         lsr_item=lsr,
                         spec_item=best_match if not self.interactive else None,
@@ -127,7 +129,7 @@ class AuditOrchestrator:
                         )
                     ))
 
-            # Сценарий В: Полное несовпадение (< 70.0%)
+            # Полное несовпадение (< 70.0%)
             else:
                 collisions.append(CollisionRecord(
                     lsr_item=lsr,
@@ -139,7 +141,81 @@ class AuditOrchestrator:
                     description="Позиция сметы отсутствует в спецификации проекта (Необоснованный объем)"
                 ))
 
-        # 2. Обратный проход: поиск неосмеченных проектных спецификаций
+        # =========================================================================
+        # ФАЗА 2: ТОПОЛОГИЧЕСКАЯ ВАЛИДАЦИЯ РАСЦЕНОК РАБОТ (Anchor Resource Pattern)
+        # =========================================================================
+        print(f"[*] Фаза 2: Валидация монтажных расценок ({len(work_items)} позиций)...")
+        for work in work_items:
+            # Находим дочерние ресурсы текущей работы по parent_id
+            children = [r for r in resource_items if r.parent_id == work.raw_id]
+
+            if children:
+                # Фильтруем подтвержденные в Фазе 1 ресурсы
+                verified_children = [c for c in children if c.raw_id in matched_resources]
+
+                if verified_children:
+                    # Выбор ресурса-якоря (Anchor):
+                    # Приоритет: ресурс с той же физической группой единиц (COUNT или LENGTH)
+                    anchor = next(
+                        (c for c in verified_children if c.canonical_unit == work.canonical_unit), 
+                        verified_children[0]
+                    )
+                    spec_item, _ = matched_resources[anchor.raw_id]
+
+                    # Проверка кратности объема монтажа и оборудования
+                    if work.canonical_unit == spec_item.canonical_unit:
+                        delta = work.volume - spec_item.volume
+                        if delta == Decimal("0"):
+                            severity = CollisionSeverity.INFO
+                            desc = f"[Монтаж подтвержден] Привязано оборудование: {spec_item.clean_title[:45]}"
+                        elif delta > Decimal("0"):
+                            severity = CollisionSeverity.SUSPECT
+                            desc = f"[Монтаж: завышение на +{delta} {work.canonical_unit.value}] Оборудование: {spec_item.clean_title[:35]}"
+                        else:
+                            severity = CollisionSeverity.SUSPECT
+                            desc = f"[Монтаж: занижение на {delta} {work.canonical_unit.value}] Оборудование: {spec_item.clean_title[:35]}"
+                    else:
+                        # Разные размерности (применительные расценки: перемычки, комплекты)
+                        delta = Decimal("0")
+                        severity = CollisionSeverity.INFO
+                        desc = f"[Монтаж подтвержден (применительная норма)] По ресурсу: {spec_item.clean_title[:40]}"
+
+                    collisions.append(CollisionRecord(
+                        lsr_item=work,
+                        spec_item=spec_item,
+                        similarity_score=Decimal("100.0"),
+                        volume_delta=delta,
+                        allowed_delta=Decimal("0"),
+                        severity=severity,
+                        description=desc
+                    ))
+                else:
+                    # Дочерние ресурсы есть, но ни один не подтвержден проектом
+                    collisions.append(CollisionRecord(
+                        lsr_item=work,
+                        spec_item=None,
+                        similarity_score=Decimal("0.0"),
+                        volume_delta=work.volume,
+                        allowed_delta=Decimal("0"),
+                        severity=CollisionSeverity.CRITICAL,
+                        description="Расценка монтажа не подтверждена проектом (дочерние ресурсы отсутствуют в спецификации)"
+                    ))
+            else:
+                # Автономная строительная расценка без дочерних ресурсов
+                collisions.append(CollisionRecord(
+                    lsr_item=work,
+                    spec_item=None,
+                    similarity_score=Decimal("0.0"),
+                    volume_delta=work.volume,
+                    allowed_delta=Decimal("0"),
+                    severity=CollisionSeverity.SUSPECT,
+                    description="Автономная расценка без дочерних ресурсов (требуется проверка по ведомости объемов работ / ВОР)"
+                ))
+
+        # =========================================================================
+        # ОБРАТНЫЙ ПРОХОД: НЕОСМЕЧЕННЫЕ ПОЗИЦИИ ПРОЕКТА
+        # =========================================================================
+        print("[*] Анализ неосмеченных позиций спецификации...")
         for spec in spec_items:
             if spec.raw_id not in matched_spec_ids:
                 collisions.append(CollisionRecord(
@@ -151,6 +227,10 @@ class AuditOrchestrator:
                     severity=CollisionSeverity.CRITICAL,
                     description="Проектная позиция не осмечена (Пропущенный объем)"
                 ))
+
+        # Сортировка: сметные позиции в исходном порядке сметы (по номеру строки Excel),
+        # неосмеченные проектные позиции — в конце таблицы
+        collisions.sort(key=lambda c: c.lsr_item.pointer.row_idx if c.lsr_item else 999999)
 
         print(f"\n[*] Формирование отчета: {output_excel}")
         self._export_report(collisions, output_excel)
@@ -185,9 +265,9 @@ class AuditOrchestrator:
 
 def main():
     parser = argparse.ArgumentParser(description="Автоматизированный аудит смет (Excel) и спецификаций (PDF)")
-    parser.add_argument("--lsr", default="data/estimate.xlsx", help="Путь к локальной смете (.xlsx)")
-    parser.add_argument("--spec", default="data/specification.pdf", help="Путь к спецификации проекта (.pdf)")
-    parser.add_argument("--out", default="data/audit_report.xlsx", help="Путь для сохранения отчета (.xlsx)")
+    parser.add_argument("--lsr", default="data/сот.xlsx", help="Путь к локальной смете (.xlsx)")
+    parser.add_argument("--spec", default="data/сот2.pdf", help="Путь к спецификации проекта (.pdf)")
+    parser.add_argument("--out", default="data/audit_clean.xlsx", help="Путь для сохранения отчета (.xlsx)")
     parser.add_argument("--no-interactive", action="store_true", help="Отключить интерактивный опрос оператора (пакетный режим)")
 
     args = parser.parse_args()
