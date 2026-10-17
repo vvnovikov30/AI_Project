@@ -7,12 +7,14 @@ sessions / rd_items / smeta_items / match_records / rule_evaluations,
 
 from collections.abc import Iterator
 from decimal import Decimal
+import io
 import json
 from pathlib import Path
 import sqlite3
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 import pytest
+from rich.console import Console
 
 import db
 import exporter
@@ -137,6 +139,28 @@ def _cable_pair() -> tuple[NormalizedItem, NormalizedItem]:
         total_cost=Decimal("375000.00"),
     )
     return rd_item, smeta_item
+
+
+def _make_two_section_smeta(path: Path) -> Path:
+    """Создает двухлистовую смету для пакетного интеграционного теста."""
+    workbook = Workbook()
+    aps = workbook.active
+    aps.title = "ЛС 02-01-08"
+    aps["A8"] = "Автоматическая пожарная сигнализация (АПС)"
+
+    sot = workbook.create_sheet("ЛС 02-01-14")
+    sot["A9"] = "Система охранного телевидения (СОТ)"
+    workbook.save(path)
+    return path
+
+
+def _make_batch_dir(tmp_path: Path) -> Path:
+    """Создает папку с двумя PDF-томами, имена которых содержат разделы."""
+    rd_dir = tmp_path / "rd"
+    rd_dir.mkdir()
+    (rd_dir / "Том 1 (АПС).pdf").write_bytes(b"")
+    (rd_dir / "Том 2 (СОТ).pdf").write_bytes(b"")
+    return rd_dir
 
 
 def _three_item_dataset() -> tuple[list[NormalizedItem], list[NormalizedItem]]:
@@ -610,3 +634,128 @@ def test_interactive_hitl_updates_link_and_rules(
     assert rule["is_violation"] == 1
     # Дельта рассчитана по выбранному кандидату (20 x 1.06), а не по первому.
     assert rule["delta_volume"] == pytest.approx(-11.2)
+
+
+def test_batch_pipeline_headless(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ночной прогон создает по сессии на раздел и не блокирует ввод."""
+    rd_dir = _make_batch_dir(tmp_path)
+    smeta_path = _make_two_section_smeta(tmp_path / "smeta.xlsx")
+    db_path = tmp_path / "batch.db"
+    target = tmp_path / "batch_report.xlsx"
+
+    class _StubPDFParser:
+        def __init__(self, _path: str) -> None:
+            self._rd_item = _cable_pair()[0]
+
+        def extract_items(self) -> list[NormalizedItem]:
+            return [self._rd_item]
+
+    class _StubLSRParser:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def parse(self, sheet_name: str | None = None) -> list[NormalizedItem]:
+            assert sheet_name in {"ЛС 02-01-08", "ЛС 02-01-14"}
+            return [_cable_pair()[1]]
+
+    def _forbidden_input(_prompt: str = "") -> str:
+        raise AssertionError("Headless-режим не должен запрашивать ввод оператора")
+
+    monkeypatch.setattr(main_module, "PDFSpecParser", _StubPDFParser)
+    monkeypatch.setattr(main_module, "LSRParser", _StubLSRParser)
+    monkeypatch.setattr("builtins.input", _forbidden_input)
+
+    code = main_module.main(
+        [
+            "--project",
+            PROJECT_NAME,
+            "--batch-dir",
+            str(rd_dir),
+            "--smeta",
+            str(smeta_path),
+            "--db",
+            str(db_path),
+            "--out",
+            str(target),
+            "--headless",
+        ]
+    )
+
+    assert code == 0
+    conn = db.get_connection(db_path)
+    try:
+        sessions = conn.execute(
+            "SELECT project_name, smeta_sheet, rd_filename FROM sessions "
+            "ORDER BY smeta_sheet"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert [row["smeta_sheet"] for row in sessions] == [
+        "ЛС 02-01-08",
+        "ЛС 02-01-14",
+    ]
+    assert {row["project_name"] for row in sessions} == {PROJECT_NAME}
+    assert len({row["rd_filename"] for row in sessions}) == 2
+
+    workbook = load_workbook(target, data_only=False)
+    assert set(workbook.sheetnames) == {"ЛС 02-01-08", "ЛС 02-01-14"}
+
+
+def test_batch_pipeline_continues_after_section_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Исключение в одном томе логируется, но не прерывает остальные разделы."""
+    rd_dir = _make_batch_dir(tmp_path)
+    smeta_path = _make_two_section_smeta(tmp_path / "smeta.xlsx")
+    db_path = tmp_path / "batch-errors.db"
+    error_log = tmp_path / "batch_errors.log"
+    target = tmp_path / "batch_report.xlsx"
+
+    class _FlakyPDFParser:
+        def __init__(self, path: str) -> None:
+            if "СОТ" in Path(path).name:
+                raise RuntimeError("поврежденный PDF")
+            self._rd_item = _cable_pair()[0]
+
+        def extract_items(self) -> list[NormalizedItem]:
+            return [self._rd_item]
+
+    class _StubLSRParser:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def parse(self, sheet_name: str | None = None) -> list[NormalizedItem]:
+            return [_cable_pair()[1]]
+
+    monkeypatch.setattr(main_module, "PDFSpecParser", _FlakyPDFParser)
+    monkeypatch.setattr(main_module, "LSRParser", _StubLSRParser)
+
+    conn = db.get_connection(db_path)
+    try:
+        summary = main_module.run_batch_pipeline(
+            conn,
+            project_name=PROJECT_NAME,
+            batch_dir=rd_dir,
+            smeta_path=smeta_path,
+            db_path=str(db_path),
+            headless=True,
+            output_path=target,
+            error_log_path=error_log,
+            console=Console(file=io.StringIO(), force_terminal=False),
+        )
+        sessions = conn.execute(
+            "SELECT smeta_sheet FROM sessions ORDER BY smeta_sheet"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert summary.total == 2
+    assert summary.succeeded == 1
+    assert summary.failed == 1
+    assert [row["smeta_sheet"] for row in sessions] == ["ЛС 02-01-08"]
+    assert target.is_file()
+    assert "поврежденный PDF" in error_log.read_text(encoding="utf-8")
+    assert "RuntimeError" in error_log.read_text(encoding="utf-8")

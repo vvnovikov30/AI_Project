@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+import re
 import sqlite3
 from typing import Any, Final, Optional
 
@@ -240,7 +241,8 @@ def _load_session(conn: sqlite3.Connection, session_id: str) -> sqlite3.Row:
     """
     row = conn.execute(
         """
-        SELECT id, project_name, rd_filename, smeta_filename, created_at, status
+        SELECT id, project_name, rd_filename, smeta_filename, smeta_sheet,
+               created_at, status
         FROM sessions
         WHERE id = ?
         """,
@@ -503,6 +505,51 @@ def _autosize_columns(worksheet: Worksheet) -> None:
         worksheet.column_dimensions[column].width = min(max(longest + 2, 8), max_width)
 
 
+def _populate_worksheet(
+    worksheet: Worksheet,
+    session: sqlite3.Row,
+    records: Sequence[AuditRecord],
+    generated_at: datetime,
+) -> None:
+    """Заполняет один лист ведомости шапкой, таблицей и формулами."""
+    worksheet.column_dimensions[HIDDEN_ID_COLUMN].hidden = True
+    _write_metadata(worksheet, session, generated_at)
+    _write_table_header(worksheet)
+
+    for offset, record in enumerate(records):
+        _write_record(worksheet, FIRST_DATA_ROW + offset, offset + 1, record)
+
+    _autosize_columns(worksheet)
+    worksheet.freeze_panes = f"C{FIRST_DATA_ROW}"
+    worksheet.print_title_rows = f"{HEADER_ROW}:{HEADER_ROW}"
+    worksheet.sheet_view.showGridLines = False
+
+
+_INVALID_SHEET_TITLE = re.compile(r"[\\/*?:\[\]]")
+
+
+def _sanitize_sheet_title(raw: Optional[str], fallback: str) -> str:
+    """Готовит допустимое имя листа Excel (не более 31 символа)."""
+    title = _INVALID_SHEET_TITLE.sub(" ", raw or "")
+    title = re.sub(r"\s+", " ", title).strip().strip("'")[:31].strip()
+    if title:
+        return title
+    safe_fallback = _INVALID_SHEET_TITLE.sub(" ", fallback)
+    return re.sub(r"\s+", " ", safe_fallback).strip()[:31] or "Раздел"
+
+
+def _unique_sheet_title(base: str, used: set[str]) -> str:
+    """Возвращает уникальное имя листа с учетом регистронезависимых коллизий."""
+    title = base
+    suffix = 2
+    while title.casefold() in used:
+        suffix_text = f" ({suffix})"
+        title = f"{base[: 31 - len(suffix_text)].rstrip()}{suffix_text}"
+        suffix += 1
+    used.add(title.casefold())
+    return title
+
+
 # ----------------------------------------------------------------------
 # 4. Публичный API и точка входа CLI
 # ----------------------------------------------------------------------
@@ -529,23 +576,61 @@ def export_audit_to_excel(
     workbook = Workbook()
     worksheet = workbook.active
     worksheet.title = SHEET_TITLE
-    worksheet.column_dimensions[HIDDEN_ID_COLUMN].hidden = True
+    _populate_worksheet(worksheet, session, records, generated_at)
 
-    _write_metadata(worksheet, session, generated_at)
-    _write_table_header(worksheet)
-
-    for offset, record in enumerate(records):
-        _write_record(worksheet, FIRST_DATA_ROW + offset, offset + 1, record)
-
-    _autosize_columns(worksheet)
-
-    # Служебные строки и колонки остаются на экране при прокрутке.
-    worksheet.freeze_panes = f"C{FIRST_DATA_ROW}"
-    worksheet.print_title_rows = f"{HEADER_ROW}:{HEADER_ROW}"
-    worksheet.sheet_view.showGridLines = False
     # Excel пересчитывает нативные формулы при открытии книги.
     workbook.calculation.fullCalcOnLoad = True
 
+    target = Path(output_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(target)
+    return target
+
+
+def export_sessions_to_excel(
+    conn: sqlite3.Connection,
+    session_ids: Sequence[str],
+    output_path: str | Path,
+) -> Path:
+    """Формирует многолистовую ведомость: один лист на каждый раздел.
+
+    Используется ночным пакетным режимом, когда каждая сессия соответствует
+    отдельному тому РД и листу ``ЛС ...``. Имена листов берутся из
+    ``sessions.smeta_sheet``; коллизии и недопустимые символы Excel
+    разрешаются автоматически.
+
+    :param conn: соединение с SQLite (SSOT).
+    :param session_ids: идентификаторы успешно завершенных сессий.
+    :param output_path: путь к создаваемому XLSX-отчету.
+    :return: путь к сохраненному файлу.
+    :raises ValueError: не передано ни одной сессии.
+    :raises LookupError: одна из сессий не найдена.
+    """
+    ordered_ids = list(session_ids)
+    if not ordered_ids:
+        raise ValueError("Для многолистового экспорта не передано ни одной сессии")
+
+    generated_at = datetime.now()
+    workbook = Workbook()
+    used_titles: set[str] = set()
+
+    for index, session_id in enumerate(ordered_ids):
+        resolved_id = resolve_session_id(conn, session_id)
+        session = _load_session(conn, resolved_id)
+        records = load_audit_records(conn, resolved_id)
+
+        fallback = f"{session['project_name']} {Path(session['rd_filename']).stem}"
+        base_title = _sanitize_sheet_title(session["smeta_sheet"], fallback)
+        title = _unique_sheet_title(base_title, used_titles)
+
+        if index == 0:
+            worksheet = workbook.active
+            worksheet.title = title
+        else:
+            worksheet = workbook.create_sheet(title=title)
+        _populate_worksheet(worksheet, session, records, generated_at)
+
+    workbook.calculation.fullCalcOnLoad = True
     target = Path(output_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(target)

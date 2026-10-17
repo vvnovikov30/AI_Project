@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     project_name TEXT NOT NULL,
     rd_filename TEXT NOT NULL,
     smeta_filename TEXT NOT NULL,
+    smeta_sheet TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     status TEXT CHECK (status IN ('CREATED', 'MATCHED', 'REVIEWED', 'EXPORTED')) DEFAULT 'CREATED'
 );
@@ -232,11 +233,21 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         raise
 
 
+def _migrate_sessions_schema(conn: sqlite3.Connection) -> None:
+    """Добавляет новые колонки в уже существующую БД без потери данных."""
+    columns = {
+        str(row["name"]) for row in conn.execute("PRAGMA table_info(sessions)")
+    }
+    if "smeta_sheet" not in columns:
+        conn.execute("ALTER TABLE sessions ADD COLUMN smeta_sheet TEXT")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     """Идемпотентно создает таблицы, индексы и представление v_audit_export."""
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA_SQL)
+    _migrate_sessions_schema(conn)
     conn.commit()
 
 
@@ -287,15 +298,21 @@ def create_session(
     project_name: str,
     rd_file: str,
     smeta_file: str,
+    smeta_sheet: str | None = None,
 ) -> str:
-    """Регистрирует сессию аудита и возвращает ее идентификатор."""
+    """Регистрирует сессию аудита и возвращает ее идентификатор.
+
+    :param smeta_sheet: имя листа ``ЛС ...``, если сессия относится к одному
+        разделу многолистовой сметы (пакетный ночной режим).
+    """
     with transaction(conn):
         conn.execute(
             """
-            INSERT INTO sessions (id, project_name, rd_filename, smeta_filename)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO sessions
+                (id, project_name, rd_filename, smeta_filename, smeta_sheet)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (session_id, project_name, rd_file, smeta_file),
+            (session_id, project_name, rd_file, smeta_file, smeta_sheet),
         )
     return session_id
 

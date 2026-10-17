@@ -45,7 +45,17 @@ class LSRParser:
         return re.sub(r"\s+", " ", text).lower().strip()
 
     def parse(self, sheet_name: Optional[str] = None) -> List[NormalizedItem]:
-        """Парсинг листа сметы в нормализованную плоскую коллекцию DTO с фильтрацией шума."""
+        """Парсинг листа сметы в нормализованную плоскую коллекцию DTO.
+
+        :param sheet_name: имя листа ``ЛС ...`` для пакетного/точечного
+            прогона. Без параметра используется активный лист книги.
+        :raises ValueError: запрошенный лист отсутствует в книге.
+        """
+        if sheet_name is not None and sheet_name not in self.wb.sheetnames:
+            raise ValueError(
+                f"Лист '{sheet_name}' не найден в книге {self.file_path}. "
+                f"Доступны: {', '.join(self.wb.sheetnames)}"
+            )
         ws = self.wb[sheet_name] if sheet_name else self.wb.active
         merge_map = self._resolve_merged_cells_map(ws)
         items: List[NormalizedItem] = []

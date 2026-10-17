@@ -346,3 +346,62 @@ def test_rule_evaluations_and_session_status_validation(
 
     with pytest.raises(ValueError, match="не найдена"):
         update_match_link(conn, 42, None, Decimal("0"))
+
+
+def test_create_session_persists_smeta_sheet(conn: sqlite3.Connection) -> None:
+    """Имя листа раздела сохраняется в сессии для пакетного экспорта."""
+    create_session(
+        conn,
+        "batch-section",
+        "ЖК Север",
+        "СОТ.pdf",
+        "smeta.xlsx",
+        smeta_sheet="ЛС 02-01-14",
+    )
+
+    row = conn.execute(
+        "SELECT smeta_sheet FROM sessions WHERE id = 'batch-section'"
+    ).fetchone()
+    assert row is not None
+    assert row["smeta_sheet"] == "ЛС 02-01-14"
+
+
+def test_init_db_migrates_legacy_sessions_table(tmp_path) -> None:
+    """Старая БД без smeta_sheet обновляется идемпотентно без потери данных."""
+    connection = get_connection(tmp_path / "legacy.db")
+    try:
+        connection.execute(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                project_name TEXT NOT NULL,
+                rd_filename TEXT NOT NULL,
+                smeta_filename TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'CREATED'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO sessions (id, project_name, rd_filename, smeta_filename)
+            VALUES ('legacy', 'Старый проект', 'rd.pdf', 'smeta.xlsx')
+            """
+        )
+        connection.commit()
+
+        init_db(connection)
+        init_db(connection)
+
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(sessions)")
+        }
+        assert "smeta_sheet" in columns
+        row = connection.execute(
+            "SELECT project_name, smeta_sheet FROM sessions WHERE id = 'legacy'"
+        ).fetchone()
+        assert row is not None
+        assert row["project_name"] == "Старый проект"
+        assert row["smeta_sheet"] is None
+    finally:
+        connection.close()
