@@ -109,6 +109,9 @@ def _candidates(
     rd_items: Sequence[NormalizedItem],
 ) -> list[tuple[NormalizedItem, float]]:
     """Возвращает кандидатов РД с ненулевым сходством по убыванию score."""
+    if not rd_items:
+        # Пустой/нераспознанный РД не должен приводить к IndexError.
+        return []
     scored = [
         (rd_item, CascadeMatcher.calculate_score(smeta_item, rd_item))
         for rd_item in rd_items
@@ -142,6 +145,21 @@ def match_items(
     """
     decisions: list[MatchDecision] = []
     covered_rd: set[int] = set()
+
+    if not rd_items:
+        # Защита от нераспознанного РД: все сметные позиции фиксируются
+        # как AUTO/NO_MATCH, а правило SMETA_NOT_IN_RD формируется ниже.
+        return [
+            MatchDecision(
+                smeta_item=smeta_item,
+                rd_item=None,
+                confidence=Decimal("0"),
+                status="AUTO",
+                method=MATCH_METHOD_NO_MATCH,
+                candidates=(),
+            )
+            for smeta_item in smeta_items
+        ]
 
     for smeta_item in smeta_items:
         candidates = _candidates(smeta_item, rd_items)

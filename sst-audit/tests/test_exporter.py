@@ -209,7 +209,9 @@ def test_exporter_creates_valid_xlsx(conn: sqlite3.Connection, tmp_path: Path) -
     assert workbook.active.title == DASHBOARD_TITLE
     worksheet = workbook[SHEET_TITLE]
 
-    assert worksheet["B1"].value == "Проект:"
+    assert worksheet["B1"].value == exporter.BACK_TO_DASHBOARD_FORMULA
+    assert worksheet["B1"].font.color.rgb.endswith("0000FF")
+    assert worksheet["B1"].font.underline == "single"
     assert worksheet["C1"].value == PROJECT_NAME
     assert worksheet["B2"].value == "ID сессии:"
     assert worksheet["C2"].value == SESSION_ID

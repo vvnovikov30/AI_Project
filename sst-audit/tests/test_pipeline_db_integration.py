@@ -361,6 +361,42 @@ def test_pipeline_filters_noise_below_min_threshold(conn: sqlite3.Connection) ->
     assert db.get_pending_reviews(conn, "it-session-noise") == []
 
 
+def test_pipeline_handles_empty_rd_gracefully(conn: sqlite3.Connection) -> None:
+    """Нераспознанный РД не роняет пайплайн: все сметы фиксируются в SMETA_NOT_IN_RD."""
+    _, smeta_item = _cable_pair()
+
+    result = run_pipeline(
+        conn,
+        _config("it-session-empty-rd"),
+        rd_items=[],
+        smeta_items=[smeta_item],
+    )
+
+    assert result.rd_saved == 0
+    assert result.smeta_saved == 1
+    assert result.matches_saved == 1
+    assert result.auto_matches == 0
+    assert result.hitl_pending == 0
+    assert result.no_match == 1
+    assert result.session_status == "REVIEWED"
+
+    match = conn.execute(
+        "SELECT * FROM match_records WHERE session_id = ?",
+        ("it-session-empty-rd",),
+    ).fetchone()
+    assert match is not None
+    assert match["status"] == "AUTO"
+    assert match["rd_item_id"] is None
+    assert match["confidence_score"] == 0
+
+    rule = conn.execute(
+        "SELECT rule_name FROM rule_evaluations WHERE match_record_id = ?",
+        (match["id"],),
+    ).fetchone()
+    assert rule is not None
+    assert rule["rule_name"] == "SMETA_NOT_IN_RD"
+
+
 def test_audit_export_view_stitches_rows(conn: sqlite3.Connection) -> None:
     """v_audit_export возвращает корректно сшитые строки RD + смета + связь."""
     rd_items, smeta_items = _three_item_dataset()
