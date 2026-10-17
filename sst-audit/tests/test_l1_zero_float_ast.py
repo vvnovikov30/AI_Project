@@ -11,7 +11,7 @@
 import ast
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, TypeAlias
 import pytest
 
 # ----------------------------------------------------------------------
@@ -31,7 +31,7 @@ class ZeroFloatViolation:
     message: str
 
 
-type ViolationList = list[ZeroFloatViolation]
+ViolationList: TypeAlias = list[ZeroFloatViolation]
 
 
 class ZeroFloatASTVisitor(ast.NodeVisitor):

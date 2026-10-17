@@ -14,8 +14,11 @@ from db import (
     record_expert_review,
     save_matches,
     save_rd_items,
+    save_rule_evaluations,
     save_smeta_items,
     transaction,
+    update_match_link,
+    update_session_status,
 )
 
 SESSION_ID = "session-001"
@@ -293,3 +296,53 @@ def test_save_and_retrieve_audit_data(conn: sqlite3.Connection) -> None:
     assert row["adjusted_ratio"] == pytest.approx(0.1)
     assert row["reject_reason_code"] == "RATIO_MISMATCH"
     assert row["reviewer_name"] == "Инженер ПТО"
+
+
+def test_rule_evaluations_and_session_status_validation(
+    conn: sqlite3.Connection,
+) -> None:
+    """Недопустимые статусы сессии и правила отклоняются до записи."""
+    create_session(conn, SESSION_ID, "Проект", "rd.pdf", "smeta.xlsx")
+
+    with pytest.raises(ValueError, match="Недопустимый статус сессии"):
+        update_session_status(conn, SESSION_ID, "DONE")
+
+    with pytest.raises(ValueError, match="не найдена"):
+        update_session_status(conn, "missing-session", "MATCHED")
+
+    update_session_status(conn, SESSION_ID, "REVIEWED")
+    status = conn.execute(
+        "SELECT status FROM sessions WHERE id = ?", (SESSION_ID,)
+    ).fetchone()["status"]
+    assert status == "REVIEWED"
+
+    with pytest.raises(ValueError, match="rule_name"):
+        save_rule_evaluations(
+            conn,
+            [
+                {
+                    "match_record_id": 1,
+                    "rule_name": "   ",
+                    "is_violation": True,
+                }
+            ],
+        )
+
+    with pytest.raises(ValueError, match="is_violation"):
+        save_rule_evaluations(
+            conn,
+            [
+                {
+                    "match_record_id": 1,
+                    "rule_name": "VOLUME_DELTA_CRITICAL",
+                    "is_violation": "yes",
+                }
+            ],
+        )
+
+    assert conn.execute(
+        "SELECT COUNT(*) AS c FROM rule_evaluations"
+    ).fetchone()["c"] == 0
+
+    with pytest.raises(ValueError, match="не найдена"):
+        update_match_link(conn, 42, None, Decimal("0"))

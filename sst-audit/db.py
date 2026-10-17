@@ -7,6 +7,8 @@
 Принципы:
 * Схема инициализируется идемпотентно (``CREATE ... IF NOT EXISTS``).
 * Все операции записи выполняются в явных транзакциях с rollback при ошибке.
+  Вложенные вызовы ``transaction()`` используют SAVEPOINT, поэтому пайплайн
+  может атомарно объединить несколько CRUD-операций в одну транзакцию.
 * Объемы и стоимости хранятся в числовых колонках SQLite (REAL) для
   совместимости с отчетными/BI-инструментами. На входе CRUD-методов
   допускается ``Decimal``: конвертация выполняется только на границе
@@ -18,6 +20,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from decimal import Decimal
+from itertools import count
 import json
 from pathlib import Path
 import sqlite3
@@ -26,8 +29,14 @@ from typing import Any, Final, TypeAlias
 DEFAULT_DB_PATH: Final[str] = "sst_audit.db"
 DEFAULT_CONVERSION_RATIO: Final[Decimal] = Decimal("1.0")
 
+VALID_SESSION_STATUSES: Final[frozenset[str]] = frozenset(
+    {"CREATED", "MATCHED", "REVIEWED", "EXPORTED"}
+)
 VALID_MATCH_STATUSES: Final[frozenset[str]] = frozenset({"AUTO", "HITL_PENDING", "RESOLVED"})
 VALID_REVIEW_DECISIONS: Final[frozenset[str]] = frozenset({"APPROVED", "REJECTED", "ADJUSTED"})
+
+# Счетчик уникальных имен SAVEPOINT для вложенных транзакций.
+_SAVEPOINT_SEQ: Iterator[int] = count(1)
 
 # Тип значения, которое sqlite3 способен принять без дополнительных адаптеров.
 SQLNumber: TypeAlias = int | float | str | None
@@ -192,7 +201,29 @@ def get_connection(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
 
 @contextmanager
 def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    """Контекстный менеджер транзакции: commit при успехе, rollback при ошибке."""
+    """Контекстный менеджер транзакции: commit при успехе, rollback при ошибке.
+
+    Если транзакция уже открыта (например, пайплайн объединяет несколько
+    CRUD-операций), создается SAVEPOINT: внутренний блок может откатиться
+    изолированно, а фиксация происходит на внешнем уровне.
+    """
+    if conn.in_transaction:
+        savepoint = f"sst_savepoint_{next(_SAVEPOINT_SEQ)}"
+        conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            yield conn
+        except BaseException:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        return
+
+    # Явный BEGIN обязателен: sqlite3 в legacy-режиме не открывает транзакцию
+    # до первого DML, поэтому conn.in_transaction остается False и вложенные
+    # вызовы transaction() не увидели бы внешнюю транзакцию.
+    conn.execute("BEGIN")
     try:
         yield conn
         conn.commit()
@@ -391,6 +422,126 @@ def get_pending_reviews(
     return list(cursor.fetchall())
 
 
+def get_match_records(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> list[sqlite3.Row]:
+    """Возвращает все связи сессии в порядке вставки (id ASC).
+
+    Используется оркестратором для связывания решений матчера с
+    идентификаторами ``match_records`` перед оценкой правил.
+    """
+    cursor = conn.execute(
+        "SELECT * FROM match_records WHERE session_id = ? ORDER BY id ASC",
+        (session_id,),
+    )
+    return list(cursor.fetchall())
+
+
+def save_rule_evaluations(
+    conn: sqlite3.Connection,
+    evaluations: Sequence[Mapping[str, Any]],
+) -> int:
+    """Сохраняет результаты проверки правил. Возвращает число строк.
+
+    Обязательные поля записи: ``match_record_id``, ``rule_name``,
+    ``is_violation``. Поля ``delta_volume``/``delta_cost`` и ``message``
+    опциональны; ``Decimal`` конвертируется на границе персистентности.
+    """
+    if not evaluations:
+        return 0
+
+    rows = []
+    for evaluation in evaluations:
+        rule_name = _require(evaluation, "rule_name")
+        if not isinstance(rule_name, str) or not rule_name.strip():
+            raise ValueError(
+                f"Поле 'rule_name' должно быть непустой строкой: {rule_name!r}"
+            )
+        is_violation = _require(evaluation, "is_violation")
+        if not isinstance(is_violation, (bool, int)):
+            raise ValueError(
+                f"Поле 'is_violation' должно быть bool/int: {is_violation!r}"
+            )
+        rows.append(
+            (
+                _require(evaluation, "match_record_id"),
+                rule_name,
+                int(bool(is_violation)),
+                _to_sql_number(evaluation.get("delta_volume")),
+                _to_sql_number(evaluation.get("delta_cost")),
+                evaluation.get("message"),
+            )
+        )
+
+    with transaction(conn):
+        conn.executemany(
+            """
+            INSERT INTO rule_evaluations
+                (match_record_id, rule_name, is_violation,
+                 delta_volume, delta_cost, message)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+    return len(rows)
+
+
+def update_session_status(
+    conn: sqlite3.Connection,
+    session_id: str,
+    status: str,
+) -> None:
+    """Переводит сессию аудита в новый статус.
+
+    :raises ValueError: неизвестный статус либо отсутствующая сессия.
+    """
+    if status not in VALID_SESSION_STATUSES:
+        raise ValueError(
+            f"Недопустимый статус сессии '{status}'. "
+            f"Разрешены: {sorted(VALID_SESSION_STATUSES)}"
+        )
+
+    with transaction(conn):
+        cursor = conn.execute(
+            "UPDATE sessions SET status = ? WHERE id = ?",
+            (status, session_id),
+        )
+
+    if cursor.rowcount == 0:
+        raise ValueError(f"Сессия '{session_id}' не найдена")
+
+
+def update_match_link(
+    conn: sqlite3.Connection,
+    match_id: int,
+    rd_item_id: int | None,
+    confidence_score: Decimal | int | float | str,
+) -> None:
+    """Уточняет связь по решению эксперта (кандидат РД, выбранный в HITL).
+
+    :param rd_item_id: идентификатор выбранной позиции РД либо ``None``,
+        если связь отклонена.
+    :raises ValueError: связь с указанным id не найдена.
+    """
+    with transaction(conn):
+        cursor = conn.execute(
+            """
+            UPDATE match_records
+            SET rd_item_id = ?, confidence_score = ?
+            WHERE id = ?
+            """,
+            (
+                rd_item_id,
+                _to_sql_number(confidence_score),
+                match_id,
+            ),
+        )
+
+    if cursor.rowcount == 0:
+        raise ValueError(f"Связь '{match_id}' не найдена")
+
+
 def record_expert_review(
     conn: sqlite3.Connection,
     match_id: int,
@@ -435,4 +586,3 @@ def record_expert_review(
             (match_id,),
         )
     return review_id
-
