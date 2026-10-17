@@ -11,10 +11,19 @@ import json
 from pathlib import Path
 import sqlite3
 
+from openpyxl import load_workbook
 import pytest
 
 import db
-from main import AUTO_MATCH_THRESHOLD, SessionConfig, match_items, run_pipeline
+import exporter
+import main as main_module
+from main import (
+    AUTO_MATCH_THRESHOLD,
+    MIN_MATCH_THRESHOLD,
+    SessionConfig,
+    match_items,
+    run_pipeline,
+)
 from models import CellPointer, NormalizedItem, UnitClass
 
 PROJECT_NAME = "ЖК Север, корпус 3"
@@ -233,6 +242,101 @@ def test_full_pipeline_persists_all_entities(conn: sqlite3.Connection) -> None:
     assert "VOLUME_WITHIN_TOLERANCE" in rules
 
 
+def test_main_exports_excel_without_interactive_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLI ``--no-review`` автоматически формирует итоговую ведомость XLSX."""
+    rd_items, smeta_items = _three_item_dataset()
+
+    class _StubPDFParser:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def extract_items(self) -> list[NormalizedItem]:
+            return rd_items
+
+    class _StubLSRParser:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def parse(self) -> list[NormalizedItem]:
+            return smeta_items
+
+    monkeypatch.setattr(main_module, "PDFSpecParser", _StubPDFParser)
+    monkeypatch.setattr(main_module, "LSRParser", _StubLSRParser)
+
+    rd_path = tmp_path / "rd.pdf"
+    smeta_path = tmp_path / "smeta.xlsx"
+    rd_path.write_bytes(b"")
+    smeta_path.write_bytes(b"")
+    target = tmp_path / "audit.xlsx"
+
+    code = main_module.main(
+        [
+            "--project",
+            PROJECT_NAME,
+            "--rd",
+            str(rd_path),
+            "--smeta",
+            str(smeta_path),
+            "--db",
+            str(tmp_path / "cli.db"),
+            "--session-id",
+            "it-cli-export",
+            "--out",
+            str(target),
+            "--no-review",
+        ]
+    )
+
+    assert code == 0
+    assert target.is_file()
+    workbook = load_workbook(target, data_only=False)
+    assert exporter.SHEET_TITLE in workbook.sheetnames
+
+
+def test_pipeline_filters_noise_below_min_threshold(conn: sqlite3.Connection) -> None:
+    """Шум (<40%) сохраняется как NO_MATCH и не создает карточку HITL."""
+    rd_item = _rd_item(
+        "SPEC_NOISE_PIPE",
+        TITLE_CABLE,
+        CODE_CABLE,
+        UnitClass.LENGTH,
+        Decimal("10.0"),
+        70,
+    )
+    noise_smeta = _smeta_item(
+        "LSR_NOISE_PIPE",
+        "Кирпич керамический полнотелый одинарный",
+        None,
+        UnitClass.LENGTH,
+        Decimal("100.0"),
+        71,
+    )
+
+    result = run_pipeline(
+        conn,
+        _config("it-session-noise"),
+        rd_items=[rd_item],
+        smeta_items=[noise_smeta],
+    )
+
+    assert result.no_match == 1
+    assert result.hitl_pending == 0
+    assert result.auto_matches == 0
+
+    match = conn.execute(
+        "SELECT * FROM match_records WHERE session_id = ?",
+        ("it-session-noise",),
+    ).fetchone()
+    assert match is not None
+    assert match["status"] == "AUTO"
+    assert match["match_method"] == "NO_MATCH"
+    assert match["rd_item_id"] is None
+    assert match["confidence_score"] == 0
+    assert db.get_pending_reviews(conn, "it-session-noise") == []
+
+
 def test_audit_export_view_stitches_rows(conn: sqlite3.Connection) -> None:
     """v_audit_export возвращает корректно сшитые строки RD + смета + связь."""
     rd_items, smeta_items = _three_item_dataset()
@@ -396,6 +500,37 @@ def test_match_items_marks_low_confidence_and_ambiguity() -> None:
     assert top.status == "HITL_PENDING"
 
 
+def test_match_items_below_min_threshold_is_no_match() -> None:
+    """Сходство ниже 40% не попадает в HITL и не создает шумовую карточку."""
+    rd_item = _rd_item(
+        "SPEC_NOISE",
+        TITLE_CABLE,
+        CODE_CABLE,
+        UnitClass.LENGTH,
+        Decimal("10.0"),
+        40,
+    )
+    noise_smeta = _smeta_item(
+        "LSR_NOISE",
+        "Кирпич керамический полнотелый одинарный",
+        None,
+        UnitClass.LENGTH,
+        Decimal("100.0"),
+        41,
+    )
+
+    decisions = match_items([rd_item], [noise_smeta])
+
+    assert len(decisions) == 1
+    decision = decisions[0]
+    assert decision.status == "AUTO"
+    assert decision.method == "NO_MATCH"
+    assert decision.rd_item is None
+    assert decision.confidence == Decimal("0")
+    assert decision.candidates == ()
+    assert decision.confidence < MIN_MATCH_THRESHOLD
+
+
 def test_interactive_hitl_updates_link_and_rules(
     conn: sqlite3.Connection,
     monkeypatch: pytest.MonkeyPatch,
@@ -428,7 +563,10 @@ def test_interactive_hitl_updates_link_and_rules(
         31,
     )
 
-    monkeypatch.setattr("builtins.input", lambda _prompt: "2")
+    # Первая карточка: выбор второго кандидата; вторая (обратный проход) —
+    # пропуск, чтобы очередь сохранила MATCHED.
+    answers = iter(["2", "S"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
 
     result = run_pipeline(
         conn,

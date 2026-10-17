@@ -246,9 +246,8 @@ def test_exporter_adjusted_ratio_applied(
 def test_exporter_rejected_reason_in_comment(
     conn: sqlite3.Connection, tmp_path: Path
 ) -> None:
-    """Отклоненная связь получает статус REJECTED и причину в колонке Q."""
+    """REJECTED сохраняет наименование РД, причину в Q и не строит дельты."""
     _, pending_match_id = _seed_session(conn)
-    db.update_match_link(conn, pending_match_id, None, Decimal("0"))
     db.record_expert_review(
         conn,
         pending_match_id,
@@ -262,11 +261,13 @@ def test_exporter_rejected_reason_in_comment(
     worksheet = _open_sheet(target)
 
     assert worksheet["P6"].value == "REJECTED"
+    assert worksheet["C6"].value == "Арматура А500С d12"
+    assert worksheet["E6"].value == pytest.approx(10.0)
     assert "UNIT_MULTIPLICITY" in str(worksheet["Q6"].value)
     assert "В смете расценка на 100 м" in str(worksheet["Q6"].value)
-    # После отвязки РД расчетные формулы объема не строятся.
-    assert worksheet["M6"].value is None
+    # Отклоненная связь: дельтовые формулы не строятся.
     assert worksheet["N6"].value is None
+    assert worksheet["O6"].value is None
 
 
 def test_exporter_resolves_latest_session(conn: sqlite3.Connection, tmp_path: Path) -> None:
