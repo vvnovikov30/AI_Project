@@ -37,6 +37,9 @@ from evaluator import DiscrepancyDetector
 
 SHEET_TITLE: Final[str] = "Ведомость аудита объемов"
 DASHBOARD_TITLE: Final[str] = "📊 Сводный дашборд"
+BACK_TO_DASHBOARD_FORMULA: Final[str] = (
+    "=HYPERLINK(\"#'" + DASHBOARD_TITLE + "'!A1\", \"⬅ На дашборд\")"
+)
 LATEST_SESSION: Final[str] = "latest"
 DEFAULT_OUTPUT: Final[str] = "audit_report.xlsx"
 
@@ -420,6 +423,9 @@ _HEADER_ALIGNMENT: Final[Alignment] = Alignment(
 _META_LABEL_FONT: Final[Font] = Font(name="Calibri", size=11, bold=True)
 _META_VALUE_FONT: Final[Font] = Font(name="Calibri", size=11)
 _PROJECT_FONT: Final[Font] = Font(name="Calibri", size=14, bold=True, color="1F4E78")
+_BACK_LINK_FONT: Final[Font] = Font(
+    name="Calibri", size=10, bold=True, color="0000FF", underline="single"
+)
 _BODY_FONT: Final[Font] = Font(name="Calibri", size=10)
 _THIN_SIDE: Final[Side] = Side(style="thin", color="B7C3D0")
 _CELL_BORDER: Final[Border] = Border(
@@ -490,8 +496,10 @@ def _write_metadata(
     session: sqlite3.Row,
     generated_at: datetime,
 ) -> None:
-    """Записывает шапку документа: проект, сессию и дату формирования."""
-    worksheet["B1"] = "Проект:"
+    """Записывает шапку документа: ссылку на дашборд, проект, сессию и дату."""
+    worksheet["B1"] = BACK_TO_DASHBOARD_FORMULA
+    worksheet["B1"].font = _BACK_LINK_FONT
+    worksheet["B1"].alignment = Alignment(horizontal="left", vertical="center")
     worksheet["C1"] = str(session["project_name"])
     worksheet.merge_cells("C1:Q1")
 
@@ -504,8 +512,11 @@ def _write_metadata(
     worksheet.merge_cells("C3:Q3")
 
     for row in (1, 2, 3):
-        worksheet[f"B{row}"].font = _META_LABEL_FONT
-        worksheet[f"B{row}"].alignment = Alignment(horizontal="left", vertical="center")
+        if row != 1:
+            worksheet[f"B{row}"].font = _META_LABEL_FONT
+            worksheet[f"B{row}"].alignment = Alignment(
+                horizontal="left", vertical="center"
+            )
         worksheet[f"C{row}"].font = _PROJECT_FONT if row == 1 else _META_VALUE_FONT
         worksheet[f"C{row}"].alignment = Alignment(horizontal="left", vertical="center")
 
@@ -1146,7 +1157,7 @@ def _write_dashboard_kpis(
         (
             "Нет в РД",
             no_rd,
-            "Серые строки: сопоставление не состоялось",
+            "Серые строки: нет пары РД (SMETA_NOT_IN_RD)",
             INTEGER_FORMAT,
             _GRAY_FILL if no_rd else None,
         ),

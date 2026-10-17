@@ -5,6 +5,7 @@ import openpyxl
 import pytest
 
 from models import UnitClass
+import parsers
 from parsers import LSRParser, PDFSpecParser
 
 
@@ -177,6 +178,77 @@ class TestPDFSpecParserUnit:
         assert box[2] == 842.0
         assert pytest.approx(box[3], 0.01) == 595.0 - stamp_h
 
+    def test_pdf_parser_extracts_vor_4_columns(self, monkeypatch):
+        """ВОР из 4 колонок распознается без жесткого требования 7 колонок."""
+        table = [
+            ["№", "Наименование вида работ", "Ед.изм", "Объем работ"],
+            ["", "Фасады", "", ""],
+            ["", "Монтаж водосточного желоба", "пм.", "58,3"],
+            ["", "Установка домового знака", "шт", "1 020"],
+            ["", "Монтаж люка", "шт.", "52.2*"],
+        ]
+
+        class _FakePage:
+            width = 842.0
+            height = 595.0
+
+            def within_bbox(self, _bbox):
+                return self
+
+            def extract_table(self, _settings):
+                return table
+
+        class _FakePDF:
+            pages = [_FakePage()]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        monkeypatch.setattr(parsers.pdfplumber, "open", lambda _path: _FakePDF())
+
+        items = PDFSpecParser("vor.pdf").extract_items()
+
+        assert [item.volume for item in items] == [
+            Decimal("58.3"),
+            Decimal("1020"),
+            Decimal("52.2"),
+        ]
+        assert [item.raw_unit for item in items] == ["пм.", "шт", "шт."]
+        assert all(item.context_section == "Фасады" for item in items)
+
+    def test_pdf_parser_empty_pages_returns_empty_list_without_error(self, monkeypatch):
+        """Пустая таблица и строка длиной 1 не вызывают IndexError."""
+        table = [
+            ["№", "Наименование", "Ед.изм", "Количество"],
+            [None],
+        ]
+
+        class _FakePage:
+            width = 842.0
+            height = 595.0
+
+            def within_bbox(self, _bbox):
+                return self
+
+            def extract_table(self, _settings):
+                return table
+
+        class _FakePDF:
+            pages = [_FakePage()]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        monkeypatch.setattr(parsers.pdfplumber, "open", lambda _path: _FakePDF())
+
+        assert PDFSpecParser("empty.pdf").extract_items() == []
+
 
 # ==============================================================================
 # 3. ИНТЕГРАЦИОННЫЕ ТЕСТЫ НА РЕАЛЬНЫХ ДАННЫХ ПРОЕКТА
@@ -205,11 +277,16 @@ def test_real_lsr_file_clean_extraction():
 
 @pytest.mark.skipif(not os.path.exists(SPEC_FILE), reason="Файл спецификации сот2.pdf не найден")
 def test_real_pdf_spec_file_clean_extraction():
-    """Интеграционный тест: реальная спецификация ГОСТ 21.110 содержит ровно 23 позиции."""
+    """Интеграционный тест: реальная спецификация ГОСТ 21.110 содержит 25 позиций.
+
+    Две вложенные позиции комплекта защиты Ethernet (модуль и корпус)
+    учитываются отдельно, а не склеиваются с родительской строкой.
+    """
     parser = PDFSpecParser(SPEC_FILE, debug=False)
     items = parser.extract_items()
 
-    assert len(items) == 23
+    assert len(items) == 25
+    assert any("модуль защиты" in item.clean_title for item in items)
 
     # Проверка отсутствия фантомных строк с номерами колонок таблицы
     assert not any(it.raw_title.strip() == "2" for it in items)

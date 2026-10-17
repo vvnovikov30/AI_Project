@@ -1,5 +1,6 @@
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 import re
-from decimal import Decimal
 from typing import Optional, Dict, Any, List
 import openpyxl
 import openpyxl.utils
@@ -144,8 +145,48 @@ class LSRParser:
         return items
 
 
+_HEADER_TITLE_TOKENS: tuple[str, ...] = ("наименование",)
+_HEADER_UNIT_TOKENS: tuple[str, ...] = (
+    "ед.изм",
+    "ед. изм",
+    "единица измер",
+)
+_HEADER_QTY_TOKENS: tuple[str, ...] = (
+    "количеств",
+    "кол-во",
+    "объем",
+    "объём",
+)
+_HEADER_SPEC_TOKENS: tuple[str, ...] = (
+    "позиция",
+    "тип, марка",
+    "тип,марка",
+    "код оборудования",
+    "завод",
+)
+_COLUMN_NUMBER_PATTERN = re.compile(r"^\d{1,2}$")
+
+
+@dataclass(frozen=True)
+class _ColumnSchema:
+    """Найденная схема таблицы PDF: ГОСТ-спецификация либо ведомость ВОР."""
+
+    kind: str
+    title_col: int
+    unit_col: int
+    qty_col: int
+    position_col: Optional[int] = None
+    mark_col: Optional[int] = None
+    code_col: Optional[int] = None
+
+
 class PDFSpecParser:
-    """Извлечение спецификаций ГОСТ 21.110-2013 с отладкой и фильтрацией штампов."""
+    """Извлечение таблиц ГОСТ 21.110 и ведомостей объемов работ (ВОР).
+
+    Схема колонок определяется по строке заголовка, поэтому один парсер
+    поддерживает и 4-5-колоночные ВОР, и много-колоночные спецификации
+    оборудования. Пустые и короткие строки не индексируются напрямую.
+    """
 
     STAMP_W_PT = 185 * 2.83465
     STAMP_H_PT = 55 * 2.83465
@@ -159,10 +200,159 @@ class PDFSpecParser:
         height = page.height
         return (0, 0, width, height - self.STAMP_H_PT)
 
+    @staticmethod
+    def _cell_text(value: Any) -> str:
+        """Очищает ячейку PDF от переносов, мягких дефисов и лишних пробелов."""
+        if value is None:
+            return ""
+        text = str(value).replace("\xa0", " ").replace("\u200b", "")
+        # Перенос слова по дефису в PDF не должен превращаться в пробел.
+        text = re.sub(r"-\s*\n\s*", "", text)
+        text = text.replace("\n", " ")
+        return re.sub(r"\s+", " ", text).strip()
+
+    @classmethod
+    def _detect_schema(cls, row: List[str]) -> Optional[_ColumnSchema]:
+        """Определяет схему таблицы по строке заголовков.
+
+        Поддерживаются оба целевых формата:
+
+        * ГОСТ 21.110 (спецификация оборудования, >= 7 колонок);
+        * ВОР (4-6 колонок: №, наименование, ед. изм., количество).
+
+        Индексы колонок берутся из шапки, а не из фиксированных позиций,
+        поэтому дополнительные служебные колонки не ломают разбор.
+        """
+        cells = [cls._cell_text(cell).lower() for cell in row]
+        # Переносы в шапке PDF дают «Количест во», «Ед. изм»; сравнение
+        # выполняется по склеенному тексту, чтобы не зависеть от пробелов.
+        keys = [cell.replace(" ", "") for cell in cells]
+        joined = " ".join(cells)
+
+        title_col = next(
+            (
+                index
+                for index, cell in enumerate(keys)
+                if any(token in cell for token in _HEADER_TITLE_TOKENS)
+            ),
+            None,
+        )
+        unit_col = next(
+            (
+                index
+                for index, cell in enumerate(keys)
+                if any(token.replace(" ", "") in cell for token in _HEADER_UNIT_TOKENS)
+            ),
+            None,
+        )
+        qty_col = next(
+            (
+                index
+                for index, cell in enumerate(keys)
+                if any(token in cell for token in _HEADER_QTY_TOKENS)
+            ),
+            None,
+        )
+        if title_col is None or unit_col is None or qty_col is None:
+            return None
+
+        is_specification = (
+            len(cells) >= 7
+            or any(token in joined for token in _HEADER_SPEC_TOKENS)
+        )
+        position_col = next(
+            (
+                index
+                for index, cell in enumerate(cells)
+                if cell in {"позиция", "№", "n п/п", "№ п/п"}
+            ),
+            None,
+        )
+        mark_col = next(
+            (
+                index
+                for index, cell in enumerate(cells)
+                if "тип, марка" in cell
+                or "тип,марка" in cell
+                or cell == "марка"
+            ),
+            None,
+        )
+        code_col = next(
+            (
+                index
+                for index, cell in enumerate(cells)
+                if cell.startswith("код")
+            ),
+            None,
+        )
+        return _ColumnSchema(
+            kind="SPECIFICATION" if is_specification else "VOR",
+            title_col=title_col,
+            unit_col=unit_col,
+            qty_col=qty_col,
+            position_col=position_col,
+            mark_col=mark_col,
+            code_col=code_col,
+        )
+
+    @classmethod
+    def _parse_decimal(cls, raw_value: Any) -> Optional[Decimal]:
+        """Извлекает объем из ячеек ``58,3``, ``1 020``, ``123.45`` и ``52.2*``."""
+        text = cls._cell_text(raw_value)
+        if not text:
+            return None
+        normalized = text.replace("*", "").replace(" ", "").replace(",", ".")
+        match = re.search(r"-?\d+(?:\.\d+)?", normalized)
+        if match is None:
+            return None
+        try:
+            return Decimal(match.group(0))
+        except InvalidOperation:
+            return None
+
+    @staticmethod
+    def _is_column_number_row(row: List[str]) -> bool:
+        """Отсекает строку нумерации колонок ``1 | 2 | 3 | ...``."""
+        values = [cell.strip() for cell in row if cell.strip()]
+        return len(values) >= 3 and all(
+            _COLUMN_NUMBER_PATTERN.fullmatch(value) for value in values
+        )
+
+    @staticmethod
+    def _at(row: List[str], index: Optional[int]) -> str:
+        """Безопасно возвращает значение колонки либо пустую строку."""
+        if index is None or index < 0 or index >= len(row):
+            return ""
+        return row[index]
+
+    @classmethod
+    def _is_section_heading(cls, title: str) -> bool:
+        """Отличает короткий заголовок раздела ВОР от описания изделия."""
+        lowered = title.lower()
+        return (
+            len(title) <= 80
+            and "гост" not in lowered
+            and not title.endswith((".", ";"))
+            and ":" not in title
+        )
+
     def extract_items(self) -> List[NormalizedItem]:
-        """Извлечение строк спецификации со сшивкой разорванных таблиц и фильтрацией служебных строк."""
-        aggregated_rows = []
-        carried_over_row = None
+        """Извлекает позиции ВОР или спецификации с автоопределением колонок.
+
+        Поддерживаются:
+
+        * ВОР с 4-6 колонками (``№ | Наименование | Ед.изм | Объем``);
+        * спецификации ГОСТ 21.110 с произвольным числом колонок;
+        * разреженные таблицы, где часть ячеек пуста, а переносы текста
+          оформлены отдельными строками.
+
+        Пустые страницы и страницы без распознанной шапки не приводят к
+        исключениям: метод возвращает пустой список либо пропускает строки.
+        """
+        items: List[NormalizedItem] = []
+        current_schema: Optional[_ColumnSchema] = None
+        current_section = "Default_Section"
 
         with pdfplumber.open(self.file_path) as pdf:
             for p_idx, page in enumerate(pdf.pages, start=1):
@@ -184,83 +374,99 @@ class PDFSpecParser:
                 if not table:
                     continue
 
-                for row in table:
-                    if not row:
+                for raw_row in table:
+                    if not raw_row:
                         continue
 
-                    # 1. Пропуск строки заголовков ("Наименование", "Тип, марка" и т.д.)
-                    if any("наименование" in str(c).lower() for c in row if c):
+                    row = [self._cell_text(cell) for cell in raw_row]
+                    if not any(row):
                         continue
 
-                    # 2. Пропуск строки с номерами колонок ГОСТ 21.110: ['1', '2', '3', '4', '5', '6', '7', '8', '9']
-                    first_cell = str(row[0] or "").strip()
-                    second_cell = str(row[1] or "").strip() if len(row) > 1 else ""
-                    if first_cell == "1" and second_cell == "2":
+                    schema = self._detect_schema(row)
+                    if schema is not None:
+                        current_schema = schema
                         continue
 
-                    cleaned_row = [str(c or "").strip() for c in row]
-
-                    # Сшивка переносов текста наименования (если колонка 0 пустая, а в 1 продолжается текст)
-                    if not cleaned_row[0] and len(cleaned_row) > 1 and cleaned_row[1] and carried_over_row:
-                        carried_over_row[1] += f" {cleaned_row[1]}"
+                    if self._is_column_number_row(row):
+                        continue
+                    if current_schema is None:
                         continue
 
-                    if carried_over_row:
-                        aggregated_rows.append((p_idx, carried_over_row))
-                    carried_over_row = cleaned_row
+                    raw_title = self._at(row, current_schema.title_col)
+                    raw_unit = self._at(row, current_schema.unit_col)
+                    parsed_qty = self._parse_decimal(
+                        self._at(row, current_schema.qty_col)
+                    )
 
-            if carried_over_row:
-                aggregated_rows.append((len(pdf.pages), carried_over_row))
+                    if not raw_title:
+                        continue
 
-        items: List[NormalizedItem] = []
-        for idx, (p_idx, r) in enumerate(aggregated_rows, start=1):
-            if len(r) < 7:
-                continue
+                    if parsed_qty is None:
+                        if not raw_unit and self._is_section_heading(raw_title):
+                            current_section = raw_title
+                        continue
 
-            # Структура колонок ГОСТ 21.110:
-            # r[0] - № позиции | r[1] - Наименование | r[2] - Марка, тип
-            # r[3] - Код | r[4] - Завод | r[5] - Ед. изм. | r[6] - Количество
-            raw_title = r[1] if len(r) > 1 else ""
-            raw_mark = r[2] if len(r) > 2 else ""
-            raw_code = r[3] if len(r) > 3 else ""
-            raw_unit = r[5] if len(r) > 5 else "шт"
-            raw_qty_str = r[6] if len(r) > 6 else "0"
-
-            try:
-                clean_qty_str = raw_qty_str.replace("\n", "").replace(" ", "").replace(",", ".")
-                qty_decimal = Decimal(clean_qty_str)
-            except Exception:
-                continue
-
-            pointer = CellPointer(
-                doc_type="SPECIFICATION",
-                file_name=self.file_path,
-                sheet_name=f"Page {p_idx}",
-                row_idx=idx,
-                col_letter="D",
-                coordinate=f"p.{p_idx} [row {idx}]"
-            )
-
-            canonical_u, norm_qty, mult = UnitNormalizer.normalize(raw_unit, qty_decimal)
-            clean_title = re.sub(r"\s+", " ", raw_title).lower().strip()
-            dimensions = DimensionLockExtractor.extract(raw_title)
-
-            # В качестве кода позиции берем марку оборудования (r[2]) или артикул (r[3]),
-            # а при их отсутствии — порядковый номер (r[0])
-            effective_code = raw_code or raw_mark or (r[0] if r[0] else None)
-
-            items.append(NormalizedItem(
-                raw_id=f"SPEC_{idx}",
-                code=effective_code,
-                raw_title=raw_title,
-                clean_title=clean_title,
-                raw_unit=raw_unit,
-                canonical_unit=canonical_u,
-                unit_multiplier=mult,
-                volume=norm_qty,
-                dimensions=dimensions,
-                context_section="Default_Section",
-                pointer=pointer
-            ))
+                    items.append(
+                        self._build_item(
+                            current_schema,
+                            row,
+                            raw_title,
+                            raw_unit,
+                            parsed_qty,
+                            current_section,
+                            p_idx,
+                            len(items) + 1,
+                        )
+                    )
 
         return items
+
+    def _build_item(
+        self,
+        schema: _ColumnSchema,
+        row: List[str],
+        raw_title: str,
+        raw_unit: str,
+        parsed_qty: Decimal,
+        section: str,
+        page_index: int,
+        sequence: int,
+    ) -> NormalizedItem:
+        """Создает нормализованную позицию из строки распознанной таблицы."""
+        raw_mark = self._at(row, schema.mark_col)
+        raw_code = self._at(row, schema.code_col)
+        position = self._at(row, schema.position_col)
+
+        canonical_u, norm_qty, multiplier = UnitNormalizer.normalize(
+            raw_unit, parsed_qty
+        )
+        clean_title = re.sub(r"\s+", " ", raw_title).lower().strip()
+        dimensions = DimensionLockExtractor.extract(raw_title)
+
+        if schema.kind == "SPECIFICATION":
+            effective_code = raw_code or raw_mark or position or None
+        else:
+            effective_code = None
+
+        pointer = CellPointer(
+            doc_type=schema.kind,
+            file_name=self.file_path,
+            sheet_name=f"Page {page_index}",
+            row_idx=sequence,
+            col_letter=openpyxl.utils.get_column_letter(schema.qty_col + 1),
+            coordinate=f"p.{page_index} [row {sequence}]",
+        )
+
+        return NormalizedItem(
+            raw_id=f"{schema.kind}_{sequence}",
+            code=effective_code,
+            raw_title=raw_title,
+            clean_title=clean_title,
+            raw_unit=raw_unit,
+            canonical_unit=canonical_u,
+            unit_multiplier=multiplier,
+            volume=norm_qty,
+            dimensions=dimensions,
+            context_section=section,
+            pointer=pointer,
+        )
