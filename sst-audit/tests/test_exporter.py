@@ -14,7 +14,12 @@ import pytest
 
 import db
 import exporter
-from exporter import SHEET_TITLE, export_audit_to_excel
+from exporter import (
+    DASHBOARD_TITLE,
+    SHEET_TITLE,
+    export_audit_to_excel,
+    export_sessions_to_excel,
+)
 
 SESSION_ID = "export-session-001"
 PROJECT_NAME = "ЖК Север, корпус 3"
@@ -127,6 +132,64 @@ def _seed_session(conn: sqlite3.Connection) -> tuple[int, int]:
     return match_ids[0], match_ids[1]
 
 
+def _seed_unmatched_smeta_session(
+    conn: sqlite3.Connection,
+    session_id: str,
+    smeta_sheet: str,
+) -> int:
+    """Создает раздел, в котором позиция сметы не имеет пары в РД."""
+    db.create_session(
+        conn,
+        session_id,
+        PROJECT_NAME,
+        f"{session_id}.pdf",
+        "smeta.xlsx",
+        smeta_sheet=smeta_sheet,
+    )
+    db.save_smeta_items(
+        conn,
+        session_id,
+        [
+            {
+                "row_idx": 1,
+                "code": "ФССЦ-БЕЗ-РД",
+                "description": "Позиция сметы без подтверждения в РД",
+                "unit": "шт",
+                "quantity": Decimal("10.0"),
+                "unit_price": Decimal("0.0"),
+                "total_cost": Decimal("0.0"),
+            }
+        ],
+    )
+    smeta_id = int(
+        conn.execute(
+            "SELECT id FROM smeta_items WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()["id"]
+    )
+    db.save_matches(
+        conn,
+        session_id,
+        [
+            {
+                "rd_item_id": None,
+                "smeta_item_id": smeta_id,
+                "confidence_score": Decimal("0.0"),
+                "conversion_ratio": Decimal("1.0"),
+                "match_method": "NO_MATCH",
+                "status": "AUTO",
+            }
+        ],
+    )
+    match_id = int(
+        conn.execute(
+            "SELECT id FROM match_records WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()["id"]
+    )
+    return match_id
+
+
 def _open_sheet(path: Path):
     """Загружает книгу без вычисления формул и возвращает ее активный лист."""
     workbook = load_workbook(path, data_only=False)
@@ -142,7 +205,8 @@ def test_exporter_creates_valid_xlsx(conn: sqlite3.Connection, tmp_path: Path) -
     assert target.stat().st_size > 0
 
     workbook = load_workbook(target)
-    assert workbook.sheetnames == [SHEET_TITLE]
+    assert workbook.sheetnames == [DASHBOARD_TITLE, SHEET_TITLE]
+    assert workbook.active.title == DASHBOARD_TITLE
     worksheet = workbook[SHEET_TITLE]
 
     assert worksheet["B1"].value == "Проект:"
@@ -155,8 +219,12 @@ def test_exporter_creates_valid_xlsx(conn: sqlite3.Connection, tmp_path: Path) -
     assert worksheet["C4"].value == "Позиция РД (наименование)"
     assert worksheet["Q4"].value == "Экспертный комментарий / Причина отклонения"
     assert worksheet.freeze_panes == "C5"
+    assert worksheet.auto_filter.ref == "B4:Q6"
     assert worksheet.max_row == 6
     assert worksheet.max_column == 17
+    assert not worksheet.column_dimensions["J"].hidden
+    assert not worksheet.column_dimensions["K"].hidden
+    assert not worksheet.column_dimensions["O"].hidden
 
     assert worksheet["B5"].value == 1
     assert worksheet["B6"].value == 2
@@ -171,6 +239,8 @@ def test_exporter_creates_valid_xlsx(conn: sqlite3.Connection, tmp_path: Path) -
     assert worksheet["N5"].fill.fgColor.rgb.endswith("C6EFCE")
     assert worksheet["P5"].value == "AUTO"
     assert worksheet["P6"].value == "HITL_PENDING"
+    assert worksheet["P6"].fill.fgColor.rgb.endswith("FFEB9C")
+    assert worksheet["P6"].font.color.rgb.endswith("9C6500")
 
 
 def test_exporter_native_formulas_presence(
@@ -284,4 +354,134 @@ def test_exporter_resolves_latest_session(conn: sqlite3.Connection, tmp_path: Pa
 
     with pytest.raises(LookupError):
         export_audit_to_excel(conn, "missing-session", tmp_path / "missing.xlsx")
+
+
+def test_exporter_overrun_is_red(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """Превышение объема сметы над РД окрашивает статус и дельту в красный."""
+    _seed_session(conn)
+    conn.execute(
+        """
+        UPDATE smeta_items
+        SET quantity = 150.0, total_cost = 375000.0
+        WHERE session_id = ? AND row_idx = 1
+        """,
+        (SESSION_ID,),
+    )
+    conn.commit()
+
+    target = export_audit_to_excel(conn, SESSION_ID, tmp_path / "overrun.xlsx")
+    worksheet = _open_sheet(target)
+
+    assert worksheet["P5"].value == "AUTO"
+    assert worksheet["P5"].fill.fgColor.rgb.endswith("FFC7CE")
+    assert worksheet["P5"].font.color.rgb.endswith("9C0006")
+    assert worksheet["N5"].value == "=I5-M5"
+    assert worksheet["N5"].fill.fgColor.rgb.endswith("FFC7CE")
+    assert worksheet["O5"].fill.fgColor.rgb.endswith("FFC7CE")
+
+
+def test_exporter_without_rd_pair_is_gray_and_has_no_deltas(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """Строка без пары РД не получает зеленый AUTO и дельтовые формулы."""
+    match_id = _seed_unmatched_smeta_session(conn, "no-rd-session", "ЛС 02-01-01")
+
+    target = export_audit_to_excel(conn, "no-rd-session", tmp_path / "no-rd.xlsx")
+    worksheet = _open_sheet(target)
+
+    assert worksheet["A5"].value == match_id
+    assert worksheet["C5"].value is None
+    assert worksheet["E5"].value is None
+    assert worksheet["P5"].value == exporter.STATUS_NOT_IN_RD
+    assert worksheet["P5"].fill.fgColor.rgb.endswith("D9D9D9")
+    assert worksheet["P5"].font.color.rgb.endswith("595959")
+    for column in ("L", "M", "N", "O"):
+        assert worksheet[f"{column}5"].value is None
+    assert worksheet["N5"].fill.fill_type is None
+
+    # В разделе нет ни одной ненулевой цены: шумовые колонки скрываются.
+    assert worksheet.column_dimensions["J"].hidden is True
+    assert worksheet.column_dimensions["K"].hidden is True
+    assert worksheet.column_dimensions["O"].hidden is True
+    assert worksheet.auto_filter.ref == "B4:Q5"
+
+    workbook = load_workbook(target)
+    dashboard = workbook[DASHBOARD_TITLE]
+    assert dashboard["G21"].value == 1
+    assert dashboard["M21"].value == exporter.VERDICT_NO_MATCH
+    assert dashboard["M21"].fill.fgColor.rgb.endswith("D9D9D9")
+
+
+def test_export_sessions_readable_titles_and_dashboard(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """Многолистовая книга получает дашборд и вкладки «Раздел (Шифр)»."""
+    _seed_session(conn)
+    conn.execute(
+        "UPDATE sessions SET smeta_sheet = 'ЛС 02-01-03' WHERE id = ?",
+        (SESSION_ID,),
+    )
+    conn.commit()
+    _seed_unmatched_smeta_session(conn, "ar-session", "ЛС 02-01-01")
+
+    target = export_sessions_to_excel(
+        conn,
+        [SESSION_ID, "ar-session"],
+        tmp_path / "multi.xlsx",
+    )
+    workbook = load_workbook(target)
+
+    assert workbook.sheetnames == [
+        DASHBOARD_TITLE,
+        "ЭОМ (ЛС 02-01-03)",
+        "АР (ЛС 02-01-01)",
+    ]
+    assert workbook.active.title == DASHBOARD_TITLE
+
+    dashboard = workbook[DASHBOARD_TITLE]
+    assert dashboard["A1"].value == "СВОДНЫЙ АУДИТ ОБЪЁМОВ"
+    assert dashboard["B7"].value == 2
+    assert dashboard["B9"].value == 2
+    assert dashboard["B10"].value == 3
+    assert dashboard["B11"].value == 2
+    assert dashboard["B12"].value == pytest.approx(2 / 3)
+    assert dashboard["B13"].value == 1
+    assert dashboard["B14"].value == 1
+    assert dashboard["B15"].value == 1
+    assert dashboard["B21"].value == "ЭОМ"
+    assert dashboard["C21"].value == "ЛС 02-01-03"
+    assert dashboard["M21"].value == exporter.VERDICT_DISCREPANCY
+    assert dashboard["B22"].value == "АР"
+    assert dashboard["C22"].value == "ЛС 02-01-01"
+    assert dashboard["G22"].value == 1
+    assert dashboard["M22"].value == exporter.VERDICT_NO_MATCH
+    assert dashboard["M22"].fill.fgColor.rgb.endswith("D9D9D9")
+    assert dashboard["B21"].hyperlink is not None
+    assert dashboard.auto_filter.ref == "A20:M22"
+
+    eom = workbook["ЭОМ (ЛС 02-01-03)"]
+    assert eom.auto_filter.ref == "B4:Q6"
+    assert eom.freeze_panes == "C5"
+
+    ar = workbook["АР (ЛС 02-01-01)"]
+    assert ar["P5"].value == exporter.STATUS_NOT_IN_RD
+    assert ar["C5"].value is None
+    assert ar["N5"].value is None
+    assert ar["P5"].fill.fgColor.rgb.endswith("D9D9D9")
+
+
+def test_readable_sheet_title_respects_excel_limits(tmp_path: Path) -> None:
+    """Имя вкладки содержит читаемый раздел и очищается от запрещенных знаков."""
+    assert (
+        exporter._readable_sheet_title("ЛС 02-01-16", "fallback")
+        == "СДС (ЛС 02-01-16)"
+    )
+
+    raw = "Очень длинное название / раздела ? * : [ ] (ЛС 02-01-99)"
+    title = exporter._readable_sheet_title(raw, "fallback")
+    assert len(title) <= 31
+    for invalid in "\\/?*:[]":
+        assert invalid not in title
 
