@@ -1,17 +1,17 @@
 """Оркестратор sst-audit: SQLite как единственный источник истины (SSOT).
 
-Конвейер:
+Единый конвейер:
 1. INGEST   — парсинг РД (PDF) и сметы (XLSX), нормализация и атомарная
               запись позиций в ``rd_items`` / ``smeta_items``.
-2. MATCHING — каскадное сопоставление, запись связей в ``match_records``
-              (``AUTO`` при уверенности >= ``AUTO_MATCH_THRESHOLD`` и
-              отсутствии неоднозначности, иначе ``HITL_PENDING``).
-3. RULES    — оценка количественных расхождений в ``rule_evaluations``.
-4. STATUS   — сессия переводится в ``MATCHED`` (есть очередь HITL) либо
-              ``REVIEWED`` (очередь пуста).
+2. MATCHING — каскадное сопоставление, запись связей в ``match_records``.
+              Позиции с максимальным сходством ниже ``MIN_MATCH_THRESHOLD``
+              не отвлекают сметчика: они фиксируются как ``AUTO``/``NO_MATCH``.
+3. HITL     — при наличии очереди ``HITL_PENDING`` автоматически запускается
+              терминальное ревью из ``cli_review.py`` в текущем процессе.
+4. RULES    — оценка количественных расхождений в ``rule_evaluations``.
+5. EXPORT   — итоговая ведомость формируется из SSOT через ``exporter.py``.
 
-XML-отчет не формируется: единственный источник истины — SQLite, выгрузка
-отчета выполняется из представления ``v_audit_export``.
+XML/JSON-дампы не формируются: единственный источник истины — SQLite.
 """
 
 from __future__ import annotations
@@ -21,15 +21,20 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 import sqlite3
-from typing import Any, Final, Mapping, Optional, Sequence
+from typing import Any, Final, Optional, Sequence
 import uuid
 
+import cli_review
 import db
+import exporter
 from evaluator import DiscrepancyDetector
 from matcher import CascadeMatcher
 from models import CollisionSeverity, NormalizedItem
 from parsers import LSRParser, PDFSpecParser
 
+# Жесткий порог отсечки семантического шума (шкала матчера 0-100).
+# Ниже него позиция сметы считается отсутствующей в РД и не попадает в HITL.
+MIN_MATCH_THRESHOLD: Final[Decimal] = Decimal("40.0")
 # Порог автоматического принятия связи (шкала матчера 0-100).
 AUTO_MATCH_THRESHOLD: Final[Decimal] = Decimal("70.0")
 # Минимальный отрыв лидера от второго кандидата; иначе связь неоднозначна.
@@ -38,6 +43,7 @@ DEFAULT_CONVERSION_RATIO: Final[Decimal] = db.DEFAULT_CONVERSION_RATIO
 
 MATCH_METHOD_CASCADE: Final[str] = "FUZZY_CASCADE"
 MATCH_METHOD_NO_CANDIDATE: Final[str] = "NO_CANDIDATE"
+MATCH_METHOD_NO_MATCH: Final[str] = "NO_MATCH"
 MATCH_METHOD_REVERSE: Final[str] = "REVERSE_PASS"
 
 RULE_BY_SEVERITY: Final[dict[CollisionSeverity, str]] = {
@@ -87,6 +93,7 @@ class PipelineResult:
     evaluations_saved: int
     auto_matches: int
     hitl_pending: int
+    no_match: int = 0
 
 
 def _candidates(
@@ -111,12 +118,19 @@ def match_items(
 ) -> list[MatchDecision]:
     """Сопоставляет позиции сметы с РД и классифицирует связи.
 
-    * ``AUTO`` — лидер >= порога и отрыв от второго кандидата не меньше
-      ``AMBIGUITY_MARGIN``;
-    * ``HITL_PENDING`` — низкая уверенность, неоднозначность или отсутствие
-      кандидатов;
-    * обратный проход добавляет ``HITL_PENDING`` для позиций РД, не нашедших
-      отражения в смете.
+    Классификация:
+
+    * ``score < MIN_MATCH_THRESHOLD`` — позиция сметы отсутствует в РД:
+      ``AUTO``/``NO_MATCH``, ``rd_item_id = NULL``, ``confidence = 0``;
+    * ``MIN_MATCH_THRESHOLD <= score < AUTO_MATCH_THRESHOLD`` — пограничное
+      сходство, требуется решение эксперта (``HITL_PENDING``);
+    * ``score >= AUTO_MATCH_THRESHOLD`` с отрывом от второго кандидата не
+      меньше ``AMBIGUITY_MARGIN`` — автоматическое принятие связи;
+    * неоднозначность (отрыв < ``AMBIGUITY_MARGIN``) отправляется в HITL.
+
+    Обратный проход добавляет ``HITL_PENDING`` только для позиций РД, у
+    которых вообще не нашлось ни одного сметного кандидата. Слабые кандидаты
+    ниже порога отсечки не создают повторную карточку по той же паре.
     """
     decisions: list[MatchDecision] = []
     covered_rd: set[int] = set()
@@ -125,35 +139,49 @@ def match_items(
         candidates = _candidates(smeta_item, rd_items)
         best_item: Optional[NormalizedItem] = None
         best_score = Decimal("0")
-        ambiguous = False
 
         if candidates:
             best_item, raw_score = candidates[0]
             best_score = Decimal(str(raw_score))
-            if len(candidates) > 1:
-                runner_up = Decimal(str(candidates[1][1]))
-                ambiguous = (best_score - runner_up) < AMBIGUITY_MARGIN
-
-        is_auto = (
-            best_item is not None
-            and best_score >= AUTO_MATCH_THRESHOLD
-            and not ambiguous
-        )
-        if best_item is not None:
+            # Даже слабое лексическое пересечение считается упоминанием РД
+            # в смете: иначе обратный проход продублирует шум карточкой
+            # "позиция РД отсутствует в смете".
             covered_rd.add(id(best_item))
 
+        if best_item is None or best_score < MIN_MATCH_THRESHOLD:
+            decisions.append(
+                MatchDecision(
+                    smeta_item=smeta_item,
+                    rd_item=None,
+                    confidence=Decimal("0"),
+                    status="AUTO",
+                    method=MATCH_METHOD_NO_MATCH,
+                    candidates=(),
+                )
+            )
+            continue
+
+        runner_up = (
+            Decimal(str(candidates[1][1])) if len(candidates) > 1 else Decimal("0")
+        )
+        ambiguous = bool(candidates[1:]) and (
+            best_score - runner_up
+        ) < AMBIGUITY_MARGIN
+        qualified_candidates = tuple(
+            (item, score)
+            for item, score in candidates
+            if Decimal(str(score)) >= MIN_MATCH_THRESHOLD
+        )[:3]
+
+        is_auto = best_score >= AUTO_MATCH_THRESHOLD and not ambiguous
         decisions.append(
             MatchDecision(
                 smeta_item=smeta_item,
                 rd_item=best_item,
                 confidence=best_score,
                 status="AUTO" if is_auto else "HITL_PENDING",
-                method=(
-                    MATCH_METHOD_CASCADE
-                    if best_item is not None
-                    else MATCH_METHOD_NO_CANDIDATE
-                ),
-                candidates=tuple(candidates[:3]),
+                method=MATCH_METHOD_CASCADE,
+                candidates=qualified_candidates,
             )
         )
 
@@ -251,137 +279,31 @@ def _load_item_ids(
     return ids
 
 
-def resolve_pending_reviews(
-    conn: sqlite3.Connection,
-    session_id: str,
+def _decisions_from_match_rows(
     match_rows: Sequence[sqlite3.Row],
-    decisions: Sequence[MatchDecision],
-    rd_id_by_object: Mapping[int, int],
-    reviewer: str,
+    rd_by_id: dict[int, NormalizedItem],
+    smeta_by_id: dict[int, NormalizedItem],
 ) -> list[MatchDecision]:
-    """Интерактивный HITL-цикл: фиксирует решения эксперта по связям.
+    """Пересобирает решения матчера из финального состояния SSOT.
 
-    Возвращает решения в исходном порядке, обновленные выбранными
-    кандидатами: последующая оценка правил выполняется уже по финальной паре.
-    Записи без кандидатов остаются в очереди для экспертной проверки
-    (в терминале выбирать не из чего).
+    После терминального ревью выбранные кандидаты уже сохранены в
+    ``match_records``. Оценка правил обязана выполняться по этим связям,
+    а не по первоначальному предложению матчера.
     """
-    index_by_match_id = {
-        int(row["id"]): index for index, row in enumerate(match_rows)
-    }
-    resolved = list(decisions)
-
-    for row in db.get_pending_reviews(conn, session_id):
-        match_id = int(row["match_id"])
-        index = index_by_match_id.get(match_id)
-        if index is None:
-            continue
-        decision = decisions[index]
-        if decision.smeta_item is None or not decision.candidates:
-            continue
-
-        selected = _prompt_operator_review(decision.smeta_item, decision.candidates)
-        if selected is None:
-            db.update_match_link(conn, match_id, None, Decimal("0"))
-            resolved[index] = MatchDecision(
-                smeta_item=decision.smeta_item,
-                rd_item=None,
-                confidence=Decimal("0"),
-                status="RESOLVED",
-                method=MATCH_METHOD_NO_CANDIDATE,
-                candidates=decision.candidates,
+    decisions: list[MatchDecision] = []
+    for row in match_rows:
+        rd_id = row["rd_item_id"]
+        smeta_id = row["smeta_item_id"]
+        decisions.append(
+            MatchDecision(
+                smeta_item=smeta_by_id.get(int(smeta_id)) if smeta_id else None,
+                rd_item=rd_by_id.get(int(rd_id)) if rd_id else None,
+                confidence=Decimal(str(row["confidence_score"] or 0)),
+                status=str(row["status"]),
+                method=str(row["match_method"]),
             )
-            db.record_expert_review(
-                conn,
-                match_id,
-                reviewer,
-                "REJECTED",
-                reason_code="NO_MATCH_CONFIRMED",
-                comment="Оператор отклонил все кандидаты",
-            )
-        else:
-            selected_score = Decimal(
-                str(
-                    next(
-                        score
-                        for candidate, score in decision.candidates
-                        if candidate is selected
-                    )
-                )
-            )
-            db.update_match_link(
-                conn,
-                match_id,
-                rd_id_by_object.get(id(selected)),
-                selected_score,
-            )
-            resolved[index] = MatchDecision(
-                smeta_item=decision.smeta_item,
-                rd_item=selected,
-                confidence=selected_score,
-                status="RESOLVED",
-                method=MATCH_METHOD_CASCADE,
-                candidates=decision.candidates,
-            )
-            db.record_expert_review(
-                conn,
-                match_id,
-                reviewer,
-                "APPROVED",
-                comment=f"Подтверждена позиция {selected.raw_id}",
-            )
-
-    return resolved
-
-
-def _prompt_operator_review(
-    smeta_item: NormalizedItem,
-    candidates: Sequence[tuple[NormalizedItem, float]],
-) -> Optional[NormalizedItem]:
-    """Интерактивный Human-in-the-Loop интерфейс в терминале."""
-    print("\n" + "=" * 70)
-    print("🔍 [HUMAN-IN-THE-LOOP] ТРЕБУЕТСЯ ВЕРИФИКАЦИЯ СОПОСТАВЛЕНИЯ")
-    print("=" * 70)
-    print("📌 Позиция сметы:")
-    print(f"   • Наименование : {smeta_item.raw_title}")
-    print(f"   • Шифр/Код     : {smeta_item.code or '—'}")
-    print(
-        f"   • Объем        : {smeta_item.volume} "
-        f"{smeta_item.canonical_unit.value} "
-        f"(ячейка {smeta_item.pointer.coordinate})"
-    )
-    print("\n🎯 Найденные кандидаты из РД:")
-
-    for idx, (rd_item, score) in enumerate(candidates, start=1):
-        print(f"   [{idx}] Сходство: {score:.1f}%")
-        print(f"       • РД    : {rd_item.raw_title}")
-        print(f"       • Код   : {rd_item.code or '—'}")
-        print(
-            f"       • Объем : {rd_item.volume} {rd_item.canonical_unit.value} "
-            f"({rd_item.pointer.coordinate})"
         )
-
-    print("   [0] Ни один вариант не подходит (Отклонить все связи)")
-
-    while True:
-        choice = input(
-            "\n👉 Выберите номер верного соответствия [0-N] (Enter = 1): "
-        ).strip()
-        if choice == "" and candidates:
-            choice = "1"
-
-        if choice == "0":
-            print("❌ Связь отклонена оператором.")
-            return None
-        if choice.isdigit() and 1 <= int(choice) <= len(candidates):
-            selected = candidates[int(choice) - 1][0]
-            print(
-                "✅ Подтверждена связь с позицией: "
-                f"{selected.code or selected.raw_title[:40]}"
-            )
-            return selected
-
-        print("⚠️ Некорректный ввод, попробуйте еще раз.")
+    return decisions
 
 
 def run_pipeline(
@@ -439,6 +361,8 @@ def run_pipeline(
     smeta_id_by_object = {
         id(item): item_id for item, item_id in zip(smeta_items, smeta_ids)
     }
+    rd_by_id = {item_id: item for item, item_id in zip(rd_items, rd_ids)}
+    smeta_by_id = {item_id: item for item, item_id in zip(smeta_items, smeta_ids)}
 
     # --- ЭТАП MATCHING ------------------------------------------------------
     decisions = match_items(rd_items, smeta_items)
@@ -472,16 +396,20 @@ def run_pipeline(
             f"Сохранено {len(match_rows)} связей, ожидалось {len(decisions)}"
         )
 
-    # --- ЭТАП HITL (опционально) -------------------------------------------
+    # --- ЭТАП HITL: терминальное ревью в текущем процессе -------------------
     if interactive:
-        decisions = resolve_pending_reviews(
-            conn,
-            session_id,
-            match_rows,
-            decisions,
-            rd_id_by_object,
-            reviewer,
-        )
+        pending_before_review = db.get_pending_reviews(conn, session_id)
+        if pending_before_review:
+            cli_review.run_review(conn, session_id, reviewer=reviewer)
+            match_rows = db.get_match_records(conn, session_id)
+            if len(match_rows) != len(decisions):
+                raise RuntimeError(
+                    f"После ревью сохранено {len(match_rows)} связей, "
+                    f"ожидалось {len(decisions)}"
+                )
+            decisions = _decisions_from_match_rows(match_rows, rd_by_id, smeta_by_id)
+        else:
+            print("Все позиции сопоставлены автоматически (непоняток нет)")
 
     # --- ЭТАП RULES ---------------------------------------------------------
     match_ids = [int(row["id"]) for row in match_rows]
@@ -500,37 +428,29 @@ def run_pipeline(
         smeta_saved=smeta_saved,
         matches_saved=len(match_rows),
         evaluations_saved=evaluations_saved,
-        auto_matches=sum(1 for d in decisions if d.status == "AUTO"),
+        auto_matches=sum(
+            1
+            for decision in decisions
+            if decision.status == "AUTO" and decision.rd_item is not None
+        ),
         hitl_pending=len(pending),
+        no_match=sum(
+            1
+            for decision in decisions
+            if decision.status == "AUTO"
+            and decision.rd_item is None
+            and decision.smeta_item is not None
+        ),
     )
-
-
-def export_audit_view(
-    conn: sqlite3.Connection,
-    session_id: str,
-    output_path: str | Path,
-) -> int:
-    """Выгружает отчет из ``v_audit_export`` в Excel.
-
-    Возвращает количество выгруженных строк. XML-отчет не формируется.
-    """
-    import pandas as pd
-
-    frame = pd.read_sql_query(
-        "SELECT * FROM v_audit_export WHERE session_id = ? ORDER BY match_id",
-        conn,
-        params=(session_id,),
-    )
-    target = Path(output_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    frame.to_excel(target, index=False)
-    return int(len(frame))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """Точка входа CLI: конфигурация сессии и запуск пайплайна."""
+    """Точка входа all-in-one CLI: ingest -> match -> HITL -> export."""
     parser = argparse.ArgumentParser(
-        description="Аудит смет (Excel) и РД (PDF) с SQLite как SSOT"
+        description=(
+            "Единый аудит смет (Excel) и РД (PDF): автоматическое HITL-ревью "
+            "пограничных связей и формирование итогового XLSX"
+        )
     )
     parser.add_argument(
         "--project",
@@ -558,13 +478,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--session-id", default=None, help="Идентификатор сессии")
     parser.add_argument(
         "--out",
-        default=None,
-        help="Опциональная Excel-выгрузка из v_audit_export",
+        default=exporter.DEFAULT_OUTPUT,
+        help="Итоговая ведомость аудита (.xlsx)",
+    )
+    parser.add_argument(
+        "--no-review",
+        action="store_true",
+        help="Не запускать терминальное HITL-ревью (для автоматизации/CI)",
     )
     parser.add_argument(
         "--interactive",
         action="store_true",
-        help="Включить интерактивный HITL-опрос оператора",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--reviewer",
@@ -590,7 +515,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         result = run_pipeline(
             conn,
             config,
-            interactive=args.interactive,
+            interactive=not args.no_review,
             reviewer=args.reviewer,
         )
         print(
@@ -604,11 +529,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         print(
             f"    AUTO: {result.auto_matches}, "
+            f"NO_MATCH (< {MIN_MATCH_THRESHOLD}%): {result.no_match}, "
             f"HITL_PENDING: {result.hitl_pending}"
         )
-        if args.out:
-            exported = export_audit_view(conn, result.session_id, args.out)
-            print(f"    Excel-выгрузка: {args.out} (строк: {exported})")
+        target = exporter.export_audit_to_excel(
+            conn, result.session_id, args.out
+        )
+        print(f"Ведомость сформирована: {target}")
     finally:
         conn.close()
 

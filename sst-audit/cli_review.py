@@ -15,6 +15,7 @@ import argparse
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+import json
 from pathlib import Path
 import sqlite3
 from typing import Final, Optional
@@ -26,10 +27,16 @@ from rich.text import Text
 
 import db
 from evaluator import DiscrepancyDetector
+from matcher import CascadeMatcher
+from models import CellPointer, NormalizedItem, UnitClass
+from normalizer import DimensionLockExtractor, UnitNormalizer
 
 DEFAULT_REVIEWER: Final[str] = "estimator_cli"
 LATEST_SESSION: Final[str] = "latest"
 CONFIDENCE_WARN_THRESHOLD: Final[Decimal] = Decimal("50.0")
+# Синхронизировано с main.MIN_MATCH_THRESHOLD: шум ниже 40% не показываем.
+MIN_CANDIDATE_SCORE: Final[Decimal] = Decimal("40.0")
+MAX_CANDIDATES: Final[int] = 3
 ONE: Final[Decimal] = Decimal("1.0")
 PERCENT: Final[Decimal] = Decimal("100")
 
@@ -40,8 +47,21 @@ REJECT_REASONS: Final[dict[str, tuple[str, str]]] = {
     "3": ("PARSER_ERROR", "Ошибка парсера: данные извлечены неверно"),
     "4": ("OTHER", "Иное (уточните комментарием)"),
 }
-VALID_COMMANDS: Final[frozenset[str]] = frozenset({"A", "R", "C", "S", "Q"})
+VALID_COMMANDS: Final[frozenset[str]] = frozenset(
+    {"1", "2", "3", "A", "R", "C", "S", "Q"}
+)
 CLOSED_SESSION_STATUSES: Final[frozenset[str]] = frozenset({"REVIEWED", "EXPORTED"})
+
+
+@dataclass(frozen=True)
+class CandidateMatch:
+    """Кандидат РД для выбора сметчиком (score >= 40%)."""
+
+    rd_item_id: int
+    score: Decimal
+    description: str
+    unit: str
+    quantity: Decimal
 
 
 @dataclass(frozen=True)
@@ -63,6 +83,7 @@ class ReviewCard:
     smeta_quantity: Optional[Decimal]
     unit_price: Optional[Decimal]
     total_cost: Optional[Decimal]
+    candidates: tuple[CandidateMatch, ...] = ()
 
     @property
     def is_paired(self) -> bool:
@@ -224,7 +245,147 @@ def _verdict(card: ReviewCard, ratio: Optional[Decimal] = None) -> tuple[str, st
     return "В пределах допуска", "green"
 
 
-def _card_from_row(row: sqlite3.Row, *, index: int, total: int) -> ReviewCard:
+def _payload_from_row(row: sqlite3.Row) -> dict[str, object]:
+    """Читает аудиторский JSON-след позиции, устойчиво к старым записям."""
+    raw = row["raw_payload"]
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _normalized_from_row(
+    row: sqlite3.Row,
+    *,
+    is_smeta: bool,
+) -> NormalizedItem:
+    """Восстанавливает ``NormalizedItem`` из строки SSOT для пересчета score."""
+    payload = _payload_from_row(row)
+    quantity = _to_decimal(row["quantity"]) or Decimal("0")
+    raw_unit = str(payload.get("raw_unit") or row["unit"] or "")
+    raw_title = str(payload.get("raw_title") or row["description"] or "")
+
+    canonical_value = payload.get("canonical_unit")
+    try:
+        canonical_unit = UnitClass(str(canonical_value))
+    except ValueError:
+        canonical_unit, _, _ = UnitNormalizer.normalize(raw_unit, quantity)
+
+    multiplier_value = payload.get("unit_multiplier")
+    if multiplier_value is not None:
+        try:
+            unit_multiplier = Decimal(str(multiplier_value))
+        except InvalidOperation:
+            unit_multiplier = Decimal("1.0")
+    else:
+        _, _, unit_multiplier = UnitNormalizer.normalize(raw_unit, quantity)
+
+    dimensions_raw = payload.get("dimensions")
+    dimensions = (
+        {str(key): str(value) for key, value in dimensions_raw.items()}
+        if isinstance(dimensions_raw, dict)
+        else DimensionLockExtractor.extract(raw_title)
+    )
+
+    pointer_raw = payload.get("pointer")
+    pointer_payload = pointer_raw if isinstance(pointer_raw, dict) else {}
+    pointer = CellPointer(
+        doc_type=str(
+            pointer_payload.get("doc_type") or ("LSR" if is_smeta else "SPECIFICATION")
+        ),
+        file_name=str(pointer_payload.get("file_name") or ""),
+        sheet_name=str(pointer_payload.get("sheet_name") or ""),
+        row_idx=int(pointer_payload.get("row_idx") or 1),
+        col_letter=str(pointer_payload.get("col_letter") or "A"),
+        coordinate=str(pointer_payload.get("coordinate") or "—"),
+    )
+
+    unit_price = (
+        _optional_decimal(row["unit_price"])
+        if is_smeta and "unit_price" in row.keys()
+        else None
+    )
+    total_cost = (
+        _optional_decimal(row["total_cost"])
+        if is_smeta and "total_cost" in row.keys()
+        else None
+    )
+
+    return NormalizedItem(
+        raw_id=str(payload.get("raw_id") or f"DB_{row['id']}"),
+        code=_text_or_none(row["code"]),
+        raw_title=raw_title,
+        clean_title=str(payload.get("clean_title") or raw_title.lower()),
+        raw_unit=raw_unit,
+        canonical_unit=canonical_unit,
+        unit_multiplier=unit_multiplier,
+        volume=quantity,
+        dimensions=dimensions,
+        context_section=str(payload.get("context_section") or "Default_Section"),
+        pointer=pointer,
+        is_resource=bool(payload.get("is_resource", is_smeta)),
+        parent_id=(
+            str(payload["parent_id"]) if payload.get("parent_id") is not None else None
+        ),
+        unit_price=unit_price,
+        total_cost=total_cost,
+    )
+
+
+def _candidates_for_row(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> tuple[CandidateMatch, ...]:
+    """Возвращает top-3 кандидатов РД со score >= ``MIN_CANDIDATE_SCORE``."""
+    smeta_item_id = row["smeta_item_id"]
+    if smeta_item_id is None:
+        return ()
+
+    smeta_row = conn.execute(
+        "SELECT * FROM smeta_items WHERE id = ?",
+        (int(smeta_item_id),),
+    ).fetchone()
+    if smeta_row is None:
+        return ()
+
+    rd_rows = conn.execute(
+        "SELECT * FROM rd_items WHERE session_id = ? ORDER BY id ASC",
+        (str(row["session_id"]),),
+    ).fetchall()
+    if not rd_rows:
+        return ()
+
+    smeta_item = _normalized_from_row(smeta_row, is_smeta=True)
+    scored: list[tuple[NormalizedItem, Decimal, sqlite3.Row]] = []
+    for rd_row in rd_rows:
+        rd_item = _normalized_from_row(rd_row, is_smeta=False)
+        score = Decimal(str(CascadeMatcher.calculate_score(smeta_item, rd_item)))
+        if score >= MIN_CANDIDATE_SCORE:
+            scored.append((rd_item, score, rd_row))
+
+    scored.sort(key=lambda entry: entry[1], reverse=True)
+    return tuple(
+        CandidateMatch(
+            rd_item_id=int(rd_row["id"]),
+            score=score,
+            description=str(rd_row["description"] or ""),
+            unit=str(rd_row["unit"] or ""),
+            quantity=_to_decimal(rd_row["quantity"]) or Decimal("0"),
+        )
+        for _, score, rd_row in scored[:MAX_CANDIDATES]
+    )
+
+
+def _card_from_row(
+    row: sqlite3.Row,
+    *,
+    index: int,
+    total: int,
+    candidates: Sequence[CandidateMatch] = (),
+) -> ReviewCard:
     """Собирает карточку из строки ``PENDING_REVIEWS_SQL``."""
     conversion = row["conversion_ratio"]
     return ReviewCard(
@@ -243,6 +404,7 @@ def _card_from_row(row: sqlite3.Row, *, index: int, total: int) -> ReviewCard:
         smeta_quantity=_optional_decimal(row["smeta_quantity"]),
         unit_price=_optional_decimal(row["unit_price"]),
         total_cost=_optional_decimal(row["total_cost"]),
+        candidates=tuple(candidates),
     )
 
 
@@ -328,6 +490,28 @@ def _render_calculation_block(card: ReviewCard) -> Panel:
     return Panel(table, title="Расчет", border_style="magenta", padding=(0, 1))
 
 
+def _render_candidates_block(card: ReviewCard) -> Optional[Panel]:
+    """Блок top-3 кандидатов РД с оценкой сходства."""
+    if not card.candidates:
+        return None
+    lines = Text()
+    for position, candidate in enumerate(card.candidates, start=1):
+        if position > 1:
+            lines.append("\n")
+        lines.append(f"[{position}] ", style="bold cyan")
+        lines.append(f"{candidate.score:.1f}%", style="green")
+        lines.append(
+            f" | {candidate.description} | "
+            f"{_format_quantity(candidate.quantity)} {candidate.unit}".rstrip()
+        )
+    return Panel(
+        lines,
+        title=f"Кандидаты РД (top-{len(card.candidates)})",
+        border_style="blue",
+        padding=(0, 1),
+    )
+
+
 def render_card(console: Console, card: ReviewCard) -> None:
     """Выводит карточку сравнения с цветовой градацией уверенности."""
     style = _confidence_style(card.confidence)
@@ -341,9 +525,18 @@ def render_card(console: Console, card: ReviewCard) -> None:
     body.add_column()
     body.add_row(_render_rd_block(card))
     body.add_row(_render_smeta_block(card))
+    candidates_block = _render_candidates_block(card)
+    if candidates_block is not None:
+        body.add_row(candidates_block)
     body.add_row(_render_calculation_block(card))
     console.print(Panel(body, title=title, border_style=style, padding=(0, 1)))
-    if card.is_paired:
+    if card.candidates:
+        console.print(
+            "[dim]1-3 / Enter — выбрать кандидата (Enter = №1) · "
+            "A — принять текущую связь · R — отклонить (сохранив №1) · "
+            "C — коэффициент · S — пропустить · Q — выход[/dim]"
+        )
+    elif card.is_paired:
         console.print(
             "[dim]A — принять · R — отклонить · C — коэффициент · "
             "S — пропустить · Q — выход[/dim]"
@@ -360,17 +553,29 @@ def render_card(console: Console, card: ReviewCard) -> None:
 # ----------------------------------------------------------------------
 
 
-def _prompt_command(console: Console) -> str:
+def _prompt_command(console: Console, *, candidate_count: int = 0) -> str:
     """Запрашивает команду до получения допустимого значения."""
+    if candidate_count:
+        prompt = (
+            f"Команда [1-{candidate_count}/A/R/C/S/Q, Enter = 1]: "
+        )
+    else:
+        prompt = "Команда [A/R/C/S/Q]: "
     while True:
         try:
-            raw = input("Команда [A/R/C/S/Q]: ")
+            raw = input(prompt)
         except EOFError:
             return "Q"
         command = raw.strip().upper()
+        if not command and candidate_count:
+            return "1"
         if command in VALID_COMMANDS:
             return command
-        console.print("[red]Некорректная команда. Допустимо: A, R, C, S, Q.[/red]")
+        console.print(
+            "[red]Некорректная команда. Допустимо: "
+            + ("1-3, " if candidate_count else "")
+            + "A, R, C, S, Q.[/red]"
+        )
 
 
 def _prompt_reject(console: Console) -> Optional[tuple[str, Optional[str]]]:
@@ -443,6 +648,31 @@ def _apply_approval(
         )
 
 
+def _apply_candidate_selection(
+    conn: sqlite3.Connection,
+    card: ReviewCard,
+    candidate: CandidateMatch,
+    position: int,
+    reviewer: str,
+) -> None:
+    """Фиксирует выбор сметчиком одного из top-3 кандидатов РД."""
+    comment = f"Выбран кандидат №{position}: {candidate.description}"
+    with db.transaction(conn):
+        db.update_match_link(
+            conn,
+            card.match_id,
+            candidate.rd_item_id,
+            candidate.score,
+        )
+        db.record_expert_review(
+            conn,
+            card.match_id,
+            reviewer,
+            "APPROVED",
+            comment=comment,
+        )
+
+
 def _apply_rejection(
     conn: sqlite3.Connection,
     card: ReviewCard,
@@ -450,10 +680,20 @@ def _apply_rejection(
     reason_code: str,
     comment: Optional[str],
 ) -> None:
-    """Фиксирует отклонение предложенной связи и снимает ссылку на РД."""
+    """Фиксирует отклонение связи, сохраняя лучшего кандидата (top-1).
+
+    Связь с РД не обнуляется: эксперт фиксирует ошибочность сопоставления,
+    но ``rd_item_id`` остается для трассируемости и последующего разбора.
+    """
     with db.transaction(conn):
-        if card.is_paired:
-            db.update_match_link(conn, card.match_id, None, Decimal("0"))
+        if card.candidates:
+            top = card.candidates[0]
+            db.update_match_link(
+                conn,
+                card.match_id,
+                top.rd_item_id,
+                top.score,
+            )
         db.record_expert_review(
             conn,
             card.match_id,
@@ -606,12 +846,17 @@ def run_review(
     skipped = 0
 
     for index, row in enumerate(pending, start=1):
-        card = _card_from_row(row, index=index, total=total)
+        card = _card_from_row(
+            row,
+            index=index,
+            total=total,
+            candidates=_candidates_for_row(conn, row),
+        )
         render_card(console, card)
         quit_requested = False
 
         while True:
-            command = _prompt_command(console)
+            command = _prompt_command(console, candidate_count=len(card.candidates))
             if command == "Q":
                 quit_requested = True
                 break
@@ -632,7 +877,30 @@ def run_review(
                 reason_code, comment = rejection
                 _apply_rejection(conn, card, reviewer, reason_code, comment)
                 rejected += 1
-                console.print("[red]Отклонено: причина сохранена.[/red]")
+                console.print(
+                    "[red]Отклонено: причина сохранена, лучший кандидат РД "
+                    "оставлен для трассируемости.[/red]"
+                )
+                break
+            if command in {"1", "2", "3"}:
+                position = int(command)
+                if position > len(card.candidates):
+                    console.print(
+                        f"[red]Кандидат №{position} отсутствует: "
+                        f"доступно {len(card.candidates)}.[/red]"
+                    )
+                    continue
+                _apply_candidate_selection(
+                    conn,
+                    card,
+                    card.candidates[position - 1],
+                    position,
+                    reviewer,
+                )
+                approved += 1
+                console.print(
+                    f"[green]Принят кандидат №{position}: связь зафиксирована.[/green]"
+                )
                 break
 
             # Осталась только команда C (корректировка коэффициента).

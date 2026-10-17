@@ -455,7 +455,11 @@ def _write_record(
 
     if record.rd_quantity is not None:
         worksheet[f"M{row}"] = f"=E{row}*L{row}"
-    if record.smeta_quantity is not None and record.rd_quantity is not None:
+    if (
+        record.status != STATUS_REJECTED
+        and record.smeta_quantity is not None
+        and record.rd_quantity is not None
+    ):
         worksheet[f"N{row}"] = f"=I{row}-M{row}"
         if record.unit_price is not None:
             worksheet[f"O{row}"] = f"=N{row}*J{row}"

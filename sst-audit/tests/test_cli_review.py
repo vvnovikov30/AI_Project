@@ -199,7 +199,7 @@ def test_cli_review_reject_flow_with_reason(
     conn: sqlite3.Connection,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Команда R с кодом причины сохраняет reject_reason_code и снимает связь."""
+    """Команда R сохраняет причину, но не обнуляет rd_item_id (трассируемость)."""
     match_id = _seed_session(conn)
     assert match_id is not None
     _feed(monkeypatch, "R", "2", "Смета в 100 м, РД в м")
@@ -215,8 +215,8 @@ def test_cli_review_reject_flow_with_reason(
 
     match = _match(conn, match_id)
     assert match["status"] == "RESOLVED"
-    assert match["rd_item_id"] is None
-    assert match["confidence_score"] == 0
+    assert match["rd_item_id"] is not None
+    assert match["confidence_score"] > 0
 
     assert outcome.rejected == 1
     assert outcome.remaining == 0
