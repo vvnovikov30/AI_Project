@@ -6,6 +6,11 @@
 формулами Excel, поэтому проверяющий видит не только результат, но и логику
 расчета и может пересчитать ведомость средствами самого Excel.
 
+Книга начинается с титульного листа «📊 Сводный дашборд» с KPI объекта.
+Вкладки разделов получают читаемые имена вида ``АР (ЛС 02-01-01)``. Зеленая
+заливка статуса допустима только при наличии реальной пары РД и дельте
+объема в пределах допуска; несопоставленные строки нейтрально-серые.
+
 Запуск как самостоятельного скрипта::
 
     python exporter.py --db sst_audit.db --session latest --out report.xlsx
@@ -31,6 +36,7 @@ import db
 from evaluator import DiscrepancyDetector
 
 SHEET_TITLE: Final[str] = "Ведомость аудита объемов"
+DASHBOARD_TITLE: Final[str] = "📊 Сводный дашборд"
 LATEST_SESSION: Final[str] = "latest"
 DEFAULT_OUTPUT: Final[str] = "audit_report.xlsx"
 
@@ -38,16 +44,50 @@ HEADER_ROW: Final[int] = 4
 FIRST_DATA_ROW: Final[int] = 5
 HIDDEN_ID_COLUMN: Final[str] = "A"
 ONE: Final[Decimal] = Decimal("1.0")
+ZERO: Final[Decimal] = Decimal("0")
 
 MONEY_FORMAT: Final[str] = "#,##0.00"
 VOLUME_FORMAT: Final[str] = "#,##0.000"
 RATIO_FORMAT: Final[str] = "#,##0.0000"
+PERCENT_FORMAT: Final[str] = "0.0%"
 INTEGER_FORMAT: Final[str] = "0"
 
 STATUS_AUTO: Final[str] = "AUTO"
 STATUS_APPROVED: Final[str] = "APPROVED"
 STATUS_REJECTED: Final[str] = "REJECTED"
 STATUS_HITL_PENDING: Final[str] = "HITL_PENDING"
+STATUS_NOT_IN_RD: Final[str] = "НЕТ В РД"
+STATUS_NOT_IN_SMETA: Final[str] = "НЕТ В СМЕТЕ"
+
+# Читаемые аббревиатуры разделов. Шифр извлекается из имени листа сметы
+# (``ЛС 02-01-03``), поэтому название вкладки не зависит от порядка разделов.
+SECTION_NAMES_BY_CODE: Final[dict[str, str]] = {
+    "02-01-01": "АР",
+    "02-01-03": "ЭОМ",
+    "02-01-04": "ВК",
+    "02-01-05": "ВК",
+    "02-01-06": "ОВ",
+    "02-01-08": "АПС",
+    "02-01-09": "СОУЭ",
+    "02-01-11": "РТС",
+    "02-01-12": "СКТ",
+    "02-01-13": "СКС",
+    "02-01-14": "СОТ",
+    "02-01-15": "СКУД",
+    "02-01-16": "СДС",
+}
+
+VERDICT_OK: Final[str] = "ПРОВЕРЕНО"
+VERDICT_DISCREPANCY: Final[str] = "РАСХОЖДЕНИЯ"
+VERDICT_REVIEW: Final[str] = "ТРЕБУЕТ ПРОВЕРКИ"
+VERDICT_NO_MATCH: Final[str] = "НЕТ СОПОСТАВЛЕНИЯ"
+VERDICT_NO_DATA: Final[str] = "НЕТ ДАННЫХ"
+
+DASHBOARD_KPI_HEADER_ROW: Final[int] = 6
+DASHBOARD_FIRST_KPI_ROW: Final[int] = 7
+DASHBOARD_SECTION_TITLE_ROW: Final[int] = 19
+DASHBOARD_SECTION_HEADER_ROW: Final[int] = 20
+DASHBOARD_FIRST_SECTION_ROW: Final[int] = 21
 
 REJECT_REASON_TITLES: Final[dict[str, str]] = {
     "SEMANTIC_MISMATCH": "Семантика: описание относится к другому ресурсу",
@@ -119,6 +159,8 @@ class AuditRecord:
     """Нормализованная строка ведомости, готовая к записи в Excel."""
 
     match_id: int
+    rd_item_id: Optional[int]
+    smeta_item_id: Optional[int]
     rd_description: Optional[str]
     rd_unit: Optional[str]
     rd_quantity: Optional[Decimal]
@@ -131,6 +173,21 @@ class AuditRecord:
     ratio: Decimal
     status: str
     comment: Optional[str]
+
+    @property
+    def has_rd_pair(self) -> bool:
+        """Есть ли реальная позиция РД, а не только запись связи."""
+        return self.rd_item_id is not None and self.rd_description is not None
+
+    @property
+    def has_smeta_item(self) -> bool:
+        """Есть ли в связи позиция сметы."""
+        return self.smeta_item_id is not None and self.smeta_description is not None
+
+    @property
+    def has_pair(self) -> bool:
+        """Есть ли полноценная пара «смета ↔ РД» для сравнения объемов."""
+        return self.has_rd_pair and self.has_smeta_item
 
     @property
     def adjusted_rd_volume(self) -> Optional[Decimal]:
@@ -213,6 +270,16 @@ def _to_text(value: Any) -> Optional[str]:
     return text or None
 
 
+def _to_optional_int(value: Any) -> Optional[int]:
+    """Приводит SQLite-идентификатор к int, сохраняя ``None``."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 # ----------------------------------------------------------------------
 # 2. Чтение SSOT и нормализация строк отчета
 # ----------------------------------------------------------------------
@@ -267,15 +334,29 @@ def _effective_ratio(row: sqlite3.Row) -> Decimal:
 def _audit_status(row: sqlite3.Row) -> str:
     """Сводит статус связи и решение эксперта к статусу ведомости.
 
-    ``ADJUSTED`` показывается как ``APPROVED``: эксперт принял связь после
-    уточнения коэффициента. Аномальный ``RESOLVED`` без решения эксперта
-    возвращается в очередь, чтобы не маскировать нарушение пайплайна.
+    Отсутствие позиции РД имеет приоритет над техническим ``AUTO``: иначе
+    несопоставленная строка выглядит как успешно проверенная. ``ADJUSTED``
+    показывается как ``APPROVED``: эксперт принял связь после уточнения
+    коэффициента. Аномальный ``RESOLVED`` без решения эксперта возвращается
+    в очередь, чтобы не маскировать нарушение пайплайна.
     """
     match_status = _to_text(row["match_status"]) or STATUS_HITL_PENDING
     decision = _to_text(row["decision"])
+    has_rd = (
+        _to_optional_int(row["rd_item_id"]) is not None
+        and _to_text(row["rd_description"]) is not None
+    )
+    has_smeta = (
+        _to_optional_int(row["smeta_item_id"]) is not None
+        and _to_text(row["smeta_description"]) is not None
+    )
 
     if decision == "REJECTED":
         return STATUS_REJECTED
+    if not has_rd:
+        return STATUS_NOT_IN_RD
+    if not has_smeta:
+        return STATUS_NOT_IN_SMETA
     if decision in {"APPROVED", "ADJUSTED"}:
         return STATUS_APPROVED
     if match_status == STATUS_AUTO:
@@ -301,6 +382,8 @@ def _record_from_row(row: sqlite3.Row) -> AuditRecord:
     """Преобразует строку ``v_audit_export`` в модель ведомости."""
     return AuditRecord(
         match_id=int(row["match_id"]),
+        rd_item_id=_to_optional_int(row["rd_item_id"]),
+        smeta_item_id=_to_optional_int(row["smeta_item_id"]),
         rd_description=_to_text(row["rd_description"]),
         rd_unit=_to_text(row["rd_unit"]),
         rd_quantity=_to_decimal(row["rd_quantity"]),
@@ -348,26 +431,59 @@ _CELL_BORDER: Final[Border] = Border(
 _GREEN_FILL: Final[PatternFill] = PatternFill("solid", fgColor="C6EFCE")
 _RED_FILL: Final[PatternFill] = PatternFill("solid", fgColor="FFC7CE")
 _YELLOW_FILL: Final[PatternFill] = PatternFill("solid", fgColor="FFEB9C")
+_GRAY_FILL: Final[PatternFill] = PatternFill("solid", fgColor="D9D9D9")
 _WHITE_FILL: Final[PatternFill] = PatternFill("solid", fgColor="FFFFFF")
 
-_STATUS_STYLES: Final[dict[str, tuple[PatternFill, Font]]] = {
-    STATUS_AUTO: (
-        _GREEN_FILL,
-        Font(name="Calibri", size=10, bold=True, color="006100"),
-    ),
-    STATUS_APPROVED: (
-        _GREEN_FILL,
-        Font(name="Calibri", size=10, bold=True, color="006100"),
-    ),
-    STATUS_REJECTED: (
-        _RED_FILL,
-        Font(name="Calibri", size=10, bold=True, color="9C0006"),
-    ),
-    STATUS_HITL_PENDING: (
-        _YELLOW_FILL,
-        Font(name="Calibri", size=10, bold=True, color="9C6500"),
-    ),
-}
+_GREEN_FONT: Final[Font] = Font(
+    name="Calibri", size=10, bold=True, color="006100"
+)
+_RED_FONT: Final[Font] = Font(
+    name="Calibri", size=10, bold=True, color="9C0006"
+)
+_YELLOW_FONT: Final[Font] = Font(
+    name="Calibri", size=10, bold=True, color="9C6500"
+)
+_GRAY_FONT: Final[Font] = Font(
+    name="Calibri", size=10, bold=True, color="595959"
+)
+
+_NO_PAIR_STATUSES: Final[frozenset[str]] = frozenset(
+    {STATUS_NOT_IN_RD, STATUS_NOT_IN_SMETA}
+)
+
+
+def _record_status_style(record: AuditRecord) -> tuple[PatternFill, Font]:
+    """Возвращает заливку и шрифт статуса без «зеленой лжи».
+
+    Зеленый цвет допустим только для реальной пары РД/смета и дельты
+    в пределах допуска. Несопоставленные строки всегда нейтрально-серые,
+    HITL — желтый, отклоненные и превышения — красные.
+    """
+    if record.status in _NO_PAIR_STATUSES or not record.has_rd_pair:
+        return _GRAY_FILL, _GRAY_FONT
+    if record.status == STATUS_HITL_PENDING:
+        return _YELLOW_FILL, _YELLOW_FONT
+    if record.status == STATUS_REJECTED:
+        return _RED_FILL, _RED_FONT
+    if record.has_pair and record.is_within_tolerance:
+        return _GREEN_FILL, _GREEN_FONT
+    if record.has_pair and record.is_overrun:
+        return _RED_FILL, _RED_FONT
+    return _WHITE_FILL, _BODY_FONT
+
+
+def _record_delta_fill(record: AuditRecord) -> Optional[PatternFill]:
+    """Заливка колонок дельты только для проверенной пары."""
+    if not record.has_pair or record.status in {
+        STATUS_HITL_PENDING,
+        STATUS_REJECTED,
+    }:
+        return None
+    if record.is_within_tolerance:
+        return _GREEN_FILL
+    if record.is_overrun:
+        return _RED_FILL
+    return None
 
 def _write_metadata(
     worksheet: Worksheet,
@@ -439,26 +555,32 @@ def _write_record(
     """Записывает одну строку ведомости и нативные формулы расчета."""
     worksheet[f"A{row}"] = record.match_id
     worksheet[f"B{row}"] = index
-    worksheet[f"C{row}"] = record.rd_description
-    worksheet[f"D{row}"] = record.rd_unit
-    worksheet[f"E{row}"] = _to_excel_number(record.rd_quantity)
-    worksheet[f"F{row}"] = record.smeta_code
-    worksheet[f"G{row}"] = record.smeta_description
-    worksheet[f"H{row}"] = record.smeta_unit
-    worksheet[f"I{row}"] = _to_excel_number(record.smeta_quantity)
-    worksheet[f"J{row}"] = _to_excel_number(record.unit_price)
 
-    if record.smeta_quantity is not None and record.unit_price is not None:
-        worksheet[f"K{row}"] = f"=I{row}*J{row}"
-    else:
-        worksheet[f"K{row}"] = _to_excel_number(record.total_cost)
+    if record.has_rd_pair:
+        worksheet[f"C{row}"] = record.rd_description
+        worksheet[f"D{row}"] = record.rd_unit
+        worksheet[f"E{row}"] = _to_excel_number(record.rd_quantity)
 
-    worksheet[f"L{row}"] = _to_excel_number(record.ratio)
+    if record.has_smeta_item:
+        worksheet[f"F{row}"] = record.smeta_code
+        worksheet[f"G{row}"] = record.smeta_description
+        worksheet[f"H{row}"] = record.smeta_unit
+        worksheet[f"I{row}"] = _to_excel_number(record.smeta_quantity)
+        worksheet[f"J{row}"] = _to_excel_number(record.unit_price)
 
-    if record.rd_quantity is not None:
-        worksheet[f"M{row}"] = f"=E{row}*L{row}"
+        if record.smeta_quantity is not None and record.unit_price is not None:
+            worksheet[f"K{row}"] = f"=I{row}*J{row}"
+        else:
+            worksheet[f"K{row}"] = _to_excel_number(record.total_cost)
+
+    if record.has_rd_pair:
+        worksheet[f"L{row}"] = _to_excel_number(record.ratio)
+        if record.rd_quantity is not None:
+            worksheet[f"M{row}"] = f"=E{row}*L{row}"
+
     if (
-        record.status != STATUS_REJECTED
+        record.has_pair
+        and record.status != STATUS_REJECTED
         and record.smeta_quantity is not None
         and record.rd_quantity is not None
     ):
@@ -477,14 +599,12 @@ def _write_record(
 
     _apply_number_format(worksheet, row)
 
-    status_fill, status_font = _STATUS_STYLES.get(
-        record.status, (_WHITE_FILL, _BODY_FONT)
-    )
+    status_fill, status_font = _record_status_style(record)
     worksheet[f"P{row}"].fill = status_fill
     worksheet[f"P{row}"].font = status_font
 
-    if record.is_within_tolerance or record.is_overrun:
-        delta_fill = _GREEN_FILL if record.is_within_tolerance else _RED_FILL
+    delta_fill = _record_delta_fill(record)
+    if delta_fill is not None:
         for column in ("N", "O"):
             worksheet[f"{column}{row}"].fill = delta_fill
 
@@ -505,6 +625,24 @@ def _autosize_columns(worksheet: Worksheet) -> None:
         worksheet.column_dimensions[column].width = min(max(longest + 2, 8), max_width)
 
 
+def _has_price_data(records: Sequence[AuditRecord]) -> bool:
+    """Проверяет, есть ли в разделе хотя бы одна ненулевая цена или стоимость."""
+    for record in records:
+        if not record.has_smeta_item:
+            continue
+        if record.unit_price not in (None, ZERO):
+            return True
+        if record.total_cost not in (None, ZERO):
+            return True
+    return False
+
+
+def _hide_price_columns(worksheet: Worksheet) -> None:
+    """Скрывает визуальный шум из нулевых цен, пока парсер цен не подключен."""
+    for column in ("J", "K", "O"):
+        worksheet.column_dimensions[column].hidden = True
+
+
 def _populate_worksheet(
     worksheet: Worksheet,
     session: sqlite3.Row,
@@ -519,13 +657,19 @@ def _populate_worksheet(
     for offset, record in enumerate(records):
         _write_record(worksheet, FIRST_DATA_ROW + offset, offset + 1, record)
 
+    if not _has_price_data(records):
+        _hide_price_columns(worksheet)
+
     _autosize_columns(worksheet)
+    worksheet.auto_filter.ref = f"B{HEADER_ROW}:Q{worksheet.max_row}"
     worksheet.freeze_panes = f"C{FIRST_DATA_ROW}"
     worksheet.print_title_rows = f"{HEADER_ROW}:{HEADER_ROW}"
     worksheet.sheet_view.showGridLines = False
 
 
 _INVALID_SHEET_TITLE = re.compile(r"[\\/*?:\[\]]")
+_SECTION_CODE_PATTERN = re.compile(r"(?<!\d)(\d{2}-\d{2}-\d{2})(?!\d)")
+_LEADING_LS_PATTERN = re.compile(r"^\s*лс\s*", re.IGNORECASE)
 
 
 def _sanitize_sheet_title(raw: Optional[str], fallback: str) -> str:
@@ -536,6 +680,44 @@ def _sanitize_sheet_title(raw: Optional[str], fallback: str) -> str:
         return title
     safe_fallback = _INVALID_SHEET_TITLE.sub(" ", fallback)
     return re.sub(r"\s+", " ", safe_fallback).strip()[:31] or "Раздел"
+
+
+def _extract_section_code(raw: Optional[str]) -> Optional[str]:
+    """Извлекает шифр раздела формата ``NN-NN-NN`` из имени листа сметы."""
+    match = _SECTION_CODE_PATTERN.search(raw or "")
+    return match.group(1) if match else None
+
+
+def _section_label_and_cipher(
+    raw: Optional[str],
+    fallback: str,
+) -> tuple[str, str]:
+    """Возвращает читаемое имя раздела и его шифр для вкладки/дашборда."""
+    code = _extract_section_code(raw)
+    if code is None:
+        label = _sanitize_sheet_title(raw, fallback)
+        return label, "—"
+
+    cipher = f"ЛС {code}"
+    mapped = SECTION_NAMES_BY_CODE.get(code)
+    if mapped is not None:
+        return mapped, cipher
+
+    source = _LEADING_LS_PATTERN.sub("", (raw or "").strip())
+    prefix = source.split(code, maxsplit=1)[0].strip(" -–—()[]")
+    if prefix:
+        return _sanitize_sheet_title(prefix, fallback), cipher
+    return f"Раздел {code}", cipher
+
+
+def _readable_sheet_title(raw: Optional[str], fallback: str) -> str:
+    """Формирует имя вкладки ``Раздел (ЛС NN-NN-NN)`` в пределах лимита Excel."""
+    label, cipher = _section_label_and_cipher(raw, fallback)
+    if cipher == "—":
+        return _sanitize_sheet_title(label, fallback)
+    if label.startswith("Раздел "):
+        return _sanitize_sheet_title(cipher, fallback)
+    return _sanitize_sheet_title(f"{label} ({cipher})", fallback)
 
 
 def _unique_sheet_title(base: str, used: set[str]) -> str:
@@ -551,8 +733,690 @@ def _unique_sheet_title(base: str, used: set[str]) -> str:
 
 
 # ----------------------------------------------------------------------
-# 4. Публичный API и точка входа CLI
+# 4. Сводный дашборд и метрики разделов
 # ----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SectionExport:
+    """Подготовленная к выгрузке сессия одного раздела."""
+
+    session: sqlite3.Row
+    records: tuple[AuditRecord, ...]
+    title: str
+    label: str
+    cipher: str
+
+
+@dataclass(frozen=True)
+class SectionMetrics:
+    """Управленческие метрики одного раздела для сводного дашборда."""
+
+    session_id: str
+    title: str
+    label: str
+    cipher: str
+    total: int
+    smeta_total: int
+    paired: int
+    no_rd: int
+    no_smeta: int
+    discrepancies: int
+    pending: int
+    rejected: int
+    incomplete: int
+    total_cost: Decimal
+    delta_cost: Decimal
+    has_prices: bool
+
+    @property
+    def coverage(self) -> float:
+        """Доля сметных позиций с реальной парой РД, от 0.0 до 1.0."""
+        return self.paired / self.smeta_total if self.smeta_total else 0.0
+
+    @property
+    def verdict(self) -> str:
+        """Краткий управленческий вердикт по разделу."""
+        if self.total == 0:
+            return VERDICT_NO_DATA
+        if self.paired == 0:
+            return VERDICT_NO_MATCH
+        if self.discrepancies > 0:
+            return VERDICT_DISCREPANCY
+        if (
+            self.no_rd
+            or self.no_smeta
+            or self.pending
+            or self.rejected
+            or self.incomplete
+            or self.total != self.paired + self.no_rd + self.no_smeta
+        ):
+            return VERDICT_REVIEW
+        return VERDICT_OK
+
+    @property
+    def fully_verified(self) -> bool:
+        """Раздел проверен полностью и не требует внимания эксперта."""
+        return self.verdict == VERDICT_OK
+
+
+def _measure_section(section: SectionExport) -> SectionMetrics:
+    """Считает KPI раздела по нормализованным строкам ведомости."""
+    paid_records = [record for record in section.records if record.has_pair]
+    total_cost = sum(
+        (
+            record.total_cost
+            for record in section.records
+            if record.has_smeta_item and record.total_cost is not None
+        ),
+        ZERO,
+    )
+    delta_cost = sum(
+        (
+            record.delta_volume * record.unit_price
+            for record in paid_records
+            if record.status != STATUS_REJECTED
+            and record.delta_volume is not None
+            and record.unit_price is not None
+        ),
+        ZERO,
+    )
+    discrepancies = sum(
+        1
+        for record in paid_records
+        if record.status != STATUS_REJECTED
+        and record.delta_volume is not None
+        and not record.is_within_tolerance
+    )
+    incomplete = sum(
+        1
+        for record in paid_records
+        if record.status != STATUS_REJECTED and record.delta_volume is None
+    )
+    no_rd = sum(
+        1
+        for record in section.records
+        if record.has_smeta_item and not record.has_rd_pair
+    )
+    no_smeta = sum(
+        1
+        for record in section.records
+        if record.has_rd_pair and not record.has_smeta_item
+    )
+
+    return SectionMetrics(
+        session_id=str(section.session["id"]),
+        title=section.title,
+        label=section.label,
+        cipher=section.cipher,
+        total=len(section.records),
+        smeta_total=sum(
+            1 for record in section.records if record.has_smeta_item
+        ),
+        paired=len(paid_records),
+        no_rd=no_rd,
+        no_smeta=no_smeta,
+        discrepancies=discrepancies,
+        pending=sum(
+            1 for record in section.records if record.status == STATUS_HITL_PENDING
+        ),
+        rejected=sum(
+            1 for record in section.records if record.status == STATUS_REJECTED
+        ),
+        incomplete=incomplete,
+        total_cost=total_cost,
+        delta_cost=delta_cost,
+        has_prices=_has_price_data(section.records),
+    )
+
+
+def _verdict_style(verdict: str) -> tuple[PatternFill, Font]:
+    """Возвращает стиль вердикта для дашборда и цвет вкладки раздела."""
+    if verdict == VERDICT_OK:
+        return _GREEN_FILL, _GREEN_FONT
+    if verdict == VERDICT_DISCREPANCY:
+        return _RED_FILL, _RED_FONT
+    if verdict == VERDICT_REVIEW:
+        return _YELLOW_FILL, _YELLOW_FONT
+    if verdict in {VERDICT_NO_MATCH, VERDICT_NO_DATA}:
+        return _GRAY_FILL, _GRAY_FONT
+    return _WHITE_FILL, _BODY_FONT
+
+
+_TAB_COLORS: Final[dict[str, str]] = {
+    VERDICT_OK: "00B050",
+    VERDICT_DISCREPANCY: "C00000",
+    VERDICT_REVIEW: "FFC000",
+    VERDICT_NO_MATCH: "808080",
+    VERDICT_NO_DATA: "808080",
+}
+
+
+_DASHBOARD_LAST_COLUMN: Final[int] = 13
+_DASHBOARD_TABLE_TITLES: Final[dict[str, str]] = {
+    "A": "№",
+    "B": "Раздел",
+    "C": "Шифр",
+    "D": "Позиций",
+    "E": "Сопоставлено",
+    "F": "Покрытие",
+    "G": "Нет в РД",
+    "H": "Нет в смете",
+    "I": "Расхождения",
+    "J": "На проверке",
+    "K": "Стоимость сметы, руб.",
+    "L": "Дельта стоимости, руб.",
+    "M": "Вердикт",
+}
+_DASHBOARD_WIDTHS: Final[dict[str, int]] = {
+    "A": 5,
+    "B": 24,
+    "C": 15,
+    "D": 10,
+    "E": 13,
+    "F": 11,
+    "G": 12,
+    "H": 13,
+    "I": 14,
+    "J": 14,
+    "K": 21,
+    "L": 23,
+    "M": 24,
+}
+
+_DASHBOARD_TITLE_FONT: Final[Font] = Font(
+    name="Calibri", size=20, bold=True, color="FFFFFF"
+)
+_DASHBOARD_TITLE_FILL: Final[PatternFill] = PatternFill(
+    "solid", fgColor="1F4E78"
+)
+_DASHBOARD_SUBTITLE_FONT: Final[Font] = Font(
+    name="Calibri", size=14, bold=True, color="1F4E78"
+)
+_DASHBOARD_META_FONT: Final[Font] = Font(
+    name="Calibri", size=10, color="595959"
+)
+_DASHBOARD_NOTE_FILL: Final[PatternFill] = PatternFill(
+    "solid", fgColor="FFF2CC"
+)
+_DASHBOARD_NOTE_FONT: Final[Font] = Font(
+    name="Calibri", size=10, italic=True, color="7F6000"
+)
+_DASHBOARD_KPI_LABEL_FILL: Final[PatternFill] = PatternFill(
+    "solid", fgColor="DDEBF7"
+)
+_DASHBOARD_KPI_VALUE_FONT: Final[Font] = Font(
+    name="Calibri", size=12, bold=True, color="1F1F1F"
+)
+_DASHBOARD_SECTION_FONT: Final[Font] = Font(
+    name="Calibri", size=12, bold=True, color="FFFFFF"
+)
+_DASHBOARD_LINK_FONT: Final[Font] = Font(
+    name="Calibri", size=10, color="0563C1", underline="single"
+)
+_DASHBOARD_ALT_FILL: Final[PatternFill] = PatternFill(
+    "solid", fgColor="F7F9FC"
+)
+
+
+def _style_dashboard_row(
+    worksheet: Worksheet,
+    row: int,
+    fill: PatternFill,
+) -> None:
+    """Заливает всю строку дашборда, включая объединенные ячейки."""
+    for column in range(1, _DASHBOARD_LAST_COLUMN + 1):
+        worksheet.cell(row=row, column=column).fill = fill
+
+
+def _write_dashboard_banner(
+    worksheet: Worksheet,
+    project_label: str,
+    generated_at: datetime,
+) -> None:
+    """Формирует шапку титульного листа."""
+    worksheet.merge_cells("A1:M1")
+    worksheet["A1"] = "СВОДНЫЙ АУДИТ ОБЪЁМОВ"
+    worksheet["A1"].font = _DASHBOARD_TITLE_FONT
+    worksheet["A1"].alignment = Alignment(horizontal="left", vertical="center")
+    _style_dashboard_row(worksheet, 1, _DASHBOARD_TITLE_FILL)
+    worksheet.row_dimensions[1].height = 36
+
+    worksheet.merge_cells("A2:M2")
+    worksheet["A2"] = project_label
+    worksheet["A2"].font = _DASHBOARD_SUBTITLE_FONT
+    worksheet["A2"].alignment = Alignment(horizontal="left", vertical="center")
+    worksheet.row_dimensions[2].height = 24
+
+    worksheet.merge_cells("A3:M3")
+    worksheet["A3"] = (
+        f"Сформировано: {generated_at.strftime('%d.%m.%Y %H:%M')}  |  "
+        "Источник данных: SQLite (SSOT)"
+    )
+    worksheet["A3"].font = _DASHBOARD_META_FONT
+    worksheet["A3"].alignment = Alignment(horizontal="left", vertical="center")
+
+    worksheet.merge_cells("A4:M4")
+    worksheet["A4"] = (
+        "Методика: зеленый статус присваивается только позициям с реальной "
+        "парой РД и дельтой объема в пределах допуска. Серый статус «НЕТ В РД» "
+        "означает, что сопоставление не состоялось и объем не проверялся."
+    )
+    worksheet["A4"].font = _DASHBOARD_NOTE_FONT
+    worksheet["A4"].alignment = Alignment(
+        horizontal="left", vertical="center", wrap_text=True
+    )
+    _style_dashboard_row(worksheet, 4, _DASHBOARD_NOTE_FILL)
+    worksheet.row_dimensions[4].height = 32
+
+
+def _write_dashboard_kpi(
+    worksheet: Worksheet,
+    row: int,
+    label: str,
+    value: Any,
+    note: str,
+    *,
+    number_format: Optional[str] = None,
+    value_fill: Optional[PatternFill] = None,
+) -> None:
+    """Записывает одну KPI-строку дашборда."""
+    label_cell = worksheet.cell(row=row, column=1, value=label)
+    value_cell = worksheet.cell(row=row, column=2, value=value)
+    note_cell = worksheet.cell(row=row, column=3, value=note)
+
+    label_cell.font = _META_LABEL_FONT
+    label_cell.fill = _DASHBOARD_KPI_LABEL_FILL
+    label_cell.alignment = Alignment(horizontal="left", vertical="center")
+    value_cell.font = _DASHBOARD_KPI_VALUE_FONT
+    value_cell.alignment = Alignment(horizontal="right", vertical="center")
+    note_cell.font = _DASHBOARD_META_FONT
+    note_cell.alignment = Alignment(horizontal="left", vertical="center")
+
+    if number_format is not None:
+        value_cell.number_format = number_format
+    if value_fill is not None:
+        value_cell.fill = value_fill
+
+    for column in range(1, 4):
+        worksheet.cell(row=row, column=column).border = _CELL_BORDER
+    worksheet.row_dimensions[row].height = 21
+
+
+def _write_dashboard_kpis(
+    worksheet: Worksheet,
+    metrics: Sequence[SectionMetrics],
+) -> None:
+    """Выводит ключевые показатели объекта."""
+    sections_count = len(metrics)
+    verified = sum(1 for metric in metrics if metric.fully_verified)
+    attention = sections_count - verified
+    total_positions = sum(metric.smeta_total for metric in metrics)
+    paired = sum(metric.paired for metric in metrics)
+    no_rd = sum(metric.no_rd for metric in metrics)
+    discrepancies = sum(metric.discrepancies for metric in metrics)
+    pending = sum(metric.pending for metric in metrics)
+    coverage = paired / total_positions if total_positions else 0.0
+    has_prices = any(metric.has_prices for metric in metrics)
+    total_cost: Any = (
+        _to_excel_number(sum((m.total_cost for m in metrics), ZERO))
+        if has_prices
+        else "н/д"
+    )
+    delta_cost: Any = (
+        _to_excel_number(sum((m.delta_cost for m in metrics), ZERO))
+        if has_prices
+        else "н/д"
+    )
+
+    worksheet.merge_cells("A5:M5")
+    worksheet["A5"] = "КЛЮЧЕВЫЕ ПОКАЗАТЕЛИ ОБЪЕКТА"
+    worksheet["A5"].font = _META_LABEL_FONT
+    worksheet["A5"].alignment = Alignment(horizontal="left", vertical="center")
+    _style_dashboard_row(worksheet, 5, _DASHBOARD_KPI_LABEL_FILL)
+
+    for column, title in (
+        ("A", "Показатель"),
+        ("B", "Значение"),
+        ("C", "Комментарий"),
+    ):
+        cell = worksheet[f"{column}{DASHBOARD_KPI_HEADER_ROW}"]
+        cell.value = title
+        cell.font = _HEADER_FONT
+        cell.fill = _HEADER_FILL
+        cell.alignment = _HEADER_ALIGNMENT
+        cell.border = _CELL_BORDER
+
+    verified_fill = (
+        _GREEN_FILL if sections_count > 0 and verified == sections_count else None
+    )
+    coverage_fill = (
+        _GREEN_FILL
+        if sections_count > 0
+        and verified == sections_count
+        and abs(coverage - 1.0) < 1e-9
+        else None
+    )
+
+    rows: tuple[
+        tuple[str, Any, str, Optional[str], Optional[PatternFill]], ...
+    ] = (
+        (
+            "Разделов в отчёте",
+            sections_count,
+            "Количество обработанных сессий в книге",
+            INTEGER_FORMAT,
+            None,
+        ),
+        (
+            "Полностью проверено",
+            verified,
+            "Покрытие 100% и отсутствие расхождений",
+            INTEGER_FORMAT,
+            verified_fill,
+        ),
+        (
+            "Требуют внимания",
+            attention,
+            "Есть пропуски, HITL или расхождения",
+            INTEGER_FORMAT,
+            _YELLOW_FILL if attention else None,
+        ),
+        (
+            "Позиций в смете",
+            total_positions,
+            "Строк в ведомостях разделов",
+            INTEGER_FORMAT,
+            None,
+        ),
+        (
+            "Сопоставлено с РД",
+            paired,
+            "Пары «смета ↔ РД»",
+            INTEGER_FORMAT,
+            None,
+        ),
+        (
+            "Покрытие РД",
+            coverage,
+            "Доля позиций с реальной парой РД",
+            PERCENT_FORMAT,
+            coverage_fill,
+        ),
+        (
+            "Нет в РД",
+            no_rd,
+            "Серые строки: сопоставление не состоялось",
+            INTEGER_FORMAT,
+            _GRAY_FILL if no_rd else None,
+        ),
+        (
+            "Расхождения объёмов",
+            discrepancies,
+            "Отклонения сверх допуска, включая превышения",
+            INTEGER_FORMAT,
+            _RED_FILL if discrepancies else None,
+        ),
+        (
+            "На проверке (HITL)",
+            pending,
+            "Очередь ручной верификации",
+            INTEGER_FORMAT,
+            _YELLOW_FILL if pending else None,
+        ),
+        (
+            "Стоимость сметы, руб.",
+            total_cost,
+            "Цены не подключены" if not has_prices else "Сумма по сметным позициям",
+            MONEY_FORMAT if has_prices else None,
+            None,
+        ),
+        (
+            "Дельта стоимости, руб.",
+            delta_cost,
+            "Смета минус приведенный объем РД",
+            MONEY_FORMAT if has_prices else None,
+            None,
+        ),
+    )
+
+    for offset, (label, value, note, number_format, fill) in enumerate(rows):
+        _write_dashboard_kpi(
+            worksheet,
+            DASHBOARD_FIRST_KPI_ROW + offset,
+            label,
+            value,
+            note,
+            number_format=number_format,
+            value_fill=fill,
+        )
+
+
+def _write_dashboard_section_table(
+    worksheet: Worksheet,
+    metrics: Sequence[SectionMetrics],
+) -> None:
+    """Выводит таблицу разделов с автофильтром и переходами на вкладки."""
+    worksheet.merge_cells(
+        f"A{DASHBOARD_SECTION_TITLE_ROW}:M{DASHBOARD_SECTION_TITLE_ROW}"
+    )
+    title_cell = worksheet[f"A{DASHBOARD_SECTION_TITLE_ROW}"]
+    title_cell.value = "РАЗДЕЛЫ ОБЪЕКТА"
+    title_cell.font = _DASHBOARD_SECTION_FONT
+    title_cell.alignment = Alignment(horizontal="left", vertical="center")
+    _style_dashboard_row(
+        worksheet,
+        DASHBOARD_SECTION_TITLE_ROW,
+        _DASHBOARD_TITLE_FILL,
+    )
+    worksheet.row_dimensions[DASHBOARD_SECTION_TITLE_ROW].height = 24
+
+    for column, title in _DASHBOARD_TABLE_TITLES.items():
+        cell = worksheet[f"{column}{DASHBOARD_SECTION_HEADER_ROW}"]
+        cell.value = title
+        cell.font = _HEADER_FONT
+        cell.fill = _HEADER_FILL
+        cell.alignment = _HEADER_ALIGNMENT
+        cell.border = _CELL_BORDER
+    worksheet.row_dimensions[DASHBOARD_SECTION_HEADER_ROW].height = 40
+
+    for offset, metric in enumerate(metrics):
+        row = DASHBOARD_FIRST_SECTION_ROW + offset
+        values: dict[str, Any] = {
+            "A": offset + 1,
+            "B": metric.label,
+            "C": metric.cipher,
+            "D": metric.smeta_total,
+            "E": metric.paired,
+            "F": metric.coverage,
+            "G": metric.no_rd,
+            "H": metric.no_smeta,
+            "I": metric.discrepancies,
+            "J": metric.pending,
+            "K": (
+                _to_excel_number(metric.total_cost)
+                if metric.has_prices
+                else None
+            ),
+            "L": (
+                _to_excel_number(metric.delta_cost)
+                if metric.has_prices
+                else None
+            ),
+            "M": metric.verdict,
+        }
+        row_fill = _DASHBOARD_ALT_FILL if offset % 2 else _WHITE_FILL
+        for column, value in values.items():
+            cell = worksheet[f"{column}{row}"]
+            cell.value = value
+            cell.font = _BODY_FONT
+            cell.fill = row_fill
+            cell.border = _CELL_BORDER
+            if column in {"B", "C"}:
+                cell.alignment = Alignment(
+                    horizontal="left", vertical="center", wrap_text=True
+                )
+            elif column == "M":
+                cell.alignment = Alignment(
+                    horizontal="center", vertical="center", wrap_text=True
+                )
+            else:
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        for column in ("A", "D", "E", "G", "H", "I", "J"):
+            worksheet[f"{column}{row}"].number_format = INTEGER_FORMAT
+        worksheet[f"F{row}"].number_format = PERCENT_FORMAT
+        for column in ("K", "L"):
+            worksheet[f"{column}{row}"].number_format = MONEY_FORMAT
+
+        link_cell = worksheet[f"B{row}"]
+        escaped_title = metric.title.replace("'", "''")
+        link_cell.hyperlink = f"#'{escaped_title}'!A1"
+        link_cell.font = _DASHBOARD_LINK_FONT
+
+        if metric.no_rd:
+            worksheet[f"G{row}"].fill = _GRAY_FILL
+            worksheet[f"G{row}"].font = _GRAY_FONT
+        if metric.no_smeta:
+            worksheet[f"H{row}"].fill = _GRAY_FILL
+            worksheet[f"H{row}"].font = _GRAY_FONT
+        if metric.discrepancies:
+            worksheet[f"I{row}"].fill = _RED_FILL
+            worksheet[f"I{row}"].font = _RED_FONT
+        if metric.pending:
+            worksheet[f"J{row}"].fill = _YELLOW_FILL
+            worksheet[f"J{row}"].font = _YELLOW_FONT
+        verdict_fill, verdict_font = _verdict_style(metric.verdict)
+        worksheet[f"M{row}"].fill = verdict_fill
+        worksheet[f"M{row}"].font = verdict_font
+        worksheet.row_dimensions[row].height = 22
+
+    last_row = max(
+        DASHBOARD_SECTION_HEADER_ROW,
+        DASHBOARD_FIRST_SECTION_ROW + len(metrics) - 1,
+    )
+    worksheet.auto_filter.ref = (
+        f"A{DASHBOARD_SECTION_HEADER_ROW}:M{last_row}"
+    )
+
+
+def _project_label(sections: Sequence[SectionExport]) -> str:
+    """Формирует подпись проекта для дашборда."""
+    names = sorted({str(section.session["project_name"]) for section in sections})
+    if not names:
+        return "Проект не указан"
+    if len(names) == 1:
+        return names[0]
+    return f"Несколько проектов ({len(names)}): " + "; ".join(names)
+
+
+def _render_dashboard(
+    worksheet: Worksheet,
+    sections: Sequence[SectionExport],
+    metrics: Sequence[SectionMetrics],
+    generated_at: datetime,
+) -> None:
+    """Полностью оформляет титульный лист книги."""
+    _write_dashboard_banner(worksheet, _project_label(sections), generated_at)
+    _write_dashboard_kpis(worksheet, metrics)
+    _write_dashboard_section_table(worksheet, metrics)
+
+    for column, width in _DASHBOARD_WIDTHS.items():
+        worksheet.column_dimensions[column].width = width
+    worksheet.sheet_view.showGridLines = False
+    worksheet.sheet_view.zoomScale = 90
+    worksheet.sheet_properties.tabColor = "1F4E78"
+    worksheet.page_setup.orientation = "landscape"
+    worksheet.sheet_properties.pageSetUpPr.fitToPage = True
+    worksheet.page_setup.fitToWidth = 1
+    worksheet.page_setup.fitToHeight = 0
+    worksheet.print_area = (
+        f"A1:M{DASHBOARD_FIRST_SECTION_ROW + len(metrics) - 1}"
+    )
+
+
+# ----------------------------------------------------------------------
+# 5. Публичный API и точка входа CLI
+# ----------------------------------------------------------------------
+
+
+def _session_fallback(session: sqlite3.Row) -> str:
+    """Возвращает запасное имя раздела из проекта и имени тома РД."""
+    return f"{session['project_name']} {Path(session['rd_filename']).stem}"
+
+
+def _section_export(
+    session: sqlite3.Row,
+    records: Sequence[AuditRecord],
+    title: str,
+) -> SectionExport:
+    """Создает описание раздела для дашборда и выгрузки."""
+    fallback = _session_fallback(session)
+    label, cipher = _section_label_and_cipher(session["smeta_sheet"], fallback)
+    return SectionExport(
+        session=session,
+        records=tuple(records),
+        title=title,
+        label=label,
+        cipher=cipher,
+    )
+
+
+def _prepare_sections(
+    conn: sqlite3.Connection,
+    session_ids: Sequence[str],
+) -> list[SectionExport]:
+    """Читает сессии и назначает читаемые уникальные имена вкладок."""
+    used_titles: set[str] = {DASHBOARD_TITLE.casefold()}
+    sections: list[SectionExport] = []
+    for session_id in session_ids:
+        resolved_id = resolve_session_id(conn, session_id)
+        session = _load_session(conn, resolved_id)
+        records = load_audit_records(conn, resolved_id)
+        fallback = _session_fallback(session)
+        base_title = _readable_sheet_title(session["smeta_sheet"], fallback)
+        title = _unique_sheet_title(base_title, used_titles)
+        sections.append(_section_export(session, records, title))
+    return sections
+
+
+def _build_workbook(
+    sections: Sequence[SectionExport],
+    generated_at: datetime,
+) -> Workbook:
+    """Собирает книгу: дашборд первым листом, затем разделы."""
+    workbook = Workbook()
+    dashboard = workbook.active
+    dashboard.title = DASHBOARD_TITLE
+    metrics = [_measure_section(section) for section in sections]
+
+    for section, metric in zip(sections, metrics):
+        worksheet = workbook.create_sheet(title=section.title)
+        _populate_worksheet(
+            worksheet,
+            section.session,
+            section.records,
+            generated_at,
+        )
+        tab_color = _TAB_COLORS.get(metric.verdict)
+        if tab_color is not None:
+            worksheet.sheet_properties.tabColor = tab_color
+
+    _render_dashboard(dashboard, sections, metrics, generated_at)
+    workbook.active = 0
+    # Excel пересчитывает нативные формулы при открытии книги.
+    workbook.calculation.fullCalcOnLoad = True
+    return workbook
+
+
+def _save_workbook(workbook: Workbook, output_path: str | Path) -> Path:
+    """Сохраняет книгу на диск, создавая родительские каталоги."""
+    workbook.properties.creator = "sst-audit"
+    workbook.properties.title = "Сводный аудит объёмов"
+    target = Path(output_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(target)
+    return target
 
 
 def export_audit_to_excel(
@@ -560,7 +1424,7 @@ def export_audit_to_excel(
     session_id: str,
     output_path: str | Path,
 ) -> Path:
-    """Формирует ведомость аудита объемов и сохраняет ее в XLSX.
+    """Формирует книгу с дашбордом и ведомостью одного раздела.
 
     :param conn: соединение с SQLite (SSOT).
     :param session_id: идентификатор сессии либо ``latest``.
@@ -571,20 +1435,10 @@ def export_audit_to_excel(
     resolved_id = resolve_session_id(conn, session_id)
     session = _load_session(conn, resolved_id)
     records = load_audit_records(conn, resolved_id)
-    generated_at = datetime.now()
+    section = _section_export(session, records, SHEET_TITLE)
 
-    workbook = Workbook()
-    worksheet = workbook.active
-    worksheet.title = SHEET_TITLE
-    _populate_worksheet(worksheet, session, records, generated_at)
-
-    # Excel пересчитывает нативные формулы при открытии книги.
-    workbook.calculation.fullCalcOnLoad = True
-
-    target = Path(output_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    workbook.save(target)
-    return target
+    workbook = _build_workbook([section], datetime.now())
+    return _save_workbook(workbook, output_path)
 
 
 def export_sessions_to_excel(
@@ -592,12 +1446,12 @@ def export_sessions_to_excel(
     session_ids: Sequence[str],
     output_path: str | Path,
 ) -> Path:
-    """Формирует многолистовую ведомость: один лист на каждый раздел.
+    """Формирует многолистовую книгу: дашборд и листы разделов.
 
     Используется ночным пакетным режимом, когда каждая сессия соответствует
-    отдельному тому РД и листу ``ЛС ...``. Имена листов берутся из
-    ``sessions.smeta_sheet``; коллизии и недопустимые символы Excel
-    разрешаются автоматически.
+    отдельному тому РД и листу ``ЛС ...``. Имена вкладок формируются как
+    ``АР (ЛС 02-01-01)``; коллизии и недопустимые символы Excel разрешаются
+    автоматически.
 
     :param conn: соединение с SQLite (SSOT).
     :param session_ids: идентификаторы успешно завершенных сессий.
@@ -610,31 +1464,9 @@ def export_sessions_to_excel(
     if not ordered_ids:
         raise ValueError("Для многолистового экспорта не передано ни одной сессии")
 
-    generated_at = datetime.now()
-    workbook = Workbook()
-    used_titles: set[str] = set()
-
-    for index, session_id in enumerate(ordered_ids):
-        resolved_id = resolve_session_id(conn, session_id)
-        session = _load_session(conn, resolved_id)
-        records = load_audit_records(conn, resolved_id)
-
-        fallback = f"{session['project_name']} {Path(session['rd_filename']).stem}"
-        base_title = _sanitize_sheet_title(session["smeta_sheet"], fallback)
-        title = _unique_sheet_title(base_title, used_titles)
-
-        if index == 0:
-            worksheet = workbook.active
-            worksheet.title = title
-        else:
-            worksheet = workbook.create_sheet(title=title)
-        _populate_worksheet(worksheet, session, records, generated_at)
-
-    workbook.calculation.fullCalcOnLoad = True
-    target = Path(output_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    workbook.save(target)
-    return target
+    sections = _prepare_sections(conn, ordered_ids)
+    workbook = _build_workbook(sections, datetime.now())
+    return _save_workbook(workbook, output_path)
 
 
 def build_parser() -> argparse.ArgumentParser:

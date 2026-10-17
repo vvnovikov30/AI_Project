@@ -701,7 +701,11 @@ def test_batch_pipeline_headless(
     assert len({row["rd_filename"] for row in sessions}) == 2
 
     workbook = load_workbook(target, data_only=False)
-    assert set(workbook.sheetnames) == {"ЛС 02-01-08", "ЛС 02-01-14"}
+    assert workbook.sheetnames == [
+        exporter.DASHBOARD_TITLE,
+        "АПС (ЛС 02-01-08)",
+        "СОТ (ЛС 02-01-14)",
+    ]
 
 
 def test_batch_pipeline_continues_after_section_error(
