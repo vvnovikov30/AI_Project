@@ -1,7 +1,8 @@
+from bisect import bisect_right
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 import re
-from typing import Optional, Dict, Any, List, Callable
+from typing import Optional, Dict, Any, List, Callable, Tuple, Final
 import openpyxl
 import openpyxl.utils
 import pdfplumber
@@ -267,6 +268,10 @@ _VOR_PAGE_MARKERS: tuple[str, ...] = (
     "ведомость объемов работ",
     "наименование вида работ",
     "обоснование объема",
+    # Форма ВОР ПК «ГРАНД-Смета»: шапка печатается на каждом листе и служит
+    # единственным признаком продолжения таблицы без рамки.
+    "наименование работ, ресурсов, затрат",
+    "формула расчета объемов",
 )
 # Строка таблицы в текстовом слое: единица измерения с объемом
 # («шт. 1», «м2 18.0», «упак. 2»). Служит дешевым признаком данных:
@@ -309,6 +314,17 @@ _UNIT_VALUE_PATTERN = re.compile(
     r"набор[а-я]*|пар[аы]?|секц[а-я]*|лист[а-я]*|к-т\.?|тыс\.?)"
     r"(?:\s*/\s*[а-я0-9]+)?$"
 )
+# Шапка формы ВОР ПК «ГРАНД-Смета» (7 граф): количество находится в графе 4,
+# а графа 7 — комментарий. Без этой проверки 7 колонок ошибочно трактуются
+# как спецификация ГОСТ 21.110 с количеством в графе 8.
+_GRAND_VOR_HEADER_MARKERS: tuple[str, ...] = (
+    "наименование работ, ресурсов, затрат",
+    "наименование работ, ресурсов и затрат",
+    "формула расчета объемов",
+    "ведомость объемов работ",
+)
+# Строка раздела ведомости: «Раздел: 1. Кровля», «Раздел 2. Фасад».
+_VOR_SECTION_PATTERN = re.compile(r"^раздел\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -344,6 +360,8 @@ class PDFSpecParser:
     CROP_TOP_PT = 15
     CROP_RIGHT_PT = 15
     CROP_BOTTOM_STAMP_PT = 65
+    # У форм ГРАНД-Сметы нижнего штампа нет: таблица доходит до края листа.
+    GRAND_VOR_BOTTOM_PT = 5
 
     _LINE_SETTINGS: Dict[str, Any] = {
         "vertical_strategy": "lines",
@@ -616,9 +634,9 @@ class PDFSpecParser:
         область — отбрасываются строки, попадающие в нижний штамп.
         """
         crop_box = self._get_crop_box(page)
-        rows = self._extract_rows_via_finder(page, crop_box)
+        rows, tables = self._extract_rows_via_finder(page, crop_box)
         if rows:
-            return rows
+            return self._maybe_rebuild_grand_vor(page, rows, crop_box, tables)
 
         for settings in (self._LINE_SETTINGS, self._TEXT_SETTINGS):
             table = self._extract_raw_table(page, settings)
@@ -628,7 +646,166 @@ class PDFSpecParser:
             # подписей, поэтому без распознанной шапки её результат не берем.
             if settings == self._TEXT_SETTINGS and not self._table_has_header(table):
                 continue
-            return table
+            return self._maybe_rebuild_grand_vor(page, table, crop_box, [])
+        return None
+
+    def _maybe_rebuild_grand_vor(
+        self,
+        page,
+        rows: List[List[str]],
+        crop_box: tuple[float, float, float, float],
+        tables: List[Any],
+    ) -> List[List[str]]:
+        """Дополняет шапку ВОР ГРАНД-Сметы строками данных без линий.
+
+        Экспорт ПК «ГРАНД-Смета» рисует рамку только у шапки таблицы: строки
+        работ идут без горизонтальных линий, поэтому ``find_tables()`` видит
+        две строки шапки и ни одной позиции. Строки данных собираются по
+        координатам слов (см. ``_extract_grand_vor_rows``), а шапка и границы
+        граф берутся из единственной размеченной таблицы листа.
+        """
+        # Рамка есть и у данных: штатный разбор уже дал позиции.
+        if len(rows) > 4 and self._table_has_item_rows(rows):
+            return rows
+        layout = self._grand_vor_layout(tables)
+        if layout is None:
+            return rows
+        boundaries, header_bottom, header_rows = layout
+        # Нижний штамп в форме ГРАНД-Сметы отсутствует, а обрезка по
+        # CROP_BOTTOM_STAMP_PT теряла последнюю позицию листа.
+        data_box = (
+            crop_box[0],
+            crop_box[1],
+            crop_box[2],
+            float(getattr(page, "height", crop_box[3])) - self.GRAND_VOR_BOTTOM_PT,
+        )
+        rebuilt = self._extract_grand_vor_rows(
+            page, data_box, boundaries, header_bottom
+        )
+        if not rebuilt:
+            return rows
+        return header_rows + rebuilt
+
+    @classmethod
+    def _is_grand_vor_header(cls, row: List[str]) -> bool:
+        """Строка является шапкой формы ВОР ПК «ГРАНД-Смета»."""
+        joined = " ".join(cls._cell_text(cell).lower() for cell in row)
+        joined = re.sub(r"\s+", " ", joined)
+        return any(marker in joined for marker in _GRAND_VOR_HEADER_MARKERS)
+
+    def _extract_grand_vor_rows(
+        self,
+        page,
+        crop_box: tuple[float, float, float, float],
+        boundaries: List[float],
+        header_bottom: float,
+    ) -> List[List[str]]:
+        """Собирает строки таблицы ВОР из слов страницы по границам граф.
+
+        Границы граф берутся из рамки шапки (единственной размеченной части
+        формы), после чего каждое слово относится к графе по центру своей
+        горизонтальной позиции. Слова одной визуальной строки склеиваются,
+        а продолжение многострочной ячейки присоединяется к предыдущей позиции.
+        """
+        word_extractor = getattr(page, "extract_words", None)
+        if not callable(word_extractor):
+            return []
+        try:
+            words = word_extractor() or []
+        except Exception:
+            return []
+        if not words:
+            return []
+
+        lines: Dict[int, List[Any]] = {}
+        for word in words:
+            top = float(word.get("top", 0.0))
+            left = float(word.get("x0", 0.0))
+            right = float(word.get("x1", 0.0))
+            if top < header_bottom - 2:
+                continue
+            if top > crop_box[3] or right < crop_box[0] or left > crop_box[2]:
+                continue
+            # Одна визуальная строка: допуск 3 pt на разную высоту шрифта.
+            lines.setdefault(round(top / 3), []).append(word)
+
+        cell_count = len(boundaries) - 1
+        rows: List[List[str]] = []
+        current: Optional[List[str]] = None
+
+        for key in sorted(lines):
+            cells = [""] * cell_count
+            for word in sorted(lines[key], key=lambda item: item["x0"]):
+                center = (float(word["x0"]) + float(word["x1"])) / 2
+                index = bisect_right(boundaries, center) - 1
+                index = min(max(index, 0), cell_count - 1)
+                text = str(word.get("text", "")).strip()
+                if not text:
+                    continue
+                cells[index] = (cells[index] + " " + text).strip()
+
+            if not any(cells):
+                continue
+            line_text = re.sub(
+                r"\s+", " ", " ".join(cell for cell in cells if cell)
+            )
+            if _VOR_SECTION_PATTERN.match(line_text):
+                # «Раздел: 1. Кровля» — отдельная строка-контекст, а не
+                # продолжение предыдущей позиции.
+                if current is not None:
+                    rows.append(current)
+                    current = None
+                rows.append(cells)
+                continue
+
+            if _POSITION_PATTERN.fullmatch(cells[0].strip()):
+                if current is not None:
+                    rows.append(current)
+                current = cells
+                continue
+            if current is None:
+                current = cells
+                continue
+            # Продолжение ячейки: объём «36.58\n31,18+5,4», перенос
+            # наименования либо ссылка на обоснование.
+            for index, value in enumerate(cells):
+                if not value:
+                    continue
+                current[index] = (
+                    f"{current[index]}\n{value}" if current[index] else value
+                )
+        if current is not None:
+            rows.append(current)
+        return rows
+
+    def _grand_vor_layout(
+        self, tables: List[Any]
+    ) -> Optional[tuple[List[float], float, List[List[str]]]]:
+        """Границы граф, низ рамки шапки и строки шапки ВОР ГРАНД-Сметы.
+
+        Разметка берется только у таблицы, в шапке которой есть маркеры формы
+        ГРАНД-Сметы: иначе координаты граф произвольной таблицы дали бы мусор.
+        """
+        for table in tables or []:
+            try:
+                data = table.extract() or []
+            except Exception:
+                continue
+            header_rows = [
+                [self._cell_text(cell) for cell in row] for row in data
+            ]
+            if not any(self._is_grand_vor_header(row) for row in header_rows[:8]):
+                continue
+            try:
+                columns = table.columns
+                bottom = float(table.bbox[3])
+            except Exception:
+                continue
+            if not columns or len(columns) < 4:
+                continue
+            boundaries = [float(column.bbox[0]) for column in columns]
+            boundaries.append(float(columns[-1].bbox[2]))
+            return boundaries, bottom, header_rows
         return None
 
     def _table_has_header(self, table: List[List[str]]) -> bool:
@@ -639,15 +816,19 @@ class PDFSpecParser:
 
     def _extract_rows_via_finder(
         self, page, crop_box: tuple[float, float, float, float]
-    ) -> List[List[str]]:
-        """Строки самой крупной таблицы страницы без строк нижнего штампа."""
+    ) -> Tuple[List[List[str]], List[Any]]:
+        """Строки самой крупной таблицы страницы без строк нижнего штампа.
+
+        Возвращает также все найденные таблицы: рамка шапки ВОР ГРАНД-Сметы
+        используется как источник границ граф для строк без линий.
+        """
         finder = getattr(page, "find_tables", None)
         if not callable(finder):
-            return []
+            return [], []
         try:
             tables = finder(self._LINE_SETTINGS)
         except Exception:
-            return []
+            return [], []
 
         best: List[List[str]] = []
         for table in tables or []:
@@ -665,7 +846,7 @@ class PDFSpecParser:
             ]
             if self._table_weight(filtered) > self._table_weight(best):
                 best = filtered
-        return best
+        return best, list(tables or [])
 
     @staticmethod
     def _table_weight(table: List[List[str]]) -> int:
@@ -789,7 +970,8 @@ class PDFSpecParser:
         Поддерживаются оба целевых формата:
 
         * ГОСТ 21.110 (спецификация оборудования, >= 7 колонок);
-        * ВОР (4-6 колонок: №, наименование, ед. изм., количество).
+        * ВОР: 4-6 колонок (№, наименование, ед. изм., количество) и форма
+          ПК «ГРАНД-Смета» из 7 граф (объем в графе 4, комментарий в графе 7).
 
         Индексы колонок берутся из шапки, а не из фиксированных позиций,
         поэтому дополнительные служебные колонки не ломают разбор.
@@ -799,6 +981,8 @@ class PDFSpecParser:
         # сравнение выполняется по склеенному тексту без пробелов и дефисов.
         keys = [re.sub(r"[\s\-]+", "", cell) for cell in cells]
         joined = " ".join(cells)
+        # Форма ВОР ПК «ГРАНД-Смета»: 7 граф, количество в графе 4.
+        is_grand_vor = cls._is_grand_vor_header(row)
 
         title_col = next(
             (
@@ -833,23 +1017,36 @@ class PDFSpecParser:
             None,
         )
 
-        is_specification = (
+        is_specification = not is_grand_vor and (
             len(cells) >= 7
             or any(token in joined for token in _HEADER_SPEC_TOKENS)
         )
         if title_col is None:
             return None
         if unit_col is None:
-            # ГОСТ 21.110: графа 6 (индекс 5) — единица измерения.
-            if not is_specification or len(cells) <= 5:
+            if is_grand_vor:
+                # ГРАНД-Смета: графа 3 (индекс 2) — единица измерения.
+                if len(cells) <= 2:
+                    return None
+                unit_col = 2
+            elif not is_specification or len(cells) <= 5:
+                # ГОСТ 21.110: графа 6 (индекс 5) — единица измерения.
                 return None
-            unit_col = 5
+            else:
+                unit_col = 5
         if qty_col is None:
-            # ГОСТ 21.110: графа 8 (индекс 7); при отсутствии графы массы —
-            # индекс 6. Значение всё равно уточняется по содержимому строки.
-            if not is_specification or len(cells) <= 6:
+            if is_grand_vor:
+                # ГРАНД-Смета: графа 4 (индекс 3) — объем работ, а не графа 7
+                # (там комментарий), и не графа 8 спецификации ГОСТ 21.110.
+                if len(cells) <= 3:
+                    return None
+                qty_col = 3
+            elif not is_specification or len(cells) <= 6:
                 return None
-            qty_col = 7 if len(cells) > 7 else 6
+            else:
+                # ГОСТ 21.110: графа 8 (индекс 7); при отсутствии графы массы —
+                # индекс 6. Значение всё равно уточняется по содержимому строки.
+                qty_col = 7 if len(cells) > 7 else 6
 
         position_col = next(
             (
@@ -877,6 +1074,9 @@ class PDFSpecParser:
             ),
             None,
         )
+        if is_grand_vor:
+            # ГРАНД-Смета: графа 1 (индекс 0) — номер позиции.
+            position_col = 0
         return _ColumnSchema(
             kind="SPECIFICATION" if is_specification else "VOR",
             title_col=title_col,
@@ -941,6 +1141,60 @@ class PDFSpecParser:
             if all(_COLUMN_NUMBER_PATTERN.fullmatch(value) for value in values):
                 return True
         return False
+
+    @classmethod
+    def _parse_vor_volume(cls, raw_value: Any) -> Optional[Decimal]:
+        """Объем работ из графы 4 ВОР: первая строка многострочной ячейки.
+
+        ГРАНД-Смета печатает в графе «Количество» итог и формулу его расчета
+        («36.58\\n31,18+5,4», «15\\n15»). Объемом является первая строка:
+        формула не должна попадать в ``Decimal``. Ячейка, склеенная
+        ``_cell_text`` в одну строку, разбирается по первому токену.
+        """
+        text = "" if raw_value is None else str(raw_value)
+        first = next((line for line in text.split("\n") if line.strip()), "")
+        if not first:
+            return None
+        compact = (
+            first.replace(" ", "")
+            .replace("\u00a0", "")
+            .replace("\u200b", "")
+            .replace(",", ".")
+            .lstrip("*")
+            .rstrip("*")
+        )
+        if compact:
+            try:
+                return Decimal(compact)
+            except InvalidOperation:
+                pass
+        # «1 020» с пробелом-разделителем уже разобрано выше; здесь — случай
+        # склеенной ячейки «36.58 31,18+5,4», где второй токен уже формула.
+        token = re.split(r"\s+", first.strip())[0]
+        token = token.replace("\u00a0", "").replace(",", ".").strip("*")
+        try:
+            return Decimal(token)
+        except InvalidOperation:
+            return None
+
+    @classmethod
+    def _clean_vor_unit(cls, value: str) -> str:
+        """Локальные исправления OCR-опечаток единиц измерения ВОР.
+
+        ``UnitNormalizer`` общий для всех форматов, поэтому искажения именно
+        ВОР («HT» вместо «шт», потерянная «м» в «2», сноска «*») правятся
+        здесь, до передачи единицы в нормализатор.
+        """
+        text = cls._cell_text(value).replace("*", "").strip()
+        if not text:
+            return ""
+        stripped = text.replace(".", "").strip()
+        # Латинские «HT»/кириллические «НТ» — OCR-опечатка «шт».
+        if re.fullmatch(r"[HН][TТ]", stripped):
+            return "шт"
+        if stripped == "2":
+            return "м2"
+        return text
 
     @classmethod
     def _parse_decimal(cls, raw_value: Any) -> Optional[Decimal]:
@@ -1059,12 +1313,18 @@ class PDFSpecParser:
     def _resolve_quantity(
         cls, row: List[str], schema: _ColumnSchema, unit_index: Optional[int]
     ) -> Optional[Decimal]:
-        """Количество из графы 8; при пустой графе — первое число справа от ед. изм.
+        """Количество из графы объема; при пустой графе — первое число справа.
 
+        Для ВОР (в т.ч. формы ГРАНД-Сметы) объем берется из первой строки
+        ячейки: формула расчета («31,18+5,4») не является количеством.
         Графа 7 «Масса единицы, кг» никогда не трактуется как количество,
         даже если графа 8 в конкретной строке не заполнена.
         """
-        qty = cls._parse_decimal(cls._at(row, schema.qty_col))
+        raw_qty = cls._at(row, schema.qty_col)
+        if schema.kind == "VOR":
+            qty = cls._parse_vor_volume(raw_qty)
+        else:
+            qty = cls._parse_decimal(raw_qty)
         if qty is not None:
             return qty
         if unit_index is None:
@@ -1072,10 +1332,29 @@ class PDFSpecParser:
         for index in range(unit_index + 1, len(row)):
             if schema.mass_col is not None and index == schema.mass_col:
                 continue
-            value = cls._parse_decimal(row[index])
+            if schema.kind == "VOR":
+                value = cls._parse_vor_volume(row[index])
+            else:
+                value = cls._parse_decimal(row[index])
             if value is not None:
                 return value
         return None
+
+    @classmethod
+    def _resolve_vor_section(cls, row: List[str], schema: _ColumnSchema) -> str:
+        """Заголовок раздела ВОР («Раздел: 1. Кровля»).
+
+        В форме ГРАНД-Сметы слово «Раздел:» печатается в графе 1, а номер и
+        название — в графе 2, поэтому графы склеиваются для контекста.
+        """
+        if schema.kind != "VOR":
+            return ""
+        first = cls._cell_text(cls._at(row, 0))
+        title = cls._cell_text(cls._at(row, schema.title_col))
+        text = f"{first} {title}".strip()
+        if not _VOR_SECTION_PATTERN.match(text):
+            return ""
+        return re.sub(r"\s+", " ", text)
 
     @classmethod
     def _resolve_title(cls, row: List[str], schema: _ColumnSchema) -> str:
@@ -1290,6 +1569,9 @@ class PDFSpecParser:
 
                     raw_title = self._resolve_title(row, current_schema)
                     raw_unit, unit_index = self._resolve_unit(row, current_schema)
+                    if current_schema.kind == "VOR":
+                        # Опечатки единиц ВОР правятся до UnitNormalizer.
+                        raw_unit = self._clean_vor_unit(raw_unit)
                     row_schema = self._effective_schema(
                         row, current_schema, unit_index
                     )
@@ -1298,7 +1580,11 @@ class PDFSpecParser:
                     )
 
                     if parsed_qty is None:
-                        if (
+                        section = self._resolve_vor_section(row, current_schema)
+                        if section:
+                            current_section = section
+                            carried_over_row = None
+                        elif (
                             not raw_unit
                             and raw_title
                             and self._is_section_heading(raw_title)
@@ -1385,3 +1671,789 @@ class PDFSpecParser:
             context_section=section,
             pointer=pointer,
         )
+
+
+# ----------------------------------------------------------------------
+# 5. Парсер локальных смет из векторных PDF (форма 4б)
+# ----------------------------------------------------------------------
+
+_PDF_LSR_INT_TOKEN_PATTERN: re.Pattern[str] = re.compile(r"^\d{1,2}$")
+_PDF_LSR_POSITION_PATTERN: re.Pattern[str] = re.compile(r"^\d{1,3}(?:[.,]\d{1,2})?$")
+_PDF_LSR_LABOR_CODE_PATTERN: re.Pattern[str] = re.compile(r"^\d{1,2}-\d{3}-\d{2,3}$")
+_PDF_LSR_MACHINE_CODE_PATTERN: re.Pattern[str] = re.compile(r"^91\.")
+# Шифры расценок: сборники ГЭСН/ФЕР/ТЕР/ТСН, ФСНБ и прейскурантные позиции.
+_PDF_LSR_RATE_CODE_PATTERN: re.Pattern[str] = re.compile(
+    r"^(?:ГЭСН|ФЕР|ТЕР|ТСН|ФСНБ|ФСЭМ|Прайс-лист|[3-6]\.[\d\-]+$)",
+    re.IGNORECASE,
+)
+# Шифры ресурсов: ФСБЦ/ФССЦ, ценники 999-хххх, код ФСБЦ вида 01.7.15.03-0012.
+_PDF_LSR_RESOURCE_CODE_PATTERN: re.Pattern[str] = re.compile(
+    r"^(?:ФСБЦ|ФССЦ|999-\d{4}|(?:1|2|13)\.[\d\-]+$|"
+    r"\d{2}\.\d{1,2}\.\d{1,2}(?:\.\d{1,2})?-\d{3,4}$)",
+    re.IGNORECASE,
+)
+_PDF_LSR_SECTION_PATTERN: re.Pattern[str] = re.compile(
+    r"^раздел\b(?!\s*пд)", re.IGNORECASE
+)
+_PDF_LSR_SERVICE_PATTERN: re.Pattern[str] = re.compile(
+    r"^(?:итого|всего|итоги|фот\b|нр\b|нр\s|сп\b|сп\s|сп\(|зтр\b|тр\b|"
+    r"в т\.ч\.|в том числе|накладные|сметная прибыль|ндс|прямые затраты|"
+    r"затраты труда|оплата труда|эксплуатация машин|материальные ресурсы|"
+    r"перевозка\b|справочно\b|оборудование,\s*отсутствующее|"
+    r"раздел\s+пд\b|книга\b|пункт\b|(?:от|отм|эм|эмм|м)$)",
+    re.IGNORECASE,
+)
+_PDF_LSR_NUMBER_PATTERN: re.Pattern[str] = re.compile(r"^-?\d[\d\s.,]*$")
+_PDF_LSR_MOJIBAKE_CODECS: Tuple[str, ...] = ("utf-8", "cp1251")
+_PDF_LSR_LINE_TOLERANCE: float = 1.5
+
+
+def _pdf_text_score(value: str) -> int:
+    """Оценивает «естественность» текста для выбора кодировки.
+
+    Считает кириллические символы положительным вкладом, а прочие
+    не-ASCII символы (латиница с диакритикой, псевдографика cp866) —
+    отрицательным.
+
+    :param value: проверяемый фрагмент текста.
+    :return: целочисленная оценка: чем больше, тем естественнее текст.
+    """
+    cyrillic = 0
+    exotic = 0
+    for char in value:
+        if char.isspace() or char in "№«»—–-.,;:()[]/%":
+            continue
+        lowered = char.lower()
+        if lowered == "ё" or "а" <= lowered <= "я":
+            cyrillic += 1
+        elif not char.isascii():
+            exotic += 1
+    return cyrillic * 2 - exotic * 2
+
+
+def _repair_pdf_text(text: str) -> str:
+    """Восстанавливает кириллицу после двойного искажения PDF-текста.
+
+    Генераторы PDF смет выдают текст в UTF-8 или cp1251, который
+    просмотрщик/извлекатель декодирует как cp866. Функция перебирает
+    кандидатов ``encode('cp866').decode(codec)`` и выбирает вариант с
+    наибольшей «кириллической» оценкой.
+
+    :param text: исходный фрагмент, полученный от ``pdfplumber``.
+    :return: восстановленный текст либо исходный фрагмент, если все
+        кандидаты оказались хуже.
+    """
+    if not text or text.isascii():
+        return text
+
+    best = text
+    best_score = _pdf_text_score(text)
+    for codec in _PDF_LSR_MOJIBAKE_CODECS:
+        try:
+            candidate = text.encode("cp866").decode(codec)
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        score = _pdf_text_score(candidate)
+        if score > best_score:
+            best = candidate
+            best_score = score
+    return best
+
+
+def _squash_spaces(value: str) -> str:
+    """Сворачивает повторные пробелы и неразрывные пробелы в один.
+
+    :param value: исходная строка.
+    :return: строка без ведущих/замыкающих пробелов.
+    """
+    return re.sub(r"\s+", " ", (value or "").replace("\xa0", " ")).strip()
+
+
+def _parse_pdf_number(value: str) -> Optional[Decimal]:
+    """Разбирает число из ячейки PDF-сметы (пробелы — разделители тысяч).
+
+    :param value: текст ячейки, например ``'1 287,00'``.
+    :return: ``Decimal`` либо ``None``, если ячейка не является числом.
+    """
+    text = _squash_spaces(value)
+    if not text or not _PDF_LSR_NUMBER_PATTERN.match(text):
+        return None
+    try:
+        return Decimal(text.replace(" ", "").replace(",", "."))
+    except InvalidOperation:
+        return None
+
+
+@dataclass(frozen=True)
+class _LSRColumnLayout:
+    """Геометрия таблицы сметы: границы колонок и их назначение.
+
+    :param bounds: возрастающие x-координаты вертикальных линий.
+    :param position_col: колонка «№ п.п.».
+    :param code_col: колонка «Обоснование» (шифр расценки/ресурса).
+    :param title_col: колонка «Наименование».
+    :param unit_col: колонка «Единица измерения».
+    :param qty_unit_col: колонка «Количество на единицу».
+    :param qty_total_col: колонка «Всего с учетом коэффициента».
+    :param base_price_col: колонка базисной цены (может отсутствовать).
+    :param unit_price_col: колонка цены в текущем уровне цен.
+    :param total_cost_col: колонка «Всего затрат».
+    """
+
+    bounds: Tuple[float, ...]
+    position_col: int
+    code_col: int
+    title_col: int
+    unit_col: int
+    qty_unit_col: Optional[int]
+    qty_total_col: int
+    base_price_col: Optional[int]
+    unit_price_col: Optional[int]
+    total_cost_col: int
+
+    @property
+    def column_count(self) -> int:
+        """Возвращает количество колонок таблицы."""
+        return len(self.bounds) - 1
+
+
+class PDFLSRParser:
+    """Парсер локальной сметы из векторного PDF (форма 4б, 11-12 граф).
+
+    Парсер работает только с PDF, содержащими текстовый слой: строки
+    собираются из отдельных слов ``pdfplumber``, поэтому OCR не требуется.
+    Геометрия таблицы определяется динамически для каждой страницы:
+    границы колонок берутся из вертикальных линий, при их отсутствии —
+    из ячеек ``pdfplumber`` (``vertical_strategy='lines'``) либо из
+    кластеризации левых краев слов тела таблицы. Строка-шапка ищется по
+    последовательным номерам граф или по ключевым заголовкам.
+
+    Тип строки определяется по шифру обоснования: ГЭСН/ФЕР/ТЕР/ТСН/ФСНБ и
+    прейскурант «Прайс-лист» — расценки (родительские позиции), а ФСБЦ/ФССЦ,
+    ценники и коды машин/труда — ресурсы. Для строк без распознанного шифра
+    действует резервная эвристика по номеру позиции (целое число — расценка,
+    вложенный номер — ресурс). Ресурсы получают ``is_resource=True`` и
+    ``parent_id`` ближайшей расценки; самостоятельные ресурсные позиции
+    с целым номером остаются без родителя.
+    """
+
+    # Минимум числовых токенов в строке-шапке «1 2 3 ... 12».
+    MIN_HEADER_TOKENS = 6
+    # Минимум колонок таблицы для распознавания сметной формы.
+    MIN_COLUMNS = 8
+    # Максимум колонок: больше — это уже рамки/штампы, а не сетка сметы.
+    MAX_COLUMNS = 24
+    # Допуск кластеризации вертикальных линий таблицы, пт.
+    EDGE_TOLERANCE = 2.0
+    # Допуск кластеризации левых краев слов для смет без линий, пт.
+    TEXT_ALIGN_TOLERANCE = 8.0
+    # Минимальная высота вертикальной линии, чтобы считать ее границей колонки.
+    MIN_EDGE_HEIGHT = 3.0
+    # Ключевые заголовки шапки для форм без нумерации граф.
+    HEADER_TOKENS: Final[Tuple[str, ...]] = (
+        "обоснование",
+        "наименование",
+        "единица измерения",
+        "количество",
+    )
+
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+
+    def parse(self, sheet_name: Optional[str] = None) -> List[NormalizedItem]:
+        """Разбирает PDF-смету целиком, страница за страницей.
+
+        :param sheet_name: не используется: у PDF нет листов; параметр
+            сохранен для единого интерфейса сметных парсеров.
+        :return: список нормализованных позиций сметы.
+        """
+        del sheet_name
+        items: List[NormalizedItem] = []
+        layout: Optional[_LSRColumnLayout] = None
+        section = "Default_Section"
+        parent_id: Optional[str] = None
+        pending_idx: Optional[int] = None
+        last_idx: Optional[int] = None
+
+        with pdfplumber.open(self.file_path) as pdf:
+            for page_number, page in enumerate(pdf.pages, start=1):
+                lines = self._page_lines(page)
+                page_layout, body_top = self._page_layout(page, lines, layout)
+                if page_layout is None:
+                    continue
+                layout = page_layout
+
+                for line in lines:
+                    if line[0]["top"] < body_top:
+                        continue
+                    cells = self._row_cells(line, layout)
+                    position_text = cells.get(layout.position_col, "")
+                    code_text = cells.get(layout.code_col, "")
+                    title_text = cells.get(layout.title_col, "")
+
+                    if _PDF_LSR_SECTION_PATTERN.match(position_text or title_text):
+                        section = _squash_spaces(
+                            " ".join(
+                                part
+                                for part in (position_text, code_text, title_text)
+                                if part
+                            )
+                        )
+                        last_idx = None
+                        continue
+
+                    if LSRParser.TOTAL_ROW_PATTERN.match(title_text):
+                        total = self._cell_number(cells, layout.total_cost_col)
+                        if total is None:
+                            total = self._cell_number(cells, layout.unit_price_col)
+                        if total is not None and pending_idx is not None:
+                            self._apply_position_total(items[pending_idx], total)
+                            pending_idx = None
+                        last_idx = None
+                        continue
+
+                    if _PDF_LSR_SERVICE_PATTERN.match(title_text):
+                        last_idx = None
+                        continue
+
+                    position_is_number = bool(
+                        _PDF_LSR_POSITION_PATTERN.match(position_text)
+                    )
+                    if not position_is_number and not code_text:
+                        if title_text and last_idx is not None:
+                            self._append_title(items[last_idx], title_text)
+                        continue
+
+                    unit_text = _squash_spaces(cells.get(layout.unit_col, ""))
+                    quantity = self._cell_number(cells, layout.qty_total_col)
+                    if quantity is None:
+                        quantity = self._cell_number(cells, layout.qty_unit_col)
+                    if (
+                        code_text
+                        and last_idx is not None
+                        and not unit_text
+                        and quantity is None
+                        and not title_text
+                    ):
+                        # Шифр перенесен на следующую физическую строку
+                        # («ГЭСНр 65-02-» + «008-01»).
+                        self._append_code(items[last_idx], code_text)
+                        continue
+                    if not unit_text or quantity is None:
+                        last_idx = None
+                        continue
+                    if _PDF_LSR_LABOR_CODE_PATTERN.match(
+                        code_text
+                    ) or _PDF_LSR_MACHINE_CODE_PATTERN.match(code_text):
+                        last_idx = None
+                        continue
+
+                    is_parent = self._is_rate_row(code_text, position_text)
+                    is_nested = bool(
+                        not is_parent
+                        and parent_id is not None
+                        and not (
+                            position_is_number
+                            and not re.search(r"[.,]", position_text)
+                        )
+                    )
+                    sequence = len(items) + 1
+                    raw_id = f"PDF_LSR_{sequence}"
+                    canonical_unit, volume, multiplier = UnitNormalizer.normalize(
+                        unit_text, quantity
+                    )
+                    pointer = CellPointer(
+                        doc_type="LSR",
+                        file_name=self.file_path,
+                        sheet_name=f"Page {page_number}",
+                        row_idx=sequence,
+                        col_letter=openpyxl.utils.get_column_letter(
+                            layout.position_col + 1
+                        ),
+                        coordinate=f"p.{page_number} [row {sequence}]",
+                    )
+                    items.append(
+                        NormalizedItem(
+                            raw_id=raw_id,
+                            code=self._normalize_code(code_text) or None,
+                            raw_title=title_text,
+                            clean_title=LSRParser._clean_estimate_title(title_text),
+                            raw_unit=unit_text,
+                            canonical_unit=canonical_unit,
+                            unit_multiplier=multiplier,
+                            volume=volume,
+                            dimensions=DimensionLockExtractor.extract(title_text),
+                            context_section=section,
+                            pointer=pointer,
+                            is_resource=not is_parent,
+                            parent_id=parent_id if is_nested else None,
+                            unit_price=self._cell_number(
+                                cells, layout.unit_price_col
+                            ),
+                            total_cost=self._cell_number(
+                                cells, layout.total_cost_col
+                            ),
+                        )
+                    )
+                    if is_parent:
+                        parent_id = raw_id
+                        pending_idx = len(items) - 1
+                    elif not is_nested:
+                        # Самостоятельная ресурсная позиция без расценки:
+                        # блок «Всего по позиции» относится к ней самой.
+                        pending_idx = len(items) - 1
+                    last_idx = len(items) - 1
+
+        return items
+
+    def _page_lines(self, page: Any) -> List[List[Dict[str, Any]]]:
+        """Собирает слова страницы в физические строки с восстановлением кодировки.
+
+        :param page: страница ``pdfplumber``.
+        :return: список строк, каждая строка — список слов с координатами.
+        """
+        words: List[Dict[str, Any]] = []
+        for raw_word in page.extract_words():
+            text = _repair_pdf_text(str(raw_word.get("text", "")))
+            if not text:
+                continue
+            words.append(
+                {
+                    "text": text,
+                    "x0": float(raw_word["x0"]),
+                    "x1": float(raw_word["x1"]),
+                    "top": float(raw_word["top"]),
+                    "bottom": float(raw_word["bottom"]),
+                }
+            )
+        words.sort(key=lambda word: (round(float(word["top"]), 1), float(word["x0"])))
+
+        lines: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+        line_top: Optional[float] = None
+        for word in words:
+            top = float(word["top"])
+            if line_top is None or abs(top - line_top) > _PDF_LSR_LINE_TOLERANCE:
+                if current:
+                    lines.append(current)
+                current = [word]
+                line_top = top
+            else:
+                current.append(word)
+        if current:
+            lines.append(current)
+        return lines
+
+    def _page_layout(
+        self,
+        page: Any,
+        lines: List[List[Dict[str, Any]]],
+        previous: Optional[_LSRColumnLayout],
+    ) -> Tuple[Optional[_LSRColumnLayout], float]:
+        """Определяет геометрию таблицы и верхнюю границу тела таблицы.
+
+        :param page: страница ``pdfplumber``.
+        :param lines: строки страницы из :meth:`_page_lines`.
+        :param previous: геометрия предыдущей страницы (для продолжений
+            таблицы без повторной шапки).
+        :return: пара «геометрия колонок, top начала тела таблицы»;
+            ``(None, 0.0)``, если страница не является таблицей сметы.
+        """
+        header_index = self._header_line_index(lines)
+        if header_index is None:
+            if previous is not None:
+                return previous, 0.0
+            return None, 0.0
+
+        header_line = lines[header_index]
+        header_top = min(float(word["top"]) for word in header_line)
+        body_top = max(float(word["bottom"]) for word in header_line)
+        bounds = self._column_bounds(page, lines, header_index, header_top)
+        if len(bounds) < self.MIN_COLUMNS:
+            if previous is not None:
+                return previous, body_top
+            return None, 0.0
+
+        band = [
+            word
+            for line in lines
+            for word in line
+            if float(word["top"]) <= header_top + _PDF_LSR_LINE_TOLERANCE
+        ]
+        headers = self._header_cells(band, bounds)
+        layout = self._layout_from_header(headers, len(bounds) - 1, bounds)
+        if layout is not None:
+            return layout, body_top
+        if previous is not None and len(previous.bounds) == len(bounds):
+            return replace(previous, bounds=bounds), body_top
+        return None, 0.0
+
+    @classmethod
+    def _header_line_index(cls, lines: List[List[Dict[str, Any]]]) -> Optional[int]:
+        """Находит строку-шапку сметы.
+
+        Сначала ищется строка с последовательными номерами граф
+        «1 2 3 ... N», затем — строка с ключевыми заголовками
+        («Обоснование», «Наименование», «Единица измерения»,
+        «Количество») для форм без нумерации граф.
+
+        :param lines: строки страницы.
+        :return: индекс строки-шапки либо ``None``.
+        """
+        for index, line in enumerate(lines):
+            values = sorted(
+                int(str(word["text"]))
+                for word in line
+                if _PDF_LSR_INT_TOKEN_PATTERN.match(str(word["text"]))
+            )
+            if len(values) < cls.MIN_HEADER_TOKENS:
+                continue
+            if values[0] == 1 and values == list(range(1, len(values) + 1)):
+                return index
+
+        for index, line in enumerate(lines):
+            text = _squash_spaces(
+                " ".join(str(word["text"]) for word in line)
+            ).lower()
+            hits = sum(1 for token in cls.HEADER_TOKENS if token in text)
+            if hits >= 2:
+                return index
+        return None
+
+    def _column_bounds(
+        self,
+        page: Any,
+        lines: List[List[Dict[str, Any]]],
+        header_index: int,
+        header_top: float,
+    ) -> Tuple[float, ...]:
+        """Определяет границы колонок таблицы без привязки к координатам файла.
+
+        Порядок источников геометрии:
+
+        1. вертикальные линии таблицы, начинающиеся выше шапки;
+        2. все вертикальные линии страницы (если линии шапки не найдены);
+        3. ячейки таблиц ``pdfplumber`` (``vertical_strategy='lines'``);
+        4. кластеризация левых краев слов тела таблицы (сметы без линий).
+
+        :param page: страница ``pdfplumber``.
+        :param lines: строки страницы из :meth:`_page_lines`.
+        :param header_index: индекс строки-шапки.
+        :param header_top: верхняя координата шапки.
+        :return: возрастающий кортеж x-координат границ колонок.
+        """
+        bounds = self._line_column_bounds(page, header_top)
+        if len(bounds) < self.MIN_COLUMNS:
+            bounds = self._line_column_bounds(page, None)
+        if not self.MIN_COLUMNS <= len(bounds) <= self.MAX_COLUMNS:
+            table_bounds = self._table_column_bounds(page)
+            if len(table_bounds) >= self.MIN_COLUMNS:
+                bounds = table_bounds
+        if len(bounds) < self.MIN_COLUMNS:
+            bounds = self._text_column_bounds(lines, header_index)
+        return bounds
+
+    def _line_column_bounds(
+        self, page: Any, top_limit: Optional[float]
+    ) -> Tuple[float, ...]:
+        """Кластеризует вертикальные линии страницы в границы колонок.
+
+        :param page: страница ``pdfplumber``.
+        :param top_limit: учитывать линии, начинающиеся выше этой
+            координаты (шапка таблицы); ``None`` — все линии страницы.
+        :return: возрастающий кортеж x-координат границ колонок.
+        """
+        coordinates: List[float] = []
+        for edge in page.edges:
+            if str(edge.get("orientation")) != "v":
+                continue
+            top = float(edge["top"])
+            bottom = float(edge["bottom"])
+            if bottom - top < self.MIN_EDGE_HEIGHT:
+                continue
+            if top_limit is not None and top >= top_limit:
+                continue
+            coordinates.append((float(edge["x0"]) + float(edge["x1"])) / 2)
+        return self._cluster_coordinates(coordinates, self.EDGE_TOLERANCE)
+
+    def _table_column_bounds(self, page: Any) -> Tuple[float, ...]:
+        """Извлекает границы колонок из таблиц ``pdfplumber`` по линиям.
+
+        :param page: страница ``pdfplumber``.
+        :return: возрастающий кортеж x-координат границ колонок.
+        """
+        find_tables = getattr(page, "find_tables", None)
+        if find_tables is None:
+            return ()
+        try:
+            tables = find_tables(
+                table_settings={
+                    "vertical_strategy": "lines",
+                    "horizontal_strategy": "lines",
+                }
+            )
+        except (TypeError, ValueError):
+            return ()
+        coordinates: List[float] = []
+        for table in tables:
+            for cell in getattr(table, "cells", ()):
+                if cell is None:
+                    continue
+                coordinates.extend((float(cell[0]), float(cell[2])))
+        return self._cluster_coordinates(coordinates, self.EDGE_TOLERANCE)
+
+    def _text_column_bounds(
+        self, lines: List[List[Dict[str, Any]]], header_index: int
+    ) -> Tuple[float, ...]:
+        """Строит границы колонок по левым краям слов тела таблицы.
+
+        Резервный способ для смет без линий: слова тела выровнены по левому
+        краю граф, поэтому кластеризация их ``x0`` дает начала колонок,
+        а границы колонок — середины между соседними кластерами.
+
+        :param lines: строки страницы.
+        :param header_index: индекс строки-шапки.
+        :return: возрастающий кортеж x-координат границ колонок.
+        """
+        body = lines[header_index + 1 :]
+        if not body:
+            return ()
+        starts = [float(word["x0"]) for line in body for word in line]
+        clusters = self._cluster_coordinates(starts, self.TEXT_ALIGN_TOLERANCE)
+        if len(clusters) < self.MIN_COLUMNS:
+            return ()
+        right = max(float(word["x1"]) for line in body for word in line)
+        bounds = [clusters[0]]
+        for left, next_left in zip(clusters, clusters[1:]):
+            bounds.append((left + next_left) / 2)
+        bounds.append(right)
+        return tuple(bounds)
+
+    @staticmethod
+    def _cluster_coordinates(
+        coordinates: List[float], tolerance: float
+    ) -> Tuple[float, ...]:
+        """Схлопывает близкие координаты в упорядоченный набор границ.
+
+        :param coordinates: исходные x-координаты.
+        :param tolerance: максимальное расстояние между границами.
+        :return: возрастающий кортеж уникальных координат.
+        """
+        ordered = sorted(coordinates)
+        clustered: List[float] = []
+        for value in ordered:
+            if clustered and abs(value - clustered[-1]) <= tolerance:
+                continue
+            clustered.append(value)
+        return tuple(clustered)
+
+    @staticmethod
+    def _header_cells(
+        words: List[Dict[str, Any]], bounds: Tuple[float, ...]
+    ) -> Dict[int, str]:
+        """Раскладывает слова шапки по колонкам и склеивает текст колонки.
+
+        :param words: слова шапки страницы.
+        :param bounds: границы колонок.
+        :return: отображение «индекс колонки -> текст заголовка».
+        """
+        cells: Dict[int, List[str]] = {}
+        for word in words:
+            center = (float(word["x0"]) + float(word["x1"])) / 2
+            index = bisect_right(bounds, center) - 1
+            if index < 0 or index >= len(bounds) - 1:
+                continue
+            cells.setdefault(index, []).append(str(word["text"]))
+        return {
+            index: _squash_spaces(" ".join(parts))
+            for index, parts in cells.items()
+        }
+
+    @classmethod
+    def _layout_from_header(
+        cls,
+        headers: Dict[int, str],
+        column_count: int,
+        bounds: Tuple[float, ...],
+    ) -> Optional[_LSRColumnLayout]:
+        """Сопоставляет текстовые заголовки граф с индексами колонок.
+
+        :param headers: отображение «индекс колонки -> текст шапки».
+        :param column_count: количество колонок таблицы.
+        :param bounds: x-координаты границ колонок.
+        :return: геометрия колонок либо ``None``, если шапка не распознана.
+        """
+        if column_count < cls.MIN_COLUMNS:
+            return None
+
+        def find(*tokens: str, exclude: Tuple[str, ...] = ()) -> Optional[int]:
+            for index in range(column_count):
+                text = headers.get(index, "").lower()
+                if all(token in text for token in tokens) and not any(
+                    token in text for token in exclude
+                ):
+                    return index
+            return None
+
+        graph: Dict[int, int] = {}
+        for index in range(column_count):
+            match = re.search(r"(\d{1,2})\s*$", headers.get(index, ""))
+            if match:
+                graph[int(match.group(1))] = index
+
+        position = find("№")
+        code = find("обоснование")
+        title = find("наименование")
+        unit = find("единица измерения")
+        if title is None:
+            title = graph.get(3)
+        if unit is None:
+            unit = graph.get(4)
+        if position is None:
+            position = graph.get(1, 0)
+        if code is None:
+            code = graph.get(2, 1 if column_count > 1 else 0)
+        if title is None or unit is None:
+            return None
+
+        qty_unit = find("количество", exclude=("всего",))
+        if qty_unit is None:
+            qty_unit = graph.get(5)
+        qty_total = find("всего", "учет")
+        if qty_total is None:
+            qty_total = find("всего", exclude=("текущем", "базисном"))
+        if qty_total is None:
+            qty_total = graph.get(7, column_count - 3)
+        base_price = find("базисном", exclude=("всего",))
+        if base_price is None:
+            base_price = graph.get(8)
+        unit_price = find("текущем", exclude=("всего",))
+        if unit_price is None:
+            unit_price = graph.get(10, column_count - 2)
+        total_cost = find("текущем", "всего")
+        if total_cost is None:
+            total_cost = graph.get(12, column_count - 1)
+
+        required = (position, code, title, unit, qty_total, total_cost)
+        if any(index is None or index >= column_count for index in required):
+            return None
+        for optional in (qty_unit, base_price, unit_price):
+            if optional is not None and optional >= column_count:
+                return None
+        if len(set(required)) < len(required):
+            return None
+
+        return _LSRColumnLayout(
+            bounds=bounds,
+            position_col=int(position),
+            code_col=int(code),
+            title_col=int(title),
+            unit_col=int(unit),
+            qty_unit_col=qty_unit,
+            qty_total_col=int(qty_total),
+            base_price_col=base_price,
+            unit_price_col=unit_price,
+            total_cost_col=int(total_cost),
+        )
+
+    @staticmethod
+    def _row_cells(
+        line: List[Dict[str, Any]], layout: _LSRColumnLayout
+    ) -> Dict[int, str]:
+        """Раскладывает слова физической строки по колонкам таблицы.
+
+        :param line: слова строки.
+        :param layout: геометрия колонок страницы.
+        :return: отображение «индекс колонки -> текст ячейки».
+        """
+        cells: Dict[int, List[str]] = {}
+        for word in line:
+            x0 = float(word["x0"])
+            x1 = float(word["x1"])
+            if x0 < layout.bounds[0] - 3 or x1 > layout.bounds[-1] + 3:
+                continue
+            index = bisect_right(layout.bounds, (x0 + x1) / 2) - 1
+            index = max(0, min(index, layout.column_count - 1))
+            cells.setdefault(index, []).append(str(word["text"]))
+        return {
+            index: _squash_spaces(" ".join(parts))
+            for index, parts in cells.items()
+        }
+
+    @staticmethod
+    def _cell_number(
+        cells: Dict[int, str], index: Optional[int]
+    ) -> Optional[Decimal]:
+        """Извлекает число из указанной колонки строки.
+
+        :param cells: ячейки строки.
+        :param index: индекс колонки либо ``None``.
+        :return: ``Decimal`` либо ``None``.
+        """
+        if index is None:
+            return None
+        return _parse_pdf_number(cells.get(index, ""))
+
+    @staticmethod
+    def _apply_position_total(item: NormalizedItem, total: Decimal) -> None:
+        """Записывает итог «Всего по позиции» в позицию сметы.
+
+        :param item: позиция, к которой относится итог.
+        :param total: стоимость по графе «Всего затрат».
+        """
+        item.total_cost = total
+        if item.unit_price is None and item.volume > 0:
+            item.unit_price = (total / item.volume).quantize(Decimal("0.0001"))
+
+    @staticmethod
+    def _is_rate_row(code: str, position: str) -> bool:
+        """Определяет, является ли строка расценкой (родительской позицией).
+
+        Приоритет отдается шифру обоснования из графы 2: сборники
+        ГЭСН/ФЕР/ТЕР/ТСН/ФСНБ, главы 3-6 ТСН-2001 и прейскурант
+        «Прайс-лист» — расценки, а ФСБЦ/ФССЦ, ценники 999-хххх,
+        главы 1/2/13 ТСН-2001 и коды ФСБЦ — ресурсы. Для строк
+        без распознанного шифра применяется резервная эвристика по номеру
+        позиции: целое число — расценка, вложенный номер (``2.1``) — ресурс.
+
+        :param code: шифр обоснования из графы 2.
+        :param position: номер позиции из графы 1.
+        :return: ``True`` для расценки, ``False`` для ресурса.
+        """
+        if code and _PDF_LSR_RATE_CODE_PATTERN.match(code):
+            return True
+        if code and _PDF_LSR_RESOURCE_CODE_PATTERN.match(code):
+            return False
+        if not _PDF_LSR_POSITION_PATTERN.match(position):
+            return False
+        return not re.search(r"[.,]", position)
+
+    @staticmethod
+    def _normalize_code(code: str) -> str:
+        """Убирает пробелы вокруг дефисов в шифре, разорванном переносом.
+
+        :param code: шифр обоснования из графы 2.
+        :return: нормализованный шифр.
+        """
+        return re.sub(r"\s*-\s*", "-", _squash_spaces(code))
+
+    @staticmethod
+    def _append_code(item: NormalizedItem, extra: str) -> None:
+        """Дописывает перенесенный на новую строку шифр обоснования.
+
+        :param item: позиция, чей шифр разорван переносом строки.
+        :param extra: продолжение шифра.
+        """
+        item.code = PDFLSRParser._normalize_code(f"{item.code or ''} {extra}")
+
+    @staticmethod
+    def _append_title(item: NormalizedItem, extra: str) -> None:
+        """Дописывает продолжение наименования к предыдущей позиции.
+
+        :param item: позиция, чье наименование переносится на новую строку.
+        :param extra: текст продолжения.
+        """
+        item.raw_title = _squash_spaces(f"{item.raw_title} {extra}")
+        item.clean_title = LSRParser._clean_estimate_title(item.raw_title)
+        item.dimensions = DimensionLockExtractor.extract(item.raw_title)
+

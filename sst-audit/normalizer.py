@@ -1,7 +1,141 @@
 import re
 from decimal import Decimal
-from typing import Tuple, Dict, Any
-from models import UnitClass
+from typing import Any, Dict, Final, Optional, Tuple
+from models import DimensionFamily, UnitClass, UnitDimension
+
+
+def _canonical_unit_key(raw_unit: Optional[str]) -> Optional[str]:
+    """Канонический ключ единицы для словаря размерностей.
+
+    Приводит написание к нижнему регистру, убирает все пробелы (включая
+    неразрывные) и точки: ``'пог. м' -> 'погм'``, ``'кв. м' -> 'квм'``,
+    ``'100 м2' -> '100м2'``. Символы ``²``/``³`` нормализуются в ``2``/``3``.
+    """
+    if raw_unit is None:
+        return None
+    text = str(raw_unit).strip().lower()
+    if not text:
+        return None
+    text = text.replace("\xa0", " ").replace("\u2009", " ").replace("\u202f", " ")
+    text = text.replace("²", "2").replace("³", "3").replace("ё", "е")
+    text = re.sub(r"\s+", "", text)
+    text = text.replace(".", "")
+    return text or None
+
+
+def _dimension(
+    family: DimensionFamily, base_unit: str, multiplier: str = "1"
+) -> UnitDimension:
+    """Фабрика описания единицы: кратность передается строкой в ``Decimal``."""
+    return UnitDimension(
+        family=family,
+        base_unit=base_unit,
+        multiplier=Decimal(multiplier),
+    )
+
+
+# Словарь физических размерностей (SSOT Unit Gate).
+# Ключи — результат ``_canonical_unit_key``, кратность — относительно base_unit.
+_UNIT_DIMENSIONS: Final[Dict[str, UnitDimension]] = {
+    # --- Длина (базовая единица — метр) ---
+    "м": _dimension(DimensionFamily.LENGTH, "м"),
+    "метр": _dimension(DimensionFamily.LENGTH, "м"),
+    "метров": _dimension(DimensionFamily.LENGTH, "м"),
+    "погм": _dimension(DimensionFamily.LENGTH, "м"),
+    "пм": _dimension(DimensionFamily.LENGTH, "м"),
+    "мп": _dimension(DimensionFamily.LENGTH, "м"),
+    "м/п": _dimension(DimensionFamily.LENGTH, "м"),
+    "100м": _dimension(DimensionFamily.LENGTH, "м", "100"),
+    "1000м": _dimension(DimensionFamily.LENGTH, "м", "1000"),
+    "км": _dimension(DimensionFamily.LENGTH, "м", "1000"),
+    "мм": _dimension(DimensionFamily.LENGTH, "м", "0.001"),
+    # --- Площадь ---
+    "м2": _dimension(DimensionFamily.AREA, "м2"),
+    "квм": _dimension(DimensionFamily.AREA, "м2"),
+    "мкв": _dimension(DimensionFamily.AREA, "м2"),
+    "100м2": _dimension(DimensionFamily.AREA, "м2", "100"),
+    "100квм": _dimension(DimensionFamily.AREA, "м2", "100"),
+    "1000м2": _dimension(DimensionFamily.AREA, "м2", "1000"),
+    "1000квм": _dimension(DimensionFamily.AREA, "м2", "1000"),
+    # --- Объем ---
+    "м3": _dimension(DimensionFamily.VOLUME, "м3"),
+    "кубм": _dimension(DimensionFamily.VOLUME, "м3"),
+    "мкуб": _dimension(DimensionFamily.VOLUME, "м3"),
+    "10м3": _dimension(DimensionFamily.VOLUME, "м3", "10"),
+    "10кубм": _dimension(DimensionFamily.VOLUME, "м3", "10"),
+    "100м3": _dimension(DimensionFamily.VOLUME, "м3", "100"),
+    "100кубм": _dimension(DimensionFamily.VOLUME, "м3", "100"),
+    "л": _dimension(DimensionFamily.VOLUME, "м3", "0.001"),
+    "литр": _dimension(DimensionFamily.VOLUME, "м3", "0.001"),
+    "литров": _dimension(DimensionFamily.VOLUME, "м3", "0.001"),
+    # --- Масса (базовая единица — кг) ---
+    "кг": _dimension(DimensionFamily.MASS, "кг"),
+    "килограмм": _dimension(DimensionFamily.MASS, "кг"),
+    "килограммов": _dimension(DimensionFamily.MASS, "кг"),
+    "г": _dimension(DimensionFamily.MASS, "кг", "0.001"),
+    "грамм": _dimension(DimensionFamily.MASS, "кг", "0.001"),
+    "граммов": _dimension(DimensionFamily.MASS, "кг", "0.001"),
+    "т": _dimension(DimensionFamily.MASS, "кг", "1000"),
+    "тн": _dimension(DimensionFamily.MASS, "кг", "1000"),
+    "тонн": _dimension(DimensionFamily.MASS, "кг", "1000"),
+    "тонна": _dimension(DimensionFamily.MASS, "кг", "1000"),
+    "тонны": _dimension(DimensionFamily.MASS, "кг", "1000"),
+    # --- Штучные изделия (COUNT) ---
+    "шт": _dimension(DimensionFamily.COUNT, "шт"),
+    "штук": _dimension(DimensionFamily.COUNT, "шт"),
+    "штука": _dimension(DimensionFamily.COUNT, "шт"),
+    "штуки": _dimension(DimensionFamily.COUNT, "шт"),
+    "1шт": _dimension(DimensionFamily.COUNT, "шт"),
+    "10шт": _dimension(DimensionFamily.COUNT, "шт", "10"),
+    "100шт": _dimension(DimensionFamily.COUNT, "шт", "100"),
+    "100перемычек": _dimension(DimensionFamily.COUNT, "шт", "100"),
+    "1000шт": _dimension(DimensionFamily.COUNT, "шт", "1000"),
+    "тысшт": _dimension(DimensionFamily.COUNT, "шт", "1000"),
+    "тысштук": _dimension(DimensionFamily.COUNT, "шт", "1000"),
+    "компл": _dimension(DimensionFamily.COUNT, "компл"),
+    "комплект": _dimension(DimensionFamily.COUNT, "компл"),
+    "комплектов": _dimension(DimensionFamily.COUNT, "компл"),
+    "комп": _dimension(DimensionFamily.COUNT, "компл"),
+    "упак": _dimension(DimensionFamily.COUNT, "упак"),
+    "упаковка": _dimension(DimensionFamily.COUNT, "упак"),
+    "упаковок": _dimension(DimensionFamily.COUNT, "упак"),
+    "уп": _dimension(DimensionFamily.COUNT, "упак"),
+    "рулон": _dimension(DimensionFamily.COUNT, "рулон"),
+    "рулонов": _dimension(DimensionFamily.COUNT, "рулон"),
+    "рул": _dimension(DimensionFamily.COUNT, "рулон"),
+    "бобина": _dimension(DimensionFamily.COUNT, "бобина"),
+    "бобин": _dimension(DimensionFamily.COUNT, "бобина"),
+    "боб": _dimension(DimensionFamily.COUNT, "бобина"),
+    "пара": _dimension(DimensionFamily.COUNT, "пара"),
+    "пары": _dimension(DimensionFamily.COUNT, "пара"),
+    "пар": _dimension(DimensionFamily.COUNT, "пара"),
+    # --- Электромонтаж / работы (ELECTRICAL) ---
+    "точка": _dimension(DimensionFamily.ELECTRICAL, "точка"),
+    "точки": _dimension(DimensionFamily.ELECTRICAL, "точка"),
+    "точек": _dimension(DimensionFamily.ELECTRICAL, "точка"),
+    "ввод": _dimension(DimensionFamily.ELECTRICAL, "ввод"),
+    "вводов": _dimension(DimensionFamily.ELECTRICAL, "ввод"),
+    "панель": _dimension(DimensionFamily.ELECTRICAL, "панель"),
+    "панелей": _dimension(DimensionFamily.ELECTRICAL, "панель"),
+    "шкаф": _dimension(DimensionFamily.ELECTRICAL, "шкаф"),
+    "шкафов": _dimension(DimensionFamily.ELECTRICAL, "шкаф"),
+    "система": _dimension(DimensionFamily.ELECTRICAL, "система"),
+    "системы": _dimension(DimensionFamily.ELECTRICAL, "система"),
+    "систем": _dimension(DimensionFamily.ELECTRICAL, "система"),
+}
+
+# Допустимые межсемейственные связки (комплекты/системы против штук).
+_CROSS_FAMILY_COMPATIBLE: Final[frozenset[frozenset[DimensionFamily]]] = frozenset(
+    {
+        frozenset({DimensionFamily.COUNT, DimensionFamily.ELECTRICAL}),
+    }
+)
+
+# Веса предиката R05_UNT (Decimal — Zero Float Policy).
+_UNIT_GATE_EXACT_WEIGHT: Final[Decimal] = Decimal("1.0")
+_UNIT_GATE_CROSS_WEIGHT: Final[Decimal] = Decimal("0.7")
+_UNIT_GATE_SKIP_WEIGHT: Final[Decimal] = Decimal("0.5")
+_UNIT_GATE_BLOCK_WEIGHT: Final[Decimal] = Decimal("0.0")
 
 
 class UnitNormalizer:
@@ -75,6 +209,104 @@ class UnitNormalizer:
             return UnitClass.COUNT, base_qty * Decimal("1000.0"), Decimal("1000.0")
 
         return UnitClass.UNKNOWN, base_qty, Decimal("1.0")
+
+    # ------------------------------------------------------------------
+    # R05_UNT: Unit Gate (физические размерности)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def classify_unit(raw_unit: Optional[str]) -> Optional[UnitDimension]:
+        """Классифицирует единицу в каноническое описание размерности.
+
+        :return: ``UnitDimension`` либо ``None``, если единица не определена
+            (None/пустая строка) или отсутствует в словаре физических единиц.
+        """
+        key = _canonical_unit_key(raw_unit)
+        if key is None:
+            return None
+        return _UNIT_DIMENSIONS.get(key)
+
+    @staticmethod
+    def dimension_family(raw_unit: Optional[str]) -> Optional[DimensionFamily]:
+        """Возвращает семейство размерности единицы (или ``None``)."""
+        dimension = UnitNormalizer.classify_unit(raw_unit)
+        return dimension.family if dimension is not None else None
+
+    @staticmethod
+    def is_dimension_compatible(
+        unit_rd: Optional[str], unit_smeta: Optional[str]
+    ) -> bool:
+        """Проверяет совместимость физических размерностей пары единиц.
+
+        Правила:
+        * одна/обе единицы не определены либо не распознаны -> ``True``
+          (мягкий пропуск в HITL, жесткая блокировка не выполняется);
+        * единицы одного семейства -> ``True`` (включая кратности);
+        * межсемейственная связка COUNT <-> ELECTRICAL -> ``True``
+          (комплект/система/точка/шкаф считаются штучными позициями);
+        * остальные комбинации семейств -> ``False``
+          (AREA vs VOLUME, LENGTH vs COUNT, MASS vs COUNT и т.д.).
+        """
+        dim_rd = UnitNormalizer.classify_unit(unit_rd)
+        dim_smeta = UnitNormalizer.classify_unit(unit_smeta)
+        if dim_rd is None or dim_smeta is None:
+            return True
+        if dim_rd.family is dim_smeta.family:
+            return True
+        return frozenset({dim_rd.family, dim_smeta.family}) in _CROSS_FAMILY_COMPATIBLE
+
+    @staticmethod
+    def evaluate_unit_gate(
+        unit_rd: Optional[str], unit_smeta: Optional[str]
+    ) -> Tuple[bool, Decimal, str]:
+        """Предикат R05_UNT: вердикт, вес и причина совместимости единиц.
+
+        :return: кортеж ``(is_compatible, weight_score, reason)``.
+
+        * несовместимые семейства -> ``(False, 0.0,
+          "INCOMPATIBLE_DIMENSIONS: {FAM1} vs {FAM2}")``;
+        * одна/обе единицы не определены -> ``(True, 0.5, "..._SKIPPED")``;
+        * совпадение с учетом кратности -> ``(True, 1.0,
+          "EXACT_OR_SCALED_MATCH")``;
+        * допустимая конверсия (шт <-> компл/система, т <-> кг) ->
+          ``(True, 0.7, "COMPATIBLE_CROSS_UNIT")``.
+
+        ``weight_score`` возвращается ``Decimal`` в соответствии с Zero Float
+        Policy проекта; сравнение с ``1.0``/``0.0`` работает штатно.
+        """
+        dim_rd = UnitNormalizer.classify_unit(unit_rd)
+        dim_smeta = UnitNormalizer.classify_unit(unit_smeta)
+
+        if dim_rd is None and dim_smeta is None:
+            return True, _UNIT_GATE_SKIP_WEIGHT, "UNDEFINED_UNITS_SKIPPED"
+        if dim_rd is None or dim_smeta is None:
+            return True, _UNIT_GATE_SKIP_WEIGHT, "UNKNOWN_UNIT_SKIPPED"
+
+        if dim_rd.family is not dim_smeta.family:
+            pair = frozenset({dim_rd.family, dim_smeta.family})
+            if pair in _CROSS_FAMILY_COMPATIBLE:
+                return True, _UNIT_GATE_CROSS_WEIGHT, "COMPATIBLE_CROSS_UNIT"
+            return (
+                False,
+                _UNIT_GATE_BLOCK_WEIGHT,
+                f"INCOMPATIBLE_DIMENSIONS: {dim_rd.family.name} vs {dim_smeta.family.name}",
+            )
+
+        if dim_rd.base_unit == dim_smeta.base_unit:
+            return True, _UNIT_GATE_EXACT_WEIGHT, "EXACT_OR_SCALED_MATCH"
+        return True, _UNIT_GATE_CROSS_WEIGHT, "COMPATIBLE_CROSS_UNIT"
+
+
+def is_dimension_compatible(unit_rd: Optional[str], unit_smeta: Optional[str]) -> bool:
+    """Модульная обертка над :meth:`UnitNormalizer.is_dimension_compatible`."""
+    return UnitNormalizer.is_dimension_compatible(unit_rd, unit_smeta)
+
+
+def evaluate_unit_gate(
+    unit_rd: Optional[str], unit_smeta: Optional[str]
+) -> Tuple[bool, Decimal, str]:
+    """Модульная обертка над :meth:`UnitNormalizer.evaluate_unit_gate`."""
+    return UnitNormalizer.evaluate_unit_gate(unit_rd, unit_smeta)
 
 
 class DimensionLockExtractor:
