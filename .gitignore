@@ -29,3 +29,5 @@ Thumbs.db*.html
 /data/
 *.xlsx
 *.pdf
+batch_errors.log
+sst_audit.db*
