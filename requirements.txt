@@ -6,6 +6,7 @@
 openpyxl==3.1.5          # MIT
 pandas==3.0.6            # BSD-3-Clause
 pdfplumber==0.11.10      # MIT
+pypdfium2==5.14.0        # Apache-2.0 / BSD-3-Clause (PDFium)
 RapidFuzz==3.14.6        # MIT
 pydantic==2.13.5         # MIT
 rich==15.0.0             # MIT
