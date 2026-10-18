@@ -16,7 +16,6 @@ import db
 import exporter
 from exporter import (
     DASHBOARD_TITLE,
-    SHEET_TITLE,
     export_audit_to_excel,
     export_sessions_to_excel,
 )
@@ -41,7 +40,14 @@ def _seed_session(conn: sqlite3.Connection) -> tuple[int, int]:
 
     :return: идентификаторы связей (AUTO, HITL_PENDING).
     """
-    db.create_session(conn, SESSION_ID, PROJECT_NAME, "rd.pdf", "smeta.xlsx")
+    db.create_session(
+        conn,
+        SESSION_ID,
+        PROJECT_NAME,
+        "rd.pdf",
+        "smeta.xlsx",
+        smeta_sheet="ЛС 02-01-03",
+    )
     db.save_rd_items(
         conn,
         SESSION_ID,
@@ -68,7 +74,7 @@ def _seed_session(conn: sqlite3.Connection) -> tuple[int, int]:
         [
             {
                 "row_idx": 1,
-                "code": "ФССЦ-21.1.06.04-0012",
+                "code": "1.7-10-1",
                 "description": "Кабель силовой ВВГнг 3х1.5",
                 "unit": "м",
                 "quantity": Decimal("100.0"),
@@ -77,7 +83,7 @@ def _seed_session(conn: sqlite3.Connection) -> tuple[int, int]:
             },
             {
                 "row_idx": 2,
-                "code": "ФССЦ-22.1.03.01-0001",
+                "code": "4.8-175-2",
                 "description": "Арматура А500С d12",
                 "unit": "т",
                 "quantity": Decimal("12.0"),
@@ -152,7 +158,7 @@ def _seed_unmatched_smeta_session(
         [
             {
                 "row_idx": 1,
-                "code": "ФССЦ-БЕЗ-РД",
+                "code": "1.7-БЕЗ-РД",
                 "description": "Позиция сметы без подтверждения в РД",
                 "unit": "шт",
                 "quantity": Decimal("10.0"),
@@ -191,9 +197,20 @@ def _seed_unmatched_smeta_session(
 
 
 def _open_sheet(path: Path):
-    """Загружает книгу без вычисления формул и возвращает ее активный лист."""
+    """Загружает книгу без вычисления формул и возвращает лист раздела."""
     workbook = load_workbook(path, data_only=False)
-    return workbook[SHEET_TITLE]
+    return workbook.worksheets[1]
+
+
+def _kpi_row(worksheet, label: str) -> int:
+    """Находит номер KPI-строки по ее подписи на дашборде."""
+    for row in range(
+        exporter.DASHBOARD_FIRST_KPI_ROW,
+        exporter.DASHBOARD_SECTION_TITLE_ROW,
+    ):
+        if worksheet[f"A{row}"].value == label:
+            return row
+    raise AssertionError(f"KPI-строка не найдена: {label}")
 
 
 def test_exporter_creates_valid_xlsx(conn: sqlite3.Connection, tmp_path: Path) -> None:
@@ -205,12 +222,13 @@ def test_exporter_creates_valid_xlsx(conn: sqlite3.Connection, tmp_path: Path) -
     assert target.stat().st_size > 0
 
     workbook = load_workbook(target)
-    assert workbook.sheetnames == [DASHBOARD_TITLE, SHEET_TITLE]
+    assert workbook.sheetnames == [DASHBOARD_TITLE, "ЭОМ (ЛС 02-01-03)"]
     assert workbook.active.title == DASHBOARD_TITLE
-    worksheet = workbook[SHEET_TITLE]
+    worksheet = workbook["ЭОМ (ЛС 02-01-03)"]
 
     assert worksheet["B1"].value == exporter.BACK_TO_DASHBOARD_FORMULA
-    assert worksheet["B1"].font.color.rgb.endswith("0000FF")
+    assert worksheet["B1"].font.color.rgb.endswith("FFFFFF")
+    assert worksheet["B1"].font.bold is True
     assert worksheet["B1"].font.underline == "single"
     assert worksheet["C1"].value == PROJECT_NAME
     assert worksheet["B2"].value == "ID сессии:"
@@ -222,7 +240,7 @@ def test_exporter_creates_valid_xlsx(conn: sqlite3.Connection, tmp_path: Path) -
     assert worksheet["Q4"].value == "Экспертный комментарий / Причина отклонения"
     assert worksheet.freeze_panes == "C5"
     assert worksheet.auto_filter.ref == "B4:Q6"
-    assert worksheet.max_row == 6
+    assert worksheet.max_row == 7
     assert worksheet.max_column == 17
     assert not worksheet.column_dimensions["J"].hidden
     assert not worksheet.column_dimensions["K"].hidden
@@ -352,7 +370,7 @@ def test_exporter_resolves_latest_session(conn: sqlite3.Connection, tmp_path: Pa
 
     assert worksheet["C2"].value == "export-session-002"
     assert worksheet["C1"].value == "Другой объект"
-    assert worksheet.max_row == 4
+    assert worksheet.max_row == 5
 
     with pytest.raises(LookupError):
         export_audit_to_excel(conn, "missing-session", tmp_path / "missing.xlsx")
@@ -411,9 +429,16 @@ def test_exporter_without_rd_pair_is_gray_and_has_no_deltas(
 
     workbook = load_workbook(target)
     dashboard = workbook[DASHBOARD_TITLE]
-    assert dashboard["G21"].value == 1
-    assert dashboard["M21"].value == exporter.VERDICT_NO_MATCH
-    assert dashboard["M21"].fill.fgColor.rgb.endswith("D9D9D9")
+    assert dashboard["A21"].value == "АР"
+    assert dashboard["C21"].value == 1
+    assert dashboard["D21"].value == 1
+    assert dashboard["E21"].value == 0
+    assert dashboard["F21"].value == 0
+    assert dashboard["G21"].value == 0
+    assert dashboard["J21"].value == "—"
+    assert dashboard["K21"].value == "—"
+    assert dashboard["L21"].value == exporter.VERDICT_NO_RD_SPEC
+    assert dashboard["L21"].fill.fgColor.rgb.endswith("FFE699")
 
 
 def test_export_sessions_readable_titles_and_dashboard(
@@ -444,24 +469,35 @@ def test_export_sessions_readable_titles_and_dashboard(
 
     dashboard = workbook[DASHBOARD_TITLE]
     assert dashboard["A1"].value == "СВОДНЫЙ АУДИТ ОБЪЁМОВ"
-    assert dashboard["B7"].value == 2
-    assert dashboard["B9"].value == 2
-    assert dashboard["B10"].value == 3
-    assert dashboard["B11"].value == 2
-    assert dashboard["B12"].value == pytest.approx(2 / 3)
-    assert dashboard["B13"].value == 1
-    assert dashboard["B14"].value == 1
-    assert dashboard["B15"].value == 1
-    assert dashboard["B21"].value == "ЭОМ"
-    assert dashboard["C21"].value == "ЛС 02-01-03"
-    assert dashboard["M21"].value == exporter.VERDICT_DISCREPANCY
-    assert dashboard["B22"].value == "АР"
-    assert dashboard["C22"].value == "ЛС 02-01-01"
-    assert dashboard["G22"].value == 1
-    assert dashboard["M22"].value == exporter.VERDICT_NO_MATCH
-    assert dashboard["M22"].fill.fgColor.rgb.endswith("D9D9D9")
-    assert dashboard["B21"].hyperlink is not None
-    assert dashboard.auto_filter.ref == "A20:M22"
+    assert dashboard["B7"].value == 3
+    assert dashboard["B8"].value == 2
+    assert dashboard["B9"].value == pytest.approx(1 / 2)
+    assert dashboard["B10"].value == 1
+    assert dashboard["B11"].value == 1
+    assert dashboard["B12"].value == 1
+    assert dashboard["B13"].value == pytest.approx(790000.0)
+    assert dashboard["B14"].value == pytest.approx(-360000.0)
+    assert dashboard["A21"].value == "ЭОМ"
+    assert dashboard["B21"].value == "ЛС 02-01-03"
+    assert dashboard["C21"].value == 2
+    assert dashboard["D21"].value == 1
+    assert dashboard["E21"].value == 1
+    assert dashboard["F21"].value == pytest.approx(1.0)
+    assert dashboard["G21"].value == 1
+    assert dashboard["L21"].value == exporter.VERDICT_DISCREPANCY
+    assert dashboard["A22"].value == "АР"
+    assert dashboard["B22"].value == "ЛС 02-01-01"
+    assert dashboard["C22"].value == 1
+    assert dashboard["D22"].value == 1
+    assert dashboard["E22"].value == 0
+    assert dashboard["F22"].value == 0
+    assert dashboard["G22"].value == 0
+    assert dashboard["J22"].value == "—"
+    assert dashboard["K22"].value == "—"
+    assert dashboard["L22"].value == exporter.VERDICT_NO_RD_SPEC
+    assert dashboard["L22"].fill.fgColor.rgb.endswith("FFE699")
+    assert dashboard["A21"].hyperlink is not None
+    assert dashboard.auto_filter.ref == "A20:L22"
 
     eom = workbook["ЭОМ (ЛС 02-01-03)"]
     assert eom.auto_filter.ref == "B4:Q6"
@@ -472,6 +508,74 @@ def test_export_sessions_readable_titles_and_dashboard(
     assert ar["C5"].value is None
     assert ar["N5"].value is None
     assert ar["P5"].fill.fgColor.rgb.endswith("D9D9D9")
+
+
+def test_dashboard_percentage_format(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """Покрытие выводится нативным процентом в KPI и таблице разделов."""
+    _seed_session(conn)
+    target = export_audit_to_excel(conn, SESSION_ID, tmp_path / "percent.xlsx")
+    dashboard = load_workbook(target)[DASHBOARD_TITLE]
+
+    kpi_row = _kpi_row(dashboard, "Покрытие спецификациями РД")
+    assert dashboard[f"B{kpi_row}"].number_format == exporter.PERCENT_FORMAT
+    assert dashboard["F21"].number_format == exporter.PERCENT_FORMAT
+
+
+def test_dashboard_dash_for_missing_prices(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """Без подключенных цен дашборд показывает центрированный прочерк."""
+    _seed_unmatched_smeta_session(conn, "dash-session", "ЛС 02-01-01")
+    target = export_audit_to_excel(conn, "dash-session", tmp_path / "dash.xlsx")
+    dashboard = load_workbook(target)[DASHBOARD_TITLE]
+
+    cost_row = _kpi_row(dashboard, "Стоимость сметы, руб.")
+    assert dashboard[f"B{cost_row}"].value == "—"
+    assert dashboard[f"B{cost_row}"].alignment.horizontal == "center"
+    assert dashboard["J21"].value == "—"
+    assert dashboard["K21"].value == "—"
+    assert dashboard["J21"].alignment.horizontal == "center"
+    assert dashboard["K21"].alignment.horizontal == "center"
+
+
+def test_sheet_has_summary_total_row(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """Внизу листа раздела есть бухгалтерская строка ИТОГО с формулами SUM."""
+    _seed_session(conn)
+    target = export_audit_to_excel(conn, SESSION_ID, tmp_path / "totals.xlsx")
+    worksheet = _open_sheet(target)
+
+    summary_row = exporter.FIRST_DATA_ROW + 2
+    assert worksheet[f"B{summary_row}"].value == "ИТОГО ПО РАЗДЕЛУ:"
+    for column in ("E", "I", "M", "N"):
+        assert (
+            worksheet[f"{column}{summary_row}"].value
+            == f"=SUM({column}5:{column}6)"
+        )
+        assert worksheet[f"{column}{summary_row}"].number_format == (
+            exporter.VOLUME_FORMAT
+        )
+    assert worksheet[f"B{summary_row}"].font.bold is True
+    assert worksheet[f"N{summary_row}"].font.bold is True
+    assert worksheet[f"E{summary_row}"].border.top.style == "thin"
+    assert worksheet[f"E{summary_row}"].border.bottom.style == "double"
+
+
+def test_return_link_styling(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    """Плашка возврата на дашборд имеет темно-синюю заливку и белый шрифт."""
+    _seed_session(conn)
+    target = export_audit_to_excel(conn, SESSION_ID, tmp_path / "link.xlsx")
+    worksheet = _open_sheet(target)
+
+    assert worksheet["B1"].value == exporter.BACK_TO_DASHBOARD_FORMULA
+    assert worksheet["B1"].fill.fgColor.rgb.endswith("1F4E79")
+    assert worksheet["B1"].font.color.rgb.endswith("FFFFFF")
+    assert worksheet["B1"].font.bold is True
+    assert worksheet["B1"].alignment.horizontal == "center"
+    assert worksheet.column_dimensions["B"].width >= 20
 
 
 def test_readable_sheet_title_respects_excel_limits(tmp_path: Path) -> None:
