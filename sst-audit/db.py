@@ -19,17 +19,28 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from datetime import datetime
 from decimal import Decimal
 from itertools import count
 import json
+import logging
 from pathlib import Path
 import sqlite3
 from typing import Any, Final, TypeAlias
 
 from models import RULE_EVALUATION_STATUSES, RuleEvaluation, SmetaItem
 
-DEFAULT_DB_PATH: Final[str] = "sst_audit.db"
+logger = logging.getLogger(__name__)
+
+# Детерминированный путь к SSOT: всегда каталог проекта, независимо от CWD.
+DEFAULT_DB_PATH: Final[Path] = Path(__file__).resolve().parent / "sst_audit.db"
 DEFAULT_CONVERSION_RATIO: Final[Decimal] = Decimal("1.0")
+
+# Параметры горячего резервирования SSOT.
+DEFAULT_BACKUP_DIRNAME: Final[str] = "backups"
+DEFAULT_MAX_BACKUPS: Final[int] = 10
+BACKUP_TIMESTAMP_FORMAT: Final[str] = "%Y%m%d_%H%M%S"
+BACKUP_CONNECT_TIMEOUT_SECONDS: Final[int] = 30
 
 VALID_SESSION_STATUSES: Final[frozenset[str]] = frozenset(
     {"CREATED", "MATCHED", "REVIEWED", "EXPORTED"}
@@ -957,3 +968,73 @@ def record_expert_review(
             (match_id,),
         )
     return review_id
+
+
+# ----------------------------------------------------------------------
+# 4. Горячее резервирование SSOT (WAL-safe snapshot)
+# ----------------------------------------------------------------------
+
+
+def _rotate_backups(target_dir: Path, stem: str, max_backups: int) -> None:
+    """Удаляет устаревшие снимки, оставляя ``max_backups`` самых свежих.
+
+    Сортировка выполняется по имени файла: формат ``YYYYMMDD_HHMMSS``
+    лексикографически совпадает с хронологией, поэтому ``st_mtime``
+    (float-метка времени) не используется.
+    """
+    retention = max(max_backups, 1)
+    snapshots = sorted(target_dir.glob(f"{stem}_*.db"), reverse=True)
+    for stale in snapshots[retention:]:
+        stale.unlink(missing_ok=True)
+
+
+def backup_database(
+    db_path: str | Path | None = None,
+    backup_dir: str | Path | None = None,
+    max_backups: int = DEFAULT_MAX_BACKUPS,
+) -> Path | None:
+    """Создает целостный горячий снимок рабочей БД SQLite.
+
+    Копирование выполняется через ``sqlite3.Connection.backup``: это
+    единственный WAL-safe способ снять снимок «на лету» (учитывает
+    незафиксированные в основном файле страницы ``-wal``/``-shm``).
+
+    :param db_path: путь к SSOT; ``None`` — ``DEFAULT_DB_PATH`` проекта.
+    :param backup_dir: каталог снимков; по умолчанию ``<db_dir>/backups``.
+    :param max_backups: сколько последних снимков хранить (ротация).
+    :return: путь к созданному снимку либо ``None``, если база пуста/нет
+        доступа (первый чистый запуск либо ошибка резервирования).
+    """
+    source_path = Path(DEFAULT_DB_PATH if db_path is None else db_path).resolve()
+    try:
+        if not source_path.is_file() or source_path.stat().st_size == 0:
+            return None
+
+        target_dir = (
+            Path(backup_dir).resolve()
+            if backup_dir is not None
+            else source_path.parent / DEFAULT_BACKUP_DIRNAME
+        )
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime(BACKUP_TIMESTAMP_FORMAT)
+        backup_file = target_dir / f"{source_path.stem}_{timestamp}.db"
+
+        src_conn: sqlite3.Connection | None = None
+        dst_conn: sqlite3.Connection | None = None
+        try:
+            src_conn = sqlite3.connect(str(source_path), timeout=BACKUP_CONNECT_TIMEOUT_SECONDS)
+            dst_conn = sqlite3.connect(str(backup_file), timeout=BACKUP_CONNECT_TIMEOUT_SECONDS)
+            # pages=0 — скопировать все страницы за один вызов backup API.
+            src_conn.backup(dst_conn, pages=0)
+        finally:
+            if dst_conn is not None:
+                dst_conn.close()
+            if src_conn is not None:
+                src_conn.close()
+
+        _rotate_backups(target_dir, source_path.stem, max_backups)
+        return backup_file
+    except Exception as exc:  # noqa: BLE001 — резервирование не должно ронять пайплайн
+        logger.warning("Не удалось создать резервную копию БД %s: %s", source_path, exc)
+        return None

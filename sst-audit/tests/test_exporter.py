@@ -5,6 +5,7 @@
 """
 
 from collections.abc import Iterator
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 import sqlite3
@@ -646,4 +647,132 @@ def test_readable_sheet_title_respects_excel_limits(tmp_path: Path) -> None:
     assert len(title) <= 31
     for invalid in "\\/?*:[]":
         assert invalid not in title
+
+
+def test_build_section_sheet_title_keeps_code_and_tag() -> None:
+    """Шаблон вкладки двухпапочного режима сохраняет шифр и тег."""
+    assert (
+        exporter.build_section_sheet_title("02-01-01", "ВКЛ", "Раздел 02-01-01")
+        == "02-01-01 ВКЛ"
+    )
+    assert (
+        exporter.build_section_sheet_title("02-01-01", "ИСКЛ", "АР")
+        == "АР 02-01-01 ИСКЛ"
+    )
+
+    long_title = exporter.build_section_sheet_title(
+        "02-01-01",
+        "ИСКЛ",
+        "Очень длинное читаемое имя раздела объекта",
+    )
+    assert len(long_title) <= 31
+    assert long_title.startswith("02-01-01")
+    assert long_title.endswith("ИСКЛ")
+
+
+def test_object_balance_is_additive_without_sign_inversion() -> None:
+    """Сальдо = ВКЛ + ИСКЛ: отрицательная смета исключения уменьшает итог."""
+    metrics = [
+        replace(_balance_metric(), delta_cost=Decimal("1000")),
+        replace(_balance_metric(), delta_cost=Decimal("-250")),
+    ]
+
+    assert exporter.calculate_object_balance(metrics) == Decimal("750")
+
+
+def test_dual_mode_sheet_names_and_balance_row(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """Двухпапочная выгрузка называет вкладки по шаблону и пишет сальдо."""
+    _seed_session(conn)
+
+    target = export_sessions_to_excel(
+        conn,
+        [SESSION_ID],
+        tmp_path / "dual.xlsx",
+        section_hints={SESSION_ID: ("02-01-03", "ВКЛ")},
+    )
+    workbook = load_workbook(target)
+
+    assert workbook.sheetnames == [DASHBOARD_TITLE, "ЭОМ 02-01-03 ВКЛ"]
+    dashboard = workbook[DASHBOARD_TITLE]
+    assert dashboard["A21"].value == "ЭОМ ВКЛ"
+    assert dashboard["B21"].value == "ЛС 02-01-03"
+    assert dashboard["A22"].value == "ИТОГО по объекту"
+    assert dashboard["B22"].value == "ВКЛ + ИСКЛ"
+    assert dashboard["J22"].value == pytest.approx(790000.0)
+    assert dashboard["K22"].value == pytest.approx(-360000.0)
+    assert dashboard.auto_filter.ref == "A20:L21"
+
+
+def test_dual_mode_label_ignores_rd_path() -> None:
+    """Подпись ИСКЛ/ВКЛ строится по шифру, а не по полному пути файла ВОР."""
+    row = {
+        "project_name": "питер",
+        "smeta_sheet": None,
+        "rd_filename": r"..\data\питер\ВОР\Раздел ПД №11_ВОР 02-01-10.pdf",
+    }
+
+    unknown = exporter._section_export(
+        row,  # type: ignore[arg-type]
+        [],
+        "02-01-10 ВКЛ",
+        tag="ВКЛ",
+        section_code="02-01-10",
+    )
+    assert unknown.label == "Раздел 02-01-10"
+    assert unknown.cipher == "ЛС 02-01-10"
+
+    known = exporter._section_export(
+        row,  # type: ignore[arg-type]
+        [],
+        "08-02-05 ИСКЛ",
+        tag="ИСКЛ",
+        section_code="02-01-01",
+    )
+    assert known.label == "АР"
+    assert known.cipher == "ЛС 02-01-01"
+
+
+def test_empty_smeta_gets_explicit_verdict() -> None:
+    """Ноль позиций сметы не маскируется под «РД не сопоставлены»."""
+    metric = replace(
+        _balance_metric(),
+        total=7,
+        smeta_total=0,
+        rd_total=7,
+    )
+
+    assert metric.verdict == exporter.VERDICT_EMPTY_SMETA
+    fill, _font = exporter._verdict_style(metric.verdict)
+    assert fill is exporter._WARNING_FILL
+    assert exporter._TAB_COLORS[metric.verdict] == "FFC000"
+
+
+def _balance_metric() -> exporter.SectionMetrics:
+    """Минимальная метрика раздела для проверки чистого расчета сальдо."""
+    return exporter.SectionMetrics(
+        session_id="balance-session",
+        title="02-01-01 ВКЛ",
+        label="АР",
+        cipher="ЛС 02-01-01",
+        total=0,
+        smeta_total=0,
+        rd_total=0,
+        equipment_total=0,
+        equipment_paired=0,
+        smr_total=0,
+        unclassified_total=0,
+        paired=0,
+        no_rd=0,
+        no_smeta=0,
+        discrepancies=0,
+        pending=0,
+        rejected=0,
+        incomplete=0,
+        total_cost=Decimal("0"),
+        delta_cost=Decimal("0"),
+        has_prices=True,
+        tag="ВКЛ",
+    )
 

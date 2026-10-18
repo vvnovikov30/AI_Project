@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -102,6 +102,7 @@ VERDICT_NO_RD_SPEC: Final[str] = (
     "⚠️ В РД не найдены таблицы спецификаций (проверьте PDF)"
 )
 VERDICT_NO_DATA: Final[str] = "НЕТ ДАННЫХ"
+VERDICT_EMPTY_SMETA: Final[str] = "⚠️ Смета не распознана: 0 позиций"
 
 DASHBOARD_KPI_HEADER_ROW: Final[int] = 6
 DASHBOARD_FIRST_KPI_ROW: Final[int] = 7
@@ -835,6 +836,7 @@ def _populate_worksheet(
 _INVALID_SHEET_TITLE = re.compile(r"[\\/*?:\[\]]")
 _SECTION_CODE_PATTERN = re.compile(r"(?<!\d)(\d{2}-\d{2}-\d{2})(?!\d)")
 _LEADING_LS_PATTERN = re.compile(r"^\s*лс\s*", re.IGNORECASE)
+_SESSION_TAG_PATTERN = re.compile(r"_(ВКЛ|ИСКЛ|ОСН)_[0-9a-f]{6}$", re.IGNORECASE)
 
 
 def _sanitize_sheet_title(raw: Optional[str], fallback: str) -> str:
@@ -897,6 +899,37 @@ def _unique_sheet_title(base: str, used: set[str]) -> str:
     return title
 
 
+def build_section_sheet_title(
+    section_code: str,
+    tag: str,
+    label: Optional[str] = None,
+) -> str:
+    """Строит безопасное имя вкладки по шаблону ``<Раздел> <шифр> <тег>``.
+
+    Примеры: ``02-01-01 ВКЛ`` и ``АР 02-01-01 ВКЛ``. Недопустимые символы
+    Excel заменяются, длина ограничивается 31 символом.
+    """
+    parts: list[str] = []
+    clean_label = (label or "").strip()
+    if clean_label and clean_label not in {f"Раздел {section_code}", "—"}:
+        parts.append(clean_label)
+    parts.append(section_code)
+    if tag:
+        parts.append(tag)
+    candidate = " ".join(parts)
+    # Длинное читаемое имя не должно вытеснять шифр и тег: ВКЛ и ИСКЛ обязаны
+    # оставаться различимыми в пределах 31 символа Excel.
+    if len(candidate) > 31:
+        candidate = " ".join(part for part in (section_code, tag) if part)
+    return _sanitize_sheet_title(candidate, section_code)
+
+
+def section_tag_from_session_id(session_id: str) -> Optional[str]:
+    """Извлекает тег ``ВКЛ``/``ИСКЛ``/``ОСН`` из изолированного session_id."""
+    match = _SESSION_TAG_PATTERN.search(session_id)
+    return match.group(1).upper() if match else None
+
+
 # ----------------------------------------------------------------------
 # 4. Сводный дашборд и метрики разделов
 # ----------------------------------------------------------------------
@@ -911,6 +944,8 @@ class SectionExport:
     title: str
     label: str
     cipher: str
+    tag: str = ""
+    section_code: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -938,6 +973,7 @@ class SectionMetrics:
     total_cost: Decimal
     delta_cost: Decimal
     has_prices: bool
+    tag: str = ""
 
     @property
     def coverage(self) -> float:
@@ -951,6 +987,8 @@ class SectionMetrics:
         """Краткий управленческий вердикт по разделу."""
         if self.total == 0:
             return VERDICT_NO_DATA
+        if self.smeta_total == 0:
+            return VERDICT_EMPTY_SMETA
         if self.paired == 0:
             if self.rd_total == 0:
                 return VERDICT_NO_RD_SPEC
@@ -1062,7 +1100,17 @@ def _measure_section(section: SectionExport) -> SectionMetrics:
         total_cost=total_cost,
         delta_cost=delta_cost,
         has_prices=_has_price_data(section.records),
+        tag=section.tag,
     )
+
+
+def calculate_object_balance(metrics: Sequence[SectionMetrics]) -> Decimal:
+    """Считает сальдо объекта прямым сложением дельт разделов.
+
+    Сметы исключения (ИСКЛ) уже содержат отрицательные объемы и стоимости,
+    поэтому сальдо = дельта ВКЛ + дельта ИСКЛ без какой-либо инверсии знака.
+    """
+    return sum((metric.delta_cost for metric in metrics), ZERO)
 
 
 def _verdict_style(verdict: str) -> tuple[PatternFill, Font]:
@@ -1073,7 +1121,7 @@ def _verdict_style(verdict: str) -> tuple[PatternFill, Font]:
         return _RED_FILL, _RED_FONT
     if verdict == VERDICT_REVIEW:
         return _YELLOW_FILL, _YELLOW_FONT
-    if verdict in {VERDICT_NO_MATCH, VERDICT_NO_RD_SPEC}:
+    if verdict in {VERDICT_NO_MATCH, VERDICT_NO_RD_SPEC, VERDICT_EMPTY_SMETA}:
         return _WARNING_FILL, _WARNING_FONT
     if verdict == VERDICT_NO_DATA:
         return _GRAY_FILL, _GRAY_FONT
@@ -1086,6 +1134,7 @@ _TAB_COLORS: Final[dict[str, str]] = {
     VERDICT_REVIEW: "FFC000",
     VERDICT_NO_MATCH: "FFC000",
     VERDICT_NO_RD_SPEC: "FFC000",
+    VERDICT_EMPTY_SMETA: "FFC000",
     VERDICT_NO_DATA: "808080",
 }
 
@@ -1425,8 +1474,9 @@ def _write_dashboard_section_table(
 
     for offset, metric in enumerate(metrics):
         row = DASHBOARD_FIRST_SECTION_ROW + offset
+        row_label = f"{metric.label} {metric.tag}".strip() if metric.tag else metric.label
         values: dict[str, Any] = {
-            "A": metric.label,
+            "A": row_label,
             "B": metric.cipher,
             "C": metric.smeta_total,
             "D": metric.equipment_total,
@@ -1494,7 +1544,8 @@ def _write_dashboard_section_table(
         worksheet[f"L{row}"].font = verdict_font
         worksheet.row_dimensions[row].height = (
             42
-            if metric.verdict in {VERDICT_NO_MATCH, VERDICT_NO_RD_SPEC}
+            if metric.verdict
+            in {VERDICT_NO_MATCH, VERDICT_NO_RD_SPEC, VERDICT_EMPTY_SMETA}
             else 24
         )
 
@@ -1505,6 +1556,68 @@ def _write_dashboard_section_table(
     worksheet.auto_filter.ref = (
         f"A{DASHBOARD_SECTION_HEADER_ROW}:L{last_row}"
     )
+
+    if metrics:
+        _write_dashboard_balance_row(
+            worksheet,
+            DASHBOARD_FIRST_SECTION_ROW + len(metrics),
+            metrics,
+        )
+
+
+def _write_dashboard_balance_row(
+    worksheet: Worksheet,
+    row: int,
+    metrics: Sequence[SectionMetrics],
+) -> None:
+    """Выводит итоговое сальдо объекта над таблицей разделов.
+
+    Сальдо считается прямым сложением дельт всех строк (ВКЛ + ИСКЛ + ОСН).
+    Сметы исключения приходят с уже отрицательными объемами и стоимостью,
+    поэтому знак не инвертируется: отрицательная дельта уменьшает сальдо.
+    """
+    equipment_total = sum(metric.equipment_total for metric in metrics)
+    equipment_paired = sum(metric.equipment_paired for metric in metrics)
+    coverage = equipment_paired / equipment_total if equipment_total else 0.0
+    has_prices = any(metric.has_prices for metric in metrics)
+    total_cost = sum((metric.total_cost for metric in metrics), ZERO)
+    balance = calculate_object_balance(metrics)
+
+    values: dict[str, Any] = {
+        "A": "ИТОГО по объекту",
+        "B": "ВКЛ + ИСКЛ",
+        "C": sum(metric.smeta_total for metric in metrics),
+        "D": equipment_total,
+        "E": equipment_paired,
+        "F": coverage,
+        "G": sum(metric.smr_total for metric in metrics),
+        "H": sum(metric.discrepancies for metric in metrics),
+        "I": sum(metric.pending for metric in metrics),
+        "J": _to_excel_number(total_cost) if has_prices else "—",
+        "K": _to_excel_number(balance) if has_prices else "—",
+        "L": "",
+    }
+
+    for column, value in values.items():
+        cell = worksheet[f"{column}{row}"]
+        cell.value = value
+        cell.font = _SUMMARY_FONT
+        cell.fill = _SUMMARY_FILL
+        cell.border = _SUMMARY_BORDER
+        if column == "A":
+            cell.alignment = Alignment(horizontal="left", vertical="center")
+        elif column in {"B", "L"} or isinstance(value, str):
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        else:
+            cell.alignment = Alignment(horizontal="right", vertical="center")
+
+    for column in ("C", "D", "E", "G", "H", "I"):
+        worksheet[f"{column}{row}"].number_format = INTEGER_FORMAT
+    worksheet[f"F{row}"].number_format = PERCENT_FORMAT
+    if has_prices:
+        for column in ("J", "K"):
+            worksheet[f"{column}{row}"].number_format = MONEY_FORMAT
+    worksheet.row_dimensions[row].height = 24
 
 
 def _project_label(sections: Sequence[SectionExport]) -> str:
@@ -1537,9 +1650,11 @@ def _render_dashboard(
     worksheet.sheet_properties.pageSetUpPr.fitToPage = True
     worksheet.page_setup.fitToWidth = 1
     worksheet.page_setup.fitToHeight = 0
-    worksheet.print_area = (
-        f"A1:L{DASHBOARD_FIRST_SECTION_ROW + len(metrics) - 1}"
-    )
+    if metrics:
+        last_row = DASHBOARD_FIRST_SECTION_ROW + len(metrics)
+    else:
+        last_row = DASHBOARD_SECTION_HEADER_ROW
+    worksheet.print_area = f"A1:L{last_row}"
 
 
 # ----------------------------------------------------------------------
@@ -1559,24 +1674,48 @@ def _section_export(
     session: sqlite3.Row,
     records: Sequence[AuditRecord],
     title: str,
+    *,
+    tag: str = "",
+    section_code: Optional[str] = None,
 ) -> SectionExport:
     """Создает описание раздела для дашборда и выгрузки."""
     fallback = _session_fallback(session)
-    label, cipher = _section_label_and_cipher(session["smeta_sheet"], fallback)
+    raw = session["smeta_sheet"] or session["rd_filename"]
+    label, cipher = _section_label_and_cipher(raw, fallback)
+    if section_code:
+        if tag:
+            # Двухпапочный режим: лист сметы не задан, поэтому подпись
+            # строится по шифру, а не по имени файла ВОР/СВОР.
+            label = SECTION_NAMES_BY_CODE.get(section_code, f"Раздел {section_code}")
+            cipher = f"ЛС {section_code}"
+        else:
+            if label.startswith("Раздел "):
+                label = SECTION_NAMES_BY_CODE.get(section_code, label)
+            if cipher == "—":
+                cipher = f"ЛС {section_code}"
     return SectionExport(
         session=session,
         records=tuple(records),
         title=title,
         label=label,
         cipher=cipher,
+        tag=tag,
+        section_code=section_code,
     )
 
 
 def _prepare_sections(
     conn: sqlite3.Connection,
     session_ids: Sequence[str],
+    section_hints: Optional[Mapping[str, tuple[str, str]]] = None,
 ) -> list[SectionExport]:
-    """Читает сессии и назначает читаемые уникальные имена вкладок."""
+    """Читает сессии и назначает читаемые уникальные имена вкладок.
+
+    Для двухпапочного режима ``section_hints`` задает пару ``(шифр, тег)``;
+    имя вкладки строится строго как ``<Раздел> <шифр> <тег>``. Без подсказки
+    тег извлекается из ``session_id`` (``..._02-01-01_ВКЛ_ab12cd``).
+    """
+    hints = section_hints or {}
     used_titles: set[str] = {DASHBOARD_TITLE.casefold()}
     sections: list[SectionExport] = []
     for session_id in session_ids:
@@ -1584,9 +1723,25 @@ def _prepare_sections(
         session = _load_session(conn, resolved_id)
         records = load_audit_records(conn, resolved_id)
         fallback = _session_fallback(session)
-        base_title = _readable_sheet_title(session["smeta_sheet"], fallback)
+        raw = session["smeta_sheet"] or session["rd_filename"]
+        hint_code, hint_tag = hints.get(resolved_id, (None, None))
+        tag = (hint_tag or section_tag_from_session_id(resolved_id) or "").strip()
+        code = hint_code or _extract_section_code(raw)
+        label, _cipher = _section_label_and_cipher(raw, fallback)
+        if tag and code:
+            base_title = build_section_sheet_title(code, tag, label)
+        else:
+            base_title = _readable_sheet_title(session["smeta_sheet"], fallback)
         title = _unique_sheet_title(base_title, used_titles)
-        sections.append(_section_export(session, records, title))
+        sections.append(
+            _section_export(
+                session,
+                records,
+                title,
+                tag=tag,
+                section_code=code,
+            )
+        )
     return sections
 
 
@@ -1660,17 +1815,20 @@ def export_sessions_to_excel(
     conn: sqlite3.Connection,
     session_ids: Sequence[str],
     output_path: str | Path,
+    *,
+    section_hints: Optional[Mapping[str, tuple[str, str]]] = None,
 ) -> Path:
     """Формирует многолистовую книгу: дашборд и листы разделов.
 
     Используется ночным пакетным режимом, когда каждая сессия соответствует
     отдельному тому РД и листу ``ЛС ...``. Имена вкладок формируются как
-    ``АР (ЛС 02-01-01)``; коллизии и недопустимые символы Excel разрешаются
-    автоматически.
+    ``АР (ЛС 02-01-01)``; для двухпапочного режима — строго ``АР 02-01-01 ВКЛ``.
+    Коллизии и недопустимые символы Excel разрешаются автоматически.
 
     :param conn: соединение с SQLite (SSOT).
     :param session_ids: идентификаторы успешно завершенных сессий.
     :param output_path: путь к создаваемому XLSX-отчету.
+    :param section_hints: отображение ``session_id -> (шифр, тег)``.
     :return: путь к сохраненному файлу.
     :raises ValueError: не передано ни одной сессии.
     :raises LookupError: одна из сессий не найдена.
@@ -1679,7 +1837,7 @@ def export_sessions_to_excel(
     if not ordered_ids:
         raise ValueError("Для многолистового экспорта не передано ни одной сессии")
 
-    sections = _prepare_sections(conn, ordered_ids)
+    sections = _prepare_sections(conn, ordered_ids, section_hints)
     workbook = _build_workbook(sections, datetime.now())
     return _save_workbook(workbook, output_path)
 

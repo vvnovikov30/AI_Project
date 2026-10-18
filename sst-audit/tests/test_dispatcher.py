@@ -5,7 +5,14 @@ from pathlib import Path
 from openpyxl import Workbook
 import pytest
 
-from dispatcher import MAPPING_RULES, ProjectDispatcher, score_pair
+from dispatcher import (
+    MAPPING_RULES,
+    ProjectDispatcher,
+    classify_smeta_tag,
+    extract_section_code,
+    pair_dual_directories,
+    score_pair,
+)
 
 
 def _make_smeta(path: Path) -> Path:
@@ -128,3 +135,70 @@ def test_match_volumes_rejects_missing_input(tmp_path: Path) -> None:
     rd_dir.mkdir()
     with pytest.raises(FileNotFoundError):
         ProjectDispatcher().match_volumes(rd_dir, tmp_path / "missing.xlsx")
+
+
+def test_tag_classification_vkl_iskl() -> None:
+    """Маркеры включения и исключения распознаются в именах ЛСР."""
+    assert classify_smeta_tag("02-01-02_ЛСР_включение.xlsx") == "ВКЛ"
+    assert classify_smeta_tag("02-01-02_доп.xlsx") == "ВКЛ"
+    assert classify_smeta_tag("02-01-02_исключение.xlsx") == "ИСКЛ"
+    assert classify_smeta_tag("02-01-02_снятие.pdf") == "ИСКЛ"
+    assert classify_smeta_tag("02-01-02_ЛСР.xlsx") == "ОСН"
+    assert extract_section_code("ВОР 02-05.pdf") == "02-05"
+
+
+def test_dual_directory_pairing(tmp_path: Path) -> None:
+    """Связки строятся по шифру раздела, СВОР приоритетнее ВОР."""
+    rd_dir = tmp_path / "wor"
+    smeta_dir = tmp_path / "lsr"
+    rd_dir.mkdir()
+    smeta_dir.mkdir()
+
+    for name in (
+        "02-01-01_ВОР.pdf",
+        "02-01-03_ВОР.pdf",
+        "02-01-03_СВОР.pdf",
+        "Пояснительная записка.pdf",
+    ):
+        (rd_dir / name).write_bytes(b"")
+    for name in (
+        "02-01-01_ЛСР.xlsx",
+        "02-01-01_ЛСР_включение.xlsx",
+        "02-01-01_ЛСР_исключение.xlsx",
+        "02-01-03_ЛСР_исключение.pdf",
+        "~$02-01-01_ЛСР.xlsx",
+    ):
+        (smeta_dir / name).write_bytes(b"")
+
+    pairs = ProjectDispatcher().match_dual_directories(rd_dir, smeta_dir)
+
+    assert [
+        (pair.section_code, pair.tag, pair.smeta_path.name) for pair in pairs
+    ] == [
+        ("02-01-01", "ОСН", "02-01-01_ЛСР.xlsx"),
+        ("02-01-01", "ВКЛ", "02-01-01_ЛСР_включение.xlsx"),
+        ("02-01-01", "ИСКЛ", "02-01-01_ЛСР_исключение.xlsx"),
+        ("02-01-03", "ИСКЛ", "02-01-03_ЛСР_исключение.pdf"),
+    ]
+    assert all(pair.rd_path.name == "02-01-01_ВОР.pdf" for pair in pairs[:3])
+    assert pairs[3].rd_path.name == "02-01-03_СВОР.pdf"
+    assert pairs[0].sheet_name == "02-01-01 ОСН"
+    assert pairs[1].session_id_prefix == "02-01-01_ВКЛ"
+    assert pairs[0].session_id_prefix != pairs[1].session_id_prefix
+
+
+def test_pair_dual_directories_is_pure_and_deduplicates() -> None:
+    """Чистая функция не трогает диск и схлопывает дубли по (шифр, тег)."""
+    rd_files = [Path("02-01-05_ВОР.pdf"), Path("02-01-05_СВОР.pdf")]
+    smeta_files = [
+        Path("02-01-05_ЛСР_исключение (1).xlsx"),
+        Path("02-01-05_ЛСР_исключение.xlsx"),
+        Path("02-01-05_ЛСР_исключение_копия.xlsx"),
+        Path("02-01-06_ЛСР.xlsx"),
+    ]
+
+    pairs = pair_dual_directories(rd_files, smeta_files)
+
+    assert len(pairs) == 1
+    assert pairs[0].rd_path.name == "02-01-05_СВОР.pdf"
+    assert pairs[0].smeta_path.name == "02-01-05_ЛСР_исключение.xlsx"
