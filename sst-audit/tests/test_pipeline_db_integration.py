@@ -316,7 +316,7 @@ def test_main_exports_excel_without_interactive_review(
     assert code == 0
     assert target.is_file()
     workbook = load_workbook(target, data_only=False)
-    assert exporter.SHEET_TITLE in workbook.sheetnames
+    assert PROJECT_NAME in workbook.sheetnames
 
 
 def test_pipeline_filters_noise_below_min_threshold(conn: sqlite3.Connection) -> None:

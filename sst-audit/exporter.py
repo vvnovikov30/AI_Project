@@ -10,6 +10,10 @@
 Вкладки разделов получают читаемые имена вида ``АР (ЛС 02-01-01)``. Зеленая
 заливка статуса допустима только при наличии реальной пары РД и дельте
 объема в пределах допуска; несопоставленные строки нейтрально-серые.
+Покрытие спецификациями рассчитывается отдельно по оборудованию и
+материалам (главы 1, 2, 13 и «Прайс-лист»), а монтажные и строительные
+работы (главы 3, 4, 6) показываются как норматив СМР. На каждом листе
+раздела под таблицей выводится бухгалтерская строка «ИТОГО ПО РАЗДЕЛУ».
 
 Запуск как самостоятельного скрипта::
 
@@ -38,7 +42,7 @@ from evaluator import DiscrepancyDetector
 SHEET_TITLE: Final[str] = "Ведомость аудита объемов"
 DASHBOARD_TITLE: Final[str] = "📊 Сводный дашборд"
 BACK_TO_DASHBOARD_FORMULA: Final[str] = (
-    "=HYPERLINK(\"#'" + DASHBOARD_TITLE + "'!A1\", \"⬅ На дашборд\")"
+    "=HYPERLINK(\"#'" + DASHBOARD_TITLE + "'!A1\", \"⬅ Вернуться на дашборд\")"
 )
 LATEST_SESSION: Final[str] = "latest"
 DEFAULT_OUTPUT: Final[str] = "audit_report.xlsx"
@@ -53,7 +57,17 @@ MONEY_FORMAT: Final[str] = "#,##0.00"
 VOLUME_FORMAT: Final[str] = "#,##0.000"
 RATIO_FORMAT: Final[str] = "#,##0.0000"
 PERCENT_FORMAT: Final[str] = "0.0%"
-INTEGER_FORMAT: Final[str] = "0"
+INTEGER_FORMAT: Final[str] = "#,##0"
+
+# Классификация сметных строк ТСН-2001. Оборудование и материалы подлежат
+# спецификации в РД; монтажные и строительные работы являются нормативом СМР
+# и не имеют отдельных строк в таблицах спецификаций.
+KIND_EQUIPMENT: Final[str] = "EQUIPMENT"
+KIND_SMR: Final[str] = "SMR"
+KIND_UNCLASSIFIED: Final[str] = "UNCLASSIFIED"
+EQUIPMENT_CHAPTERS: Final[frozenset[str]] = frozenset({"1", "2", "13"})
+SMR_CHAPTERS: Final[frozenset[str]] = frozenset({"3", "4", "6"})
+_RATE_CHAPTER_PATTERN: Final[re.Pattern[str]] = re.compile(r"^\s*(\d{1,2})[.\-]")
 
 STATUS_AUTO: Final[str] = "AUTO"
 STATUS_APPROVED: Final[str] = "APPROVED"
@@ -83,7 +97,10 @@ SECTION_NAMES_BY_CODE: Final[dict[str, str]] = {
 VERDICT_OK: Final[str] = "ПРОВЕРЕНО"
 VERDICT_DISCREPANCY: Final[str] = "РАСХОЖДЕНИЯ"
 VERDICT_REVIEW: Final[str] = "ТРЕБУЕТ ПРОВЕРКИ"
-VERDICT_NO_MATCH: Final[str] = "НЕТ СОПОСТАВЛЕНИЯ"
+VERDICT_NO_MATCH: Final[str] = "⚠️ Позиции РД не сопоставлены со сметой"
+VERDICT_NO_RD_SPEC: Final[str] = (
+    "⚠️ В РД не найдены таблицы спецификаций (проверьте PDF)"
+)
 VERDICT_NO_DATA: Final[str] = "НЕТ ДАННЫХ"
 
 DASHBOARD_KPI_HEADER_ROW: Final[int] = 6
@@ -157,6 +174,31 @@ ORDER BY v.match_id
 """
 
 
+def classify_smeta_code(code: Optional[str]) -> str:
+    """Классифицирует сметную строку как оборудование, СМР или прочее.
+
+    В ТСН-2001 шифр расценки начинается с номера главы: главы 1, 2 и 13
+    относятся к оборудованию и материалам, главы 3, 4 и 6 — к монтажным и
+    строительным работам. Строки с пометкой «Прайс-лист» или «Оборудование»
+    также считаются оборудованием.
+    """
+    normalized = (code or "").strip().casefold()
+    if not normalized:
+        return KIND_UNCLASSIFIED
+    if "прайс" in normalized or "оборуд" in normalized:
+        return KIND_EQUIPMENT
+
+    match = _RATE_CHAPTER_PATTERN.match(normalized)
+    if match is None:
+        return KIND_UNCLASSIFIED
+    chapter = match.group(1)
+    if chapter in EQUIPMENT_CHAPTERS:
+        return KIND_EQUIPMENT
+    if chapter in SMR_CHAPTERS:
+        return KIND_SMR
+    return KIND_UNCLASSIFIED
+
+
 @dataclass(frozen=True)
 class AuditRecord:
     """Нормализованная строка ведомости, готовая к записи в Excel."""
@@ -191,6 +233,11 @@ class AuditRecord:
     def has_pair(self) -> bool:
         """Есть ли полноценная пара «смета ↔ РД» для сравнения объемов."""
         return self.has_rd_pair and self.has_smeta_item
+
+    @property
+    def smeta_kind(self) -> str:
+        """Тип сметной строки: оборудование, СМР или вне классификации."""
+        return classify_smeta_code(self.smeta_code)
 
     @property
     def adjusted_rd_volume(self) -> Optional[Decimal]:
@@ -424,19 +471,33 @@ _META_LABEL_FONT: Final[Font] = Font(name="Calibri", size=11, bold=True)
 _META_VALUE_FONT: Final[Font] = Font(name="Calibri", size=11)
 _PROJECT_FONT: Final[Font] = Font(name="Calibri", size=14, bold=True, color="1F4E78")
 _BACK_LINK_FONT: Final[Font] = Font(
-    name="Calibri", size=10, bold=True, color="0000FF", underline="single"
+    name="Calibri", size=9, bold=True, color="FFFFFF", underline="single"
+)
+_BACK_LINK_FILL: Final[PatternFill] = PatternFill(
+    "solid", fgColor="1F4E79"
 )
 _BODY_FONT: Final[Font] = Font(name="Calibri", size=10)
+_SUMMARY_FONT: Final[Font] = Font(name="Calibri", size=10, bold=True)
+_SUMMARY_FILL: Final[PatternFill] = PatternFill("solid", fgColor="EAF1F8")
 _THIN_SIDE: Final[Side] = Side(style="thin", color="B7C3D0")
+_SUMMARY_TOP_SIDE: Final[Side] = Side(style="thin", color="1F4E79")
+_SUMMARY_BOTTOM_SIDE: Final[Side] = Side(style="double", color="1F4E79")
 _CELL_BORDER: Final[Border] = Border(
     left=_THIN_SIDE,
     right=_THIN_SIDE,
     top=_THIN_SIDE,
     bottom=_THIN_SIDE,
 )
+_SUMMARY_BORDER: Final[Border] = Border(
+    left=_THIN_SIDE,
+    right=_THIN_SIDE,
+    top=_SUMMARY_TOP_SIDE,
+    bottom=_SUMMARY_BOTTOM_SIDE,
+)
 _GREEN_FILL: Final[PatternFill] = PatternFill("solid", fgColor="C6EFCE")
 _RED_FILL: Final[PatternFill] = PatternFill("solid", fgColor="FFC7CE")
 _YELLOW_FILL: Final[PatternFill] = PatternFill("solid", fgColor="FFEB9C")
+_WARNING_FILL: Final[PatternFill] = PatternFill("solid", fgColor="FFE699")
 _GRAY_FILL: Final[PatternFill] = PatternFill("solid", fgColor="D9D9D9")
 _WHITE_FILL: Final[PatternFill] = PatternFill("solid", fgColor="FFFFFF")
 
@@ -448,6 +509,9 @@ _RED_FONT: Final[Font] = Font(
 )
 _YELLOW_FONT: Final[Font] = Font(
     name="Calibri", size=10, bold=True, color="9C6500"
+)
+_WARNING_FONT: Final[Font] = Font(
+    name="Calibri", size=10, bold=True, color="9C5700"
 )
 _GRAY_FONT: Final[Font] = Font(
     name="Calibri", size=10, bold=True, color="595959"
@@ -499,7 +563,10 @@ def _write_metadata(
     """Записывает шапку документа: ссылку на дашборд, проект, сессию и дату."""
     worksheet["B1"] = BACK_TO_DASHBOARD_FORMULA
     worksheet["B1"].font = _BACK_LINK_FONT
-    worksheet["B1"].alignment = Alignment(horizontal="left", vertical="center")
+    worksheet["B1"].fill = _BACK_LINK_FILL
+    worksheet["B1"].alignment = Alignment(
+        horizontal="center", vertical="center", wrap_text=True
+    )
     worksheet["C1"] = str(session["project_name"])
     worksheet.merge_cells("C1:Q1")
 
@@ -654,6 +721,42 @@ def _hide_price_columns(worksheet: Worksheet) -> None:
         worksheet.column_dimensions[column].hidden = True
 
 
+def _write_summary_row(
+    worksheet: Worksheet,
+    records: Sequence[AuditRecord],
+) -> int:
+    """Добавляет бухгалтерскую строку «ИТОГО ПО РАЗДЕЛУ» с формулами SUM.
+
+    :return: номер итоговой строки.
+    """
+    summary_row = FIRST_DATA_ROW + len(records)
+    last_data_row = summary_row - 1
+
+    worksheet[f"B{summary_row}"] = "ИТОГО ПО РАЗДЕЛУ:"
+    for column in ("E", "I", "M", "N"):
+        cell = worksheet[f"{column}{summary_row}"]
+        if records:
+            cell.value = f"=SUM({column}{FIRST_DATA_ROW}:{column}{last_data_row})"
+        else:
+            cell.value = 0
+        cell.number_format = VOLUME_FORMAT
+
+    for column in range(2, len(COLUMN_TITLES) + 1):
+        cell = worksheet.cell(row=summary_row, column=column)
+        cell.font = _SUMMARY_FONT
+        cell.fill = _SUMMARY_FILL
+        cell.border = _SUMMARY_BORDER
+        if column == 2:
+            cell.alignment = Alignment(horizontal="left", vertical="center")
+        elif column in {5, 9, 13, 14}:
+            cell.alignment = Alignment(horizontal="right", vertical="center")
+        else:
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    worksheet.row_dimensions[summary_row].height = 22
+    return summary_row
+
+
 def _populate_worksheet(
     worksheet: Worksheet,
     session: sqlite3.Row,
@@ -671,8 +774,18 @@ def _populate_worksheet(
     if not _has_price_data(records):
         _hide_price_columns(worksheet)
 
+    last_data_row = FIRST_DATA_ROW + len(records) - 1
+    _write_summary_row(worksheet, records)
+
     _autosize_columns(worksheet)
-    worksheet.auto_filter.ref = f"B{HEADER_ROW}:Q{worksheet.max_row}"
+    # Плашка возврата должна быть читаемой целиком, поэтому колонка B
+    # расширяется после авторазмера (для данных она остается узкой).
+    worksheet.column_dimensions["B"].width = max(
+        worksheet.column_dimensions["B"].width or 0, 20
+    )
+    worksheet.auto_filter.ref = (
+        f"B{HEADER_ROW}:Q{max(last_data_row, HEADER_ROW)}"
+    )
     worksheet.freeze_panes = f"C{FIRST_DATA_ROW}"
     worksheet.print_title_rows = f"{HEADER_ROW}:{HEADER_ROW}"
     worksheet.sheet_view.showGridLines = False
@@ -769,6 +882,11 @@ class SectionMetrics:
     cipher: str
     total: int
     smeta_total: int
+    rd_total: int
+    equipment_total: int
+    equipment_paired: int
+    smr_total: int
+    unclassified_total: int
     paired: int
     no_rd: int
     no_smeta: int
@@ -782,8 +900,10 @@ class SectionMetrics:
 
     @property
     def coverage(self) -> float:
-        """Доля сметных позиций с реальной парой РД, от 0.0 до 1.0."""
-        return self.paired / self.smeta_total if self.smeta_total else 0.0
+        """Покрытие спецификациями РД: пары / оборудование и материалы."""
+        if not self.equipment_total:
+            return 0.0
+        return self.equipment_paired / self.equipment_total
 
     @property
     def verdict(self) -> str:
@@ -791,6 +911,8 @@ class SectionMetrics:
         if self.total == 0:
             return VERDICT_NO_DATA
         if self.paired == 0:
+            if self.rd_total == 0:
+                return VERDICT_NO_RD_SPEC
             return VERDICT_NO_MATCH
         if self.discrepancies > 0:
             return VERDICT_DISCREPANCY
@@ -854,6 +976,14 @@ def _measure_section(section: SectionExport) -> SectionMetrics:
         for record in section.records
         if record.has_rd_pair and not record.has_smeta_item
     )
+    equipment_records = [
+        record
+        for record in section.records
+        if record.has_smeta_item and record.smeta_kind == KIND_EQUIPMENT
+    ]
+    smeta_records = [
+        record for record in section.records if record.has_smeta_item
+    ]
 
     return SectionMetrics(
         session_id=str(section.session["id"]),
@@ -861,8 +991,21 @@ def _measure_section(section: SectionExport) -> SectionMetrics:
         label=section.label,
         cipher=section.cipher,
         total=len(section.records),
-        smeta_total=sum(
-            1 for record in section.records if record.has_smeta_item
+        smeta_total=len(smeta_records),
+        rd_total=sum(1 for record in section.records if record.has_rd_pair),
+        equipment_total=len(equipment_records),
+        equipment_paired=sum(
+            1 for record in equipment_records if record.has_pair
+        ),
+        smr_total=sum(
+            1
+            for record in smeta_records
+            if record.smeta_kind == KIND_SMR
+        ),
+        unclassified_total=sum(
+            1
+            for record in smeta_records
+            if record.smeta_kind == KIND_UNCLASSIFIED
         ),
         paired=len(paid_records),
         no_rd=no_rd,
@@ -889,7 +1032,9 @@ def _verdict_style(verdict: str) -> tuple[PatternFill, Font]:
         return _RED_FILL, _RED_FONT
     if verdict == VERDICT_REVIEW:
         return _YELLOW_FILL, _YELLOW_FONT
-    if verdict in {VERDICT_NO_MATCH, VERDICT_NO_DATA}:
+    if verdict in {VERDICT_NO_MATCH, VERDICT_NO_RD_SPEC}:
+        return _WARNING_FILL, _WARNING_FONT
+    if verdict == VERDICT_NO_DATA:
         return _GRAY_FILL, _GRAY_FONT
     return _WHITE_FILL, _BODY_FONT
 
@@ -898,41 +1043,41 @@ _TAB_COLORS: Final[dict[str, str]] = {
     VERDICT_OK: "00B050",
     VERDICT_DISCREPANCY: "C00000",
     VERDICT_REVIEW: "FFC000",
-    VERDICT_NO_MATCH: "808080",
+    VERDICT_NO_MATCH: "FFC000",
+    VERDICT_NO_RD_SPEC: "FFC000",
     VERDICT_NO_DATA: "808080",
 }
 
 
 _DASHBOARD_LAST_COLUMN: Final[int] = 13
 _DASHBOARD_TABLE_TITLES: Final[dict[str, str]] = {
-    "A": "№",
-    "B": "Раздел",
-    "C": "Шифр",
-    "D": "Позиций",
-    "E": "Сопоставлено",
-    "F": "Покрытие",
-    "G": "Нет в РД",
-    "H": "Нет в смете",
-    "I": "Расхождения",
-    "J": "На проверке",
-    "K": "Стоимость сметы, руб.",
-    "L": "Дельта стоимости, руб.",
-    "M": "Вердикт",
+    "A": "Раздел",
+    "B": "Шифр",
+    "C": "Позиций сметы",
+    "D": "Оборудование",
+    "E": "Сопоставлено РД",
+    "F": "Покрытие РД",
+    "G": "СМР",
+    "H": "Расхождения",
+    "I": "На проверке",
+    "J": "Стоимость сметы, руб.",
+    "K": "Дельта стоимости, руб.",
+    "L": "Вердикт",
 }
 _DASHBOARD_WIDTHS: Final[dict[str, int]] = {
-    "A": 5,
-    "B": 24,
-    "C": 15,
-    "D": 10,
-    "E": 13,
+    "A": 28,
+    "B": 15,
+    "C": 10,
+    "D": 12,
+    "E": 14,
     "F": 11,
-    "G": 12,
+    "G": 9,
     "H": 13,
-    "I": 14,
-    "J": 14,
-    "K": 21,
-    "L": 23,
-    "M": 24,
+    "I": 12,
+    "J": 21,
+    "K": 23,
+    "L": 38,
+    "M": 3,
 }
 
 _DASHBOARD_TITLE_FONT: Final[Font] = Font(
@@ -1009,9 +1154,9 @@ def _write_dashboard_banner(
 
     worksheet.merge_cells("A4:M4")
     worksheet["A4"] = (
-        "Методика: зеленый статус присваивается только позициям с реальной "
-        "парой РД и дельтой объема в пределах допуска. Серый статус «НЕТ В РД» "
-        "означает, что сопоставление не состоялось и объем не проверялся."
+        "Методика: покрытие считается по оборудованию и материалам (главы 1, 2, "
+        "13 и «Прайс-лист»). Монтажные и строительные работы (главы 3, 4, 6) — "
+        "норматив СМР и не имеют отдельных строк в спецификациях РД."
     )
     worksheet["A4"].font = _DASHBOARD_NOTE_FONT
     worksheet["A4"].alignment = Alignment(
@@ -1035,23 +1180,33 @@ def _write_dashboard_kpi(
     label_cell = worksheet.cell(row=row, column=1, value=label)
     value_cell = worksheet.cell(row=row, column=2, value=value)
     note_cell = worksheet.cell(row=row, column=3, value=note)
+    worksheet.merge_cells(
+        start_row=row, start_column=3, end_row=row, end_column=12
+    )
 
     label_cell.font = _META_LABEL_FONT
     label_cell.fill = _DASHBOARD_KPI_LABEL_FILL
-    label_cell.alignment = Alignment(horizontal="left", vertical="center")
+    label_cell.alignment = Alignment(
+        horizontal="left", vertical="center", wrap_text=True
+    )
     value_cell.font = _DASHBOARD_KPI_VALUE_FONT
-    value_cell.alignment = Alignment(horizontal="right", vertical="center")
+    value_cell.alignment = Alignment(
+        horizontal="center" if isinstance(value, str) else "right",
+        vertical="center",
+    )
     note_cell.font = _DASHBOARD_META_FONT
-    note_cell.alignment = Alignment(horizontal="left", vertical="center")
+    note_cell.alignment = Alignment(
+        horizontal="left", vertical="center", wrap_text=True
+    )
 
     if number_format is not None:
         value_cell.number_format = number_format
     if value_fill is not None:
         value_cell.fill = value_fill
 
-    for column in range(1, 4):
+    for column in range(1, 13):
         worksheet.cell(row=row, column=column).border = _CELL_BORDER
-    worksheet.row_dimensions[row].height = 21
+    worksheet.row_dimensions[row].height = 26 if len(label) > 28 else 21
 
 
 def _write_dashboard_kpis(
@@ -1059,25 +1214,33 @@ def _write_dashboard_kpis(
     metrics: Sequence[SectionMetrics],
 ) -> None:
     """Выводит ключевые показатели объекта."""
-    sections_count = len(metrics)
-    verified = sum(1 for metric in metrics if metric.fully_verified)
-    attention = sections_count - verified
     total_positions = sum(metric.smeta_total for metric in metrics)
-    paired = sum(metric.paired for metric in metrics)
-    no_rd = sum(metric.no_rd for metric in metrics)
+    equipment_total = sum(metric.equipment_total for metric in metrics)
+    equipment_paired = sum(metric.equipment_paired for metric in metrics)
+    smr_total = sum(metric.smr_total for metric in metrics)
+    unclassified_total = sum(
+        metric.unclassified_total for metric in metrics
+    )
     discrepancies = sum(metric.discrepancies for metric in metrics)
     pending = sum(metric.pending for metric in metrics)
-    coverage = paired / total_positions if total_positions else 0.0
+    coverage = (
+        equipment_paired / equipment_total if equipment_total else 0.0
+    )
     has_prices = any(metric.has_prices for metric in metrics)
     total_cost: Any = (
         _to_excel_number(sum((m.total_cost for m in metrics), ZERO))
         if has_prices
-        else "н/д"
+        else "—"
     )
     delta_cost: Any = (
         _to_excel_number(sum((m.delta_cost for m in metrics), ZERO))
         if has_prices
-        else "н/д"
+        else "—"
+    )
+    coverage_fill = (
+        _GREEN_FILL
+        if equipment_total and abs(coverage - 1.0) < 1e-9
+        else None
     )
 
     worksheet.merge_cells("A5:M5")
@@ -1097,98 +1260,86 @@ def _write_dashboard_kpis(
         cell.fill = _HEADER_FILL
         cell.alignment = _HEADER_ALIGNMENT
         cell.border = _CELL_BORDER
-
-    verified_fill = (
-        _GREEN_FILL if sections_count > 0 and verified == sections_count else None
-    )
-    coverage_fill = (
-        _GREEN_FILL
-        if sections_count > 0
-        and verified == sections_count
-        and abs(coverage - 1.0) < 1e-9
-        else None
+    worksheet.merge_cells(
+        f"C{DASHBOARD_KPI_HEADER_ROW}:L{DASHBOARD_KPI_HEADER_ROW}"
     )
 
-    rows: tuple[
-        tuple[str, Any, str, Optional[str], Optional[PatternFill]], ...
-    ] = (
+    rows: list[
+        tuple[str, Any, str, Optional[str], Optional[PatternFill]]
+    ] = [
         (
-            "Разделов в отчёте",
-            sections_count,
-            "Количество обработанных сессий в книге",
-            INTEGER_FORMAT,
-            None,
-        ),
-        (
-            "Полностью проверено",
-            verified,
-            "Покрытие 100% и отсутствие расхождений",
-            INTEGER_FORMAT,
-            verified_fill,
-        ),
-        (
-            "Требуют внимания",
-            attention,
-            "Есть пропуски, HITL или расхождения",
-            INTEGER_FORMAT,
-            _YELLOW_FILL if attention else None,
-        ),
-        (
-            "Позиций в смете",
+            "Всего позиций сметы",
             total_positions,
-            "Строк в ведомостях разделов",
+            "Строк сметы в ведомостях разделов",
             INTEGER_FORMAT,
             None,
         ),
         (
-            "Сопоставлено с РД",
-            paired,
-            "Пары «смета ↔ РД»",
+            "Оборудование и материалы (в РД)",
+            equipment_total,
+            "Главы 1, 2, 13 и строки «Прайс-лист»",
             INTEGER_FORMAT,
             None,
         ),
         (
-            "Покрытие РД",
+            "Покрытие спецификациями РД",
             coverage,
-            "Доля позиций с реальной парой РД",
+            "Сопоставлено / Оборудование и материалы",
             PERCENT_FORMAT,
             coverage_fill,
         ),
         (
-            "Нет в РД",
-            no_rd,
-            "Серые строки: нет пары РД (SMETA_NOT_IN_RD)",
+            "Строительно-монтажные работы (норматив СМР)",
+            smr_total,
+            "Технологические работы монтажа без отдельных строк "
+            "в спецификациях",
             INTEGER_FORMAT,
-            _GRAY_FILL if no_rd else None,
+            None,
         ),
         (
-            "Расхождения объёмов",
+            "Выявлено расхождений объёмов",
             discrepancies,
             "Отклонения сверх допуска, включая превышения",
             INTEGER_FORMAT,
             _RED_FILL if discrepancies else None,
         ),
         (
-            "На проверке (HITL)",
+            "Очередь ручной проверки (HITL)",
             pending,
-            "Очередь ручной верификации",
+            "Позиции, требующие решения эксперта",
             INTEGER_FORMAT,
             _YELLOW_FILL if pending else None,
         ),
-        (
-            "Стоимость сметы, руб.",
-            total_cost,
-            "Цены не подключены" if not has_prices else "Сумма по сметным позициям",
-            MONEY_FORMAT if has_prices else None,
-            None,
-        ),
-        (
-            "Дельта стоимости, руб.",
-            delta_cost,
-            "Смета минус приведенный объем РД",
-            MONEY_FORMAT if has_prices else None,
-            None,
-        ),
+    ]
+    if unclassified_total:
+        rows.append(
+            (
+                "Позиции вне классификации",
+                unclassified_total,
+                "Шифры вне глав 1, 2, 13 и 3, 4, 6",
+                INTEGER_FORMAT,
+                _YELLOW_FILL,
+            )
+        )
+    rows.extend(
+        [
+            (
+                "Стоимость сметы, руб.",
+                total_cost,
+                "Цены не подключены"
+                if not has_prices
+                else "Сумма по сметным позициям",
+                MONEY_FORMAT if has_prices else None,
+                None,
+            ),
+            (
+                "Дельта стоимости, руб.",
+                delta_cost,
+                "Смета минус приведенный объем РД",
+                MONEY_FORMAT if has_prices else None,
+                None,
+            ),
+        ]
     )
 
     for offset, (label, value, note, number_format, fill) in enumerate(rows):
@@ -1209,7 +1360,7 @@ def _write_dashboard_section_table(
 ) -> None:
     """Выводит таблицу разделов с автофильтром и переходами на вкладки."""
     worksheet.merge_cells(
-        f"A{DASHBOARD_SECTION_TITLE_ROW}:M{DASHBOARD_SECTION_TITLE_ROW}"
+        f"A{DASHBOARD_SECTION_TITLE_ROW}:L{DASHBOARD_SECTION_TITLE_ROW}"
     )
     title_cell = worksheet[f"A{DASHBOARD_SECTION_TITLE_ROW}"]
     title_cell.value = "РАЗДЕЛЫ ОБЪЕКТА"
@@ -1234,27 +1385,26 @@ def _write_dashboard_section_table(
     for offset, metric in enumerate(metrics):
         row = DASHBOARD_FIRST_SECTION_ROW + offset
         values: dict[str, Any] = {
-            "A": offset + 1,
-            "B": metric.label,
-            "C": metric.cipher,
-            "D": metric.smeta_total,
-            "E": metric.paired,
+            "A": metric.label,
+            "B": metric.cipher,
+            "C": metric.smeta_total,
+            "D": metric.equipment_total,
+            "E": metric.equipment_paired,
             "F": metric.coverage,
-            "G": metric.no_rd,
-            "H": metric.no_smeta,
-            "I": metric.discrepancies,
-            "J": metric.pending,
-            "K": (
+            "G": metric.smr_total,
+            "H": metric.discrepancies,
+            "I": metric.pending,
+            "J": (
                 _to_excel_number(metric.total_cost)
                 if metric.has_prices
-                else None
+                else "—"
             ),
-            "L": (
+            "K": (
                 _to_excel_number(metric.delta_cost)
                 if metric.has_prices
-                else None
+                else "—"
             ),
-            "M": metric.verdict,
+            "L": metric.verdict,
         }
         row_fill = _DASHBOARD_ALT_FILL if offset % 2 else _WHITE_FILL
         for column, value in values.items():
@@ -1263,51 +1413,56 @@ def _write_dashboard_section_table(
             cell.font = _BODY_FONT
             cell.fill = row_fill
             cell.border = _CELL_BORDER
-            if column in {"B", "C"}:
+            if column == "A":
                 cell.alignment = Alignment(
                     horizontal="left", vertical="center", wrap_text=True
                 )
-            elif column == "M":
+            elif column == "B":
                 cell.alignment = Alignment(
                     horizontal="center", vertical="center", wrap_text=True
                 )
-            else:
+            elif column == "L":
+                cell.alignment = Alignment(
+                    horizontal="center", vertical="center", wrap_text=True
+                )
+            elif column in {"J", "K"} and isinstance(value, str):
                 cell.alignment = Alignment(horizontal="center", vertical="center")
+            else:
+                cell.alignment = Alignment(horizontal="right", vertical="center")
 
-        for column in ("A", "D", "E", "G", "H", "I", "J"):
+        for column in ("C", "D", "E", "G", "H", "I"):
             worksheet[f"{column}{row}"].number_format = INTEGER_FORMAT
         worksheet[f"F{row}"].number_format = PERCENT_FORMAT
-        for column in ("K", "L"):
-            worksheet[f"{column}{row}"].number_format = MONEY_FORMAT
+        if metric.has_prices:
+            for column in ("J", "K"):
+                worksheet[f"{column}{row}"].number_format = MONEY_FORMAT
 
-        link_cell = worksheet[f"B{row}"]
+        link_cell = worksheet[f"A{row}"]
         escaped_title = metric.title.replace("'", "''")
         link_cell.hyperlink = f"#'{escaped_title}'!A1"
         link_cell.font = _DASHBOARD_LINK_FONT
 
-        if metric.no_rd:
-            worksheet[f"G{row}"].fill = _GRAY_FILL
-            worksheet[f"G{row}"].font = _GRAY_FONT
-        if metric.no_smeta:
-            worksheet[f"H{row}"].fill = _GRAY_FILL
-            worksheet[f"H{row}"].font = _GRAY_FONT
         if metric.discrepancies:
-            worksheet[f"I{row}"].fill = _RED_FILL
-            worksheet[f"I{row}"].font = _RED_FONT
+            worksheet[f"H{row}"].fill = _RED_FILL
+            worksheet[f"H{row}"].font = _RED_FONT
         if metric.pending:
-            worksheet[f"J{row}"].fill = _YELLOW_FILL
-            worksheet[f"J{row}"].font = _YELLOW_FONT
+            worksheet[f"I{row}"].fill = _YELLOW_FILL
+            worksheet[f"I{row}"].font = _YELLOW_FONT
         verdict_fill, verdict_font = _verdict_style(metric.verdict)
-        worksheet[f"M{row}"].fill = verdict_fill
-        worksheet[f"M{row}"].font = verdict_font
-        worksheet.row_dimensions[row].height = 22
+        worksheet[f"L{row}"].fill = verdict_fill
+        worksheet[f"L{row}"].font = verdict_font
+        worksheet.row_dimensions[row].height = (
+            42
+            if metric.verdict in {VERDICT_NO_MATCH, VERDICT_NO_RD_SPEC}
+            else 24
+        )
 
     last_row = max(
         DASHBOARD_SECTION_HEADER_ROW,
         DASHBOARD_FIRST_SECTION_ROW + len(metrics) - 1,
     )
     worksheet.auto_filter.ref = (
-        f"A{DASHBOARD_SECTION_HEADER_ROW}:M{last_row}"
+        f"A{DASHBOARD_SECTION_HEADER_ROW}:L{last_row}"
     )
 
 
@@ -1342,7 +1497,7 @@ def _render_dashboard(
     worksheet.page_setup.fitToWidth = 1
     worksheet.page_setup.fitToHeight = 0
     worksheet.print_area = (
-        f"A1:M{DASHBOARD_FIRST_SECTION_ROW + len(metrics) - 1}"
+        f"A1:L{DASHBOARD_FIRST_SECTION_ROW + len(metrics) - 1}"
     )
 
 
@@ -1353,7 +1508,10 @@ def _render_dashboard(
 
 def _session_fallback(session: sqlite3.Row) -> str:
     """Возвращает запасное имя раздела из проекта и имени тома РД."""
-    return f"{session['project_name']} {Path(session['rd_filename']).stem}"
+    project_name = str(session["project_name"])
+    if not session["smeta_sheet"]:
+        return project_name
+    return f"{project_name} {Path(session['rd_filename']).stem}"
 
 
 def _section_export(
@@ -1446,7 +1604,12 @@ def export_audit_to_excel(
     resolved_id = resolve_session_id(conn, session_id)
     session = _load_session(conn, resolved_id)
     records = load_audit_records(conn, resolved_id)
-    section = _section_export(session, records, SHEET_TITLE)
+    # Одиночный запуск получает осмысленное имя раздела, например
+    # «СОТ (ЛС 02-01-14)», а при отсутствии шифра — имя проекта.
+    sheet_title = _readable_sheet_title(
+        session["smeta_sheet"], str(session["project_name"])
+    )
+    section = _section_export(session, records, sheet_title)
 
     workbook = _build_workbook([section], datetime.now())
     return _save_workbook(workbook, output_path)
