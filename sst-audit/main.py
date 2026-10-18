@@ -20,6 +20,7 @@ import argparse
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+import logging
 from pathlib import Path
 import sqlite3
 import sys
@@ -27,16 +28,20 @@ from typing import Any, Final, Optional, Sequence
 import uuid
 
 from rich.console import Console
+from rich.prompt import Prompt
 from rich.table import Table
 
 import cli_review
 import db
+from db import backup_database
 import dispatcher
 import exporter
 from evaluator import DiscrepancyDetector
 from matcher import CascadeMatcher
 from models import CollisionSeverity, NormalizedItem
 from parsers import LSRParser, PDFLSRParser, PDFSpecParser
+
+logger = logging.getLogger(__name__)
 
 # Жесткий порог отсечки семантического шума (шкала матчера 0-100).
 # Ниже него позиция сметы считается отсутствующей в РД и не попадает в HITL.
@@ -52,6 +57,8 @@ MATCH_METHOD_NO_CANDIDATE: Final[str] = "NO_CANDIDATE"
 MATCH_METHOD_NO_MATCH: Final[str] = "NO_MATCH"
 MATCH_METHOD_REVERSE: Final[str] = "REVERSE_PASS"
 BATCH_ERROR_LOG: Final[str] = "batch_errors.log"
+# Сколько горячих снимков SSOT хранить в backups/ (ротация по имени файла).
+BACKUP_RETENTION_LIMIT: Final[int] = 10
 
 RULE_BY_SEVERITY: Final[dict[CollisionSeverity, str]] = {
     CollisionSeverity.CRITICAL: "VOLUME_DELTA_CRITICAL",
@@ -68,7 +75,7 @@ class SessionConfig:
     project_name: str
     rd_path: str
     smeta_path: str
-    db_path: str = db.DEFAULT_DB_PATH
+    db_path: str | Path = db.DEFAULT_DB_PATH
     session_id: Optional[str] = None
     smeta_sheet: Optional[str] = None
 
@@ -530,6 +537,8 @@ class BatchSectionResult:
     session_id: str
     result: Optional[PipelineResult] = None
     error: Optional[str] = None
+    section_code: str = ""
+    tag: str = ""
 
     @property
     def succeeded(self) -> bool:
@@ -606,7 +615,7 @@ def run_batch_pipeline(
     project_name: str,
     batch_dir: str | Path,
     smeta_path: str | Path,
-    db_path: str = db.DEFAULT_DB_PATH,
+    db_path: str | Path = db.DEFAULT_DB_PATH,
     headless: bool = True,
     reviewer: str = "Оператор ПТО",
     output_path: Optional[str | Path] = None,
@@ -723,6 +732,223 @@ def run_batch_pipeline(
     )
 
 
+def _render_dual_mapping_table(
+    pairs: Sequence[dispatcher.DualPair],
+    console: Console,
+) -> None:
+    """Показывает Rich-таблицу связок перед запуском двухпапочного аудита."""
+    table = Table(
+        title="Связки ведомостей ВОР и сметных расчетов ЛСР",
+        show_lines=False,
+    )
+    table.add_column("Шифр", style="bold cyan", no_wrap=True)
+    table.add_column("Тег", style="magenta", no_wrap=True)
+    table.add_column("ВОР / СВОР (PDF)", style="green", no_wrap=False)
+    table.add_column("Смета ЛСР", style="yellow", no_wrap=False)
+
+    for pair in pairs:
+        table.add_row(
+            pair.section_code,
+            pair.tag,
+            pair.rd_path.name,
+            pair.smeta_path.name,
+        )
+    console.print(table)
+
+
+def run_dual_batch_pipeline(
+    conn: sqlite3.Connection,
+    *,
+    project_name: str,
+    rd_dir: str | Path,
+    smeta_dir: str | Path,
+    db_path: str | Path = db.DEFAULT_DB_PATH,
+    headless: bool = True,
+    reviewer: str = "Оператор ПТО",
+    output_path: Optional[str | Path] = None,
+    error_log_path: str | Path = BATCH_ERROR_LOG,
+    console: Optional[Console] = None,
+    project_dispatcher: Optional[dispatcher.ProjectDispatcher] = None,
+) -> BatchSummary:
+    """Двухпапочный пакетный аудит: папка ВОР/СВОР + папка ЛСР.
+
+    Каждая связка (ВОР/СВОР ↔ ЛСР) обрабатывается в изолированной сессии
+    ``{project}_{sec}_{tag}_{uuid}``. Сметы включения и исключения не
+    смешиваются: их объемы и стоимости уже имеют собственный знак, поэтому
+    сальдо далее считается прямым сложением без инверсии.
+    """
+    console = console or Console()
+    resolver = project_dispatcher or dispatcher.ProjectDispatcher()
+
+    pairs = resolver.match_dual_directories(Path(rd_dir), Path(smeta_dir))
+    if not pairs:
+        console.print(
+            "[yellow]Не найдено ни одной связки ВОР/СВОР ↔ ЛСР. "
+            "Проверьте шифры разделов в именах файлов.[/yellow]"
+        )
+        return BatchSummary(total=0, succeeded=0, failed=0, hitl_pending=0)
+
+    _render_dual_mapping_table(pairs, console)
+
+    results: list[BatchSectionResult] = []
+    log_path = Path(error_log_path)
+
+    for pair in pairs:
+        # Изоляция ВКЛ и ИСКЛ: уникальный session_id на каждую смету.
+        session_id = (
+            f"{project_name}_{pair.section_code}_{pair.tag}_"
+            f"{uuid.uuid4().hex[:6]}"
+        )
+        config = SessionConfig(
+            project_name=project_name,
+            rd_path=str(pair.rd_path),
+            smeta_path=str(pair.smeta_path),
+            db_path=db_path,
+            session_id=session_id,
+            smeta_sheet=None,
+        )
+        try:
+            pipeline_result = run_pipeline(
+                conn,
+                config,
+                interactive=not headless,
+                reviewer=reviewer,
+            )
+        except Exception as error:  # noqa: BLE001 - ночной прогон не падает
+            _append_batch_error(log_path, pair.rd_path, pair.sheet_name, error)
+            results.append(
+                BatchSectionResult(
+                    pdf_path=pair.rd_path,
+                    sheet_name=pair.sheet_name,
+                    confidence=100.0,
+                    session_id=session_id,
+                    error=f"{type(error).__name__}: {error}",
+                    section_code=pair.section_code,
+                    tag=pair.tag,
+                )
+            )
+            continue
+
+        results.append(
+            BatchSectionResult(
+                pdf_path=pair.rd_path,
+                sheet_name=pair.sheet_name,
+                confidence=100.0,
+                session_id=session_id,
+                result=pipeline_result,
+                section_code=pair.section_code,
+                tag=pair.tag,
+            )
+        )
+
+    succeeded = [section for section in results if section.succeeded]
+    failed = [section for section in results if not section.succeeded]
+    hitl_pending = sum(
+        section.result.hitl_pending
+        for section in succeeded
+        if section.result is not None
+    )
+
+    summary = BatchSummary(
+        total=len(results),
+        succeeded=len(succeeded),
+        failed=len(failed),
+        hitl_pending=hitl_pending,
+        sections=tuple(results),
+    )
+    console.print(
+        f"Всего связок: {summary.total} | Успешно: {summary.succeeded} | "
+        f"С ошибками: {summary.failed} | "
+        f"Требуют верификации утром: {summary.hitl_pending} позиций."
+    )
+
+    target: Optional[Path] = None
+    if output_path is not None and succeeded:
+        hints = {
+            section.session_id: (section.section_code, section.tag)
+            for section in succeeded
+        }
+        target = exporter.export_sessions_to_excel(
+            conn,
+            summary.successful_session_ids,
+            output_path,
+            section_hints=hints,
+        )
+        console.print(f"Многолистовая ведомость сформирована: {target}")
+    elif output_path is not None:
+        console.print(
+            "[yellow]Ведомость не сформирована: нет успешно обработанных "
+            "связок.[/yellow]"
+        )
+
+    return BatchSummary(
+        total=summary.total,
+        succeeded=summary.succeeded,
+        failed=summary.failed,
+        hitl_pending=summary.hitl_pending,
+        sections=summary.sections,
+        output_path=target,
+    )
+
+
+def _create_startup_backup(args: argparse.Namespace) -> Path | None:
+    """Снимает горячий WAL-safe снимок SSOT перед стартом обработки.
+
+    Ошибка резервирования не прерывает пайплайн: она только логируется.
+    """
+    db_arg = getattr(args, "db", None) or getattr(args, "db_path", None)
+    try:
+        backup_path = backup_database(db_path=db_arg, max_backups=BACKUP_RETENTION_LIMIT)
+    except Exception as exc:  # noqa: BLE001 — резервирование не блокирует аудит
+        logger.warning("Резервное копирование БД не выполнено: %s", exc)
+        return None
+
+    if backup_path is None:
+        return None
+
+    logger.info(f"Создана резервная копия БД: {backup_path}")
+    if not getattr(args, "headless", False) and sys.stdout is not None:
+        console = Console()
+        console.print(
+            f"[bold green]✔[/] Резервная копия БД создана: [cyan]{backup_path.name}[/]"
+        )
+    return backup_path
+
+
+def _clean_path_argument(raw: str) -> str:
+    """Убирает кавычки и пробелы, которые оператор копирует из проводника."""
+    return raw.strip().strip("'\"").strip()
+
+
+def _prompt_directory(label: str, console: Console) -> str:
+    """Запрашивает существующий каталог, пока оператор не введет корректный."""
+    while True:
+        raw = Prompt.ask(label)
+        cleaned = _clean_path_argument(raw)
+        if not cleaned:
+            console.print("[red]Путь не может быть пустым.[/red]")
+            continue
+        candidate = Path(cleaned).expanduser()
+        if candidate.is_dir():
+            return str(candidate)
+        console.print(f"[red]Каталог не найден:[/red] {candidate}")
+
+
+def _derive_project_name(*path_args: Optional[str | Path]) -> str:
+    """Определяет имя проекта по родительской папке исходных данных."""
+    for value in path_args:
+        if not value:
+            continue
+        candidate = Path(value)
+        if candidate.is_file():
+            name = candidate.parent.name
+        else:
+            name = candidate.parent.name or candidate.name
+        if name:
+            return name
+    return "Проект"
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Точка входа all-in-one CLI: ingest -> match -> HITL -> export."""
     parser = argparse.ArgumentParser(
@@ -735,8 +961,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--project",
         "--project-name",
         dest="project_name",
-        required=True,
-        help="Наименование проекта/объекта",
+        default=None,
+        help=(
+            "Наименование проекта/объекта (по умолчанию — имя родительской "
+            "папки исходных данных)"
+        ),
     )
     parser.add_argument(
         "--rd",
@@ -747,12 +976,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--batch-dir",
         dest="batch_dir",
         default=None,
-        help="Папка с томами РД (.pdf) для ночного пакетного прогона",
+        help=(
+            "Папка с томами РД (.pdf) для пакетного прогона по одной "
+            "многолистовой смете (--smeta)"
+        ),
+    )
+    parser.add_argument(
+        "--rd-dir",
+        dest="rd_dir",
+        default=None,
+        help="Папка ведомостей объемов работ / спецификаций ВОР, СВОР (.pdf)",
     )
     parser.add_argument(
         "--smeta",
-        required=True,
+        default=None,
         help="Путь к локальной смете (.xlsx или .pdf формы 4б)",
+    )
+    parser.add_argument(
+        "--smeta-dir",
+        dest="smeta_dir",
+        default=None,
+        help="Папка сметных расчетов ЛСР (.xlsx/.pdf) для двухпапочного режима",
     )
     parser.add_argument(
         "--sheet",
@@ -800,8 +1044,83 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Имя эксперта для записей expert_reviews",
     )
     args = parser.parse_args(argv)
+    console = Console()
+    headless = bool(args.headless or args.no_review)
 
-    smeta_path = Path(args.smeta)
+    if args.rd_dir and (args.batch_dir or args.rd):
+        parser.error("--rd-dir не используется вместе с --batch-dir/--rd")
+    if args.batch_dir and args.smeta_dir:
+        parser.error("--smeta-dir используется только с --rd-dir")
+
+    # Без аргументов оператор попадает в двухпапочный режим с опросом путей.
+    dual_requested = bool(
+        args.rd_dir
+        or args.smeta_dir
+        or (args.rd is None and args.batch_dir is None and args.smeta is None)
+    )
+
+    if dual_requested:
+        rd_dir_arg = args.rd_dir
+        smeta_dir_arg = args.smeta_dir
+        if headless and not (rd_dir_arg and smeta_dir_arg):
+            print(
+                "[ERROR] Двухпапочный режим в --headless требует явные "
+                "--rd-dir и --smeta-dir: интерактивный запрос путей запрещен.",
+                file=sys.stderr,
+            )
+            return 2
+        if not rd_dir_arg:
+            rd_dir_arg = _prompt_directory("Папка ВОР/СВОР (PDF)", console)
+        if not smeta_dir_arg:
+            smeta_dir_arg = _prompt_directory(
+                "Папка сметных расчетов ЛСР (XLSX/PDF)", console
+            )
+
+        rd_dir = Path(_clean_path_argument(rd_dir_arg))
+        smeta_dir = Path(_clean_path_argument(smeta_dir_arg))
+        if not rd_dir.is_dir():
+            parser.error(f"Папка не найдена: --rd-dir {rd_dir}")
+        if not smeta_dir.is_dir():
+            parser.error(f"Папка не найдена: --smeta-dir {smeta_dir}")
+        if args.sheet or args.session_id:
+            parser.error(
+                "--sheet/--session-id не используются с --rd-dir: "
+                "листы и сессии определяются автоматически"
+            )
+
+        project_name = args.project_name or _derive_project_name(rd_dir)
+        output_path = args.out or f"Аудит_{project_name}_Сводный.xlsx"
+
+        # Горячий снимок SSOT до старта двухпапочного прогона.
+        _create_startup_backup(args)
+
+        conn = db.get_connection(args.db_path)
+        try:
+            summary = run_dual_batch_pipeline(
+                conn,
+                project_name=project_name,
+                rd_dir=rd_dir,
+                smeta_dir=smeta_dir,
+                db_path=args.db_path,
+                headless=headless,
+                reviewer=args.reviewer,
+                output_path=output_path,
+            )
+        except (OSError, ValueError, sqlite3.Error) as error:
+            print(f"[ERROR] Двухпапочный прогон не выполнен: {error}", file=sys.stderr)
+            return 1
+        finally:
+            conn.close()
+
+        return 0 if summary.failed == 0 else 1
+
+    if not args.smeta:
+        if headless:
+            print("[ERROR] Не указан --smeta для одиночного режима.", file=sys.stderr)
+            return 2
+        parser.error("--smeta обязателен (либо используйте --rd-dir/--smeta-dir)")
+
+    smeta_path = Path(_clean_path_argument(args.smeta))
     if not smeta_path.is_file():
         parser.error(f"Файл не найден: --smeta {smeta_path}")
 
@@ -816,12 +1135,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.session_id:
             parser.error("--session-id не используется с --batch-dir: сессии создаются изолированно")
 
+        # Горячий снимок SSOT до старта пакетного прогона.
+        _create_startup_backup(args)
+
         conn = db.get_connection(args.db_path)
         try:
-            headless = bool(args.headless or args.no_review)
             summary = run_batch_pipeline(
                 conn,
-                project_name=args.project_name,
+                project_name=args.project_name or _derive_project_name(batch_dir),
                 batch_dir=batch_dir,
                 smeta_path=smeta_path,
                 db_path=args.db_path,
@@ -839,12 +1160,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if not args.rd:
         parser.error("--rd обязателен для одиночного запуска (либо укажите --batch-dir)")
-    rd_path = Path(args.rd)
+    rd_path = Path(_clean_path_argument(args.rd))
     if not rd_path.is_file():
         parser.error(f"Файл не найден: --rd {rd_path}")
 
+    project_name = args.project_name or _derive_project_name(rd_path)
+
+    # Горячий снимок SSOT до старта одиночного прогона.
+    _create_startup_backup(args)
+
     config = SessionConfig(
-        project_name=args.project_name,
+        project_name=project_name,
         rd_path=str(rd_path),
         smeta_path=str(smeta_path),
         db_path=args.db_path,
@@ -857,7 +1183,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         result = run_pipeline(
             conn,
             config,
-            interactive=not (args.no_review or args.headless),
+            interactive=not headless,
             reviewer=args.reviewer,
         )
         print(

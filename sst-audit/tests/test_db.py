@@ -8,6 +8,7 @@ import pytest
 
 from db import (
     SCHEMA_SQL,
+    backup_database,
     create_session,
     get_connection,
     get_pending_reviews,
@@ -620,5 +621,95 @@ def test_init_db_migrates_legacy_rule_evaluations_and_parent_id(
         assert "parent_id" in smeta_columns
     finally:
         connection.close()
+
+
+# ----------------------------------------------------------------------
+# Горячее резервирование SSOT (WAL-safe snapshot + ротация)
+# ----------------------------------------------------------------------
+
+
+class TestDatabaseBackup:
+    """Проверяет снимок БД через sqlite3 backup API и ротацию файлов."""
+
+    def test_backup_nonexistent_db_returns_none(self, tmp_path) -> None:
+        """Первый чистый запуск: файла нет — снимок не создается, исключений нет."""
+        missing = tmp_path / "missing.db"
+
+        assert backup_database(db_path=missing) is None
+        assert not (tmp_path / "backups").exists()
+
+    def test_backup_creates_valid_copy_with_wal(self, tmp_path) -> None:
+        """Копия включает данные, оставшиеся в WAL (без явного checkpoint)."""
+        source_path = tmp_path / "wal_source.db"
+        source = sqlite3.connect(str(source_path), timeout=30)
+        try:
+            journal_mode = source.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            assert str(journal_mode).lower() == "wal"
+            source.execute(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, code TEXT NOT NULL)"
+            )
+            source.executemany(
+                "INSERT INTO items (code) VALUES (?)",
+                [("A-1",), ("B-2",), ("C-3",)],
+            )
+            source.commit()
+            # Соединение не закрыто: часть страниц гарантированно остается в -wal.
+            wal_path = source_path.with_name(source_path.name + "-wal")
+            assert wal_path.is_file()
+
+            backup_path = backup_database(db_path=source_path)
+        finally:
+            source.close()
+
+        assert backup_path is not None
+        assert backup_path.is_file()
+        assert backup_path.parent == source_path.parent / "backups"
+        assert backup_path.suffix == ".db"
+        assert backup_path.name.startswith("wal_source_")
+
+        restored = sqlite3.connect(str(backup_path))
+        try:
+            integrity = restored.execute("PRAGMA integrity_check").fetchone()[0]
+            rows = restored.execute("SELECT code FROM items ORDER BY id").fetchall()
+        finally:
+            restored.close()
+
+        assert integrity == "ok"
+        assert [row[0] for row in rows] == ["A-1", "B-2", "C-3"]
+
+    def test_backup_rotation_limits_file_count(self, tmp_path) -> None:
+        """Ротация по имени оставляет ровно max_backups самых свежих снимков."""
+        source_path = tmp_path / "rotate.db"
+        source = sqlite3.connect(str(source_path), timeout=30)
+        try:
+            source.execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+            source.execute("INSERT INTO items (id) VALUES (1)")
+            source.commit()
+        finally:
+            source.close()
+
+        backup_dir = tmp_path / "backups"
+        backup_dir.mkdir()
+        for stale_name in (
+            "rotate_20200101_000000.db",
+            "rotate_20200102_000000.db",
+            "rotate_20200103_000000.db",
+        ):
+            (backup_dir / stale_name).write_bytes(b"stale snapshot")
+
+        fresh = backup_database(
+            db_path=source_path,
+            backup_dir=backup_dir,
+            max_backups=2,
+        )
+
+        assert fresh is not None
+        assert fresh.is_file()
+        snapshots = sorted(backup_dir.glob("rotate_*.db"), reverse=True)
+        assert len(snapshots) == 2
+        assert snapshots[0].name == fresh.name
+        assert snapshots[1].name == "rotate_20200103_000000.db"
+        assert not (backup_dir / "rotate_20200101_000000.db").exists()
+        assert not (backup_dir / "rotate_20200102_000000.db").exists()
 
 
