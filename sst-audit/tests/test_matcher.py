@@ -1,6 +1,7 @@
 import pytest
 from decimal import Decimal
 from models import NormalizedItem, CellPointer, UnitClass
+from evaluator import PredicateEvaluator
 from matcher import CascadeMatcher, CompositeMatcher
 from normalizer import UnitNormalizer
 
@@ -259,13 +260,13 @@ class TestParentCoverage:
         assert evaluations[1]["is_violation"] is False
 
 
-def make_item(raw_id="1", title="Камера", code=None, section="Default_Section", unit=UnitClass.COUNT, dims=None):
+def make_item(raw_id="1", title="Камера", code=None, section="Default_Section", unit=UnitClass.COUNT, dims=None, raw_unit="шт"):
     return NormalizedItem(
         raw_id=raw_id,
         code=code,
         raw_title=title,
         clean_title=title.lower(),
-        raw_unit="шт",
+        raw_unit=raw_unit,
         canonical_unit=unit,
         unit_multiplier=Decimal("1.0"),
         volume=Decimal("1"),
@@ -291,13 +292,26 @@ class TestCascadeMatcherAdaptive:
         assert CascadeMatcher._clean_code("  RVi-1NCT4053  ") == "RVi-1NCT4053"
 
     def test_unit_gating_and_unknown(self):
-        """Блокировка при несовпадении единиц или при статусе UNKNOWN."""
+        """Несовместимые единицы блокируются, UNKNOWN — мягкий пропуск."""
         item_count = make_item(unit=UnitClass.COUNT)
         item_length = make_item(unit=UnitClass.LENGTH)
         item_unknown = make_item(unit=UnitClass.UNKNOWN)
 
         assert CascadeMatcher.calculate_score(item_count, item_length) == 0.0
-        assert CascadeMatcher.calculate_score(item_count, item_unknown) == 0.0
+        assert CascadeMatcher.calculate_score(item_count, item_unknown) > 0.0
+
+    def test_matching_with_missing_smeta_unit(self):
+        """Усеченная 4б: отсутствие единицы в смете не блокирует матчинг."""
+        lsr_item = make_item(unit=UnitClass.COUNT, raw_unit="шт")
+        smeta_item = make_item(unit=UnitClass.UNKNOWN, raw_unit="")
+
+        assert CascadeMatcher.calculate_score(lsr_item, smeta_item) > 0.0
+        breakdown = PredicateEvaluator.evaluate_pair(lsr_item, smeta_item)
+        unit_gate = breakdown.get("R05_UNT")
+        assert unit_gate is not None
+        assert unit_gate.status == "WARNING"
+        assert unit_gate.score == Decimal("0.5")
+        assert unit_gate.message == "UNIT_MISSING_IN_SMETA"
 
     def test_dimension_lock_rejection(self):
         """Блокировка при конфликте геометрических параметров."""

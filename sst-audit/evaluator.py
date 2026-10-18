@@ -247,9 +247,23 @@ class PredicateEvaluator:
     def evaluate_units(
         cls, rd_item: NormalizedItem, smeta_item: NormalizedItem
     ) -> RuleEvaluation:
-        """R05_UNT: шлюз размерностей единиц измерения."""
+        """R05_UNT: шлюз размерностей единиц измерения.
+
+        Если единица сметной позиции не определена (усеченная форма 4б без
+        графы «Ед. изм.»), жесткая блокировка не применяется: предикат
+        возвращает WARNING с весом 0.5 и причиной ``UNIT_MISSING_IN_SMETA``.
+        """
+        smeta_raw = (smeta_item.raw_unit or "").strip()
+        if not smeta_raw and smeta_item.canonical_unit == UnitClass.UNKNOWN:
+            return RuleEvaluation(
+                rule_code="R05_UNT",
+                status="WARNING",
+                weight=RuleBreakdown.R05_UNT,
+                score=Decimal("0.5"),
+                message="UNIT_MISSING_IN_SMETA",
+            )
         rd_unit = rd_item.raw_unit or rd_item.canonical_unit.value
-        smeta_unit = smeta_item.raw_unit or smeta_item.canonical_unit.value
+        smeta_unit = smeta_raw or smeta_item.canonical_unit.value
         compatible, gate_score, reason = evaluate_unit_gate(rd_unit, smeta_unit)
         if reason.endswith("SKIPPED"):
             status = "SKIPPED"

@@ -5,6 +5,7 @@ from typing import Any, Dict, Final, Optional, Sequence
 from rapidfuzz import fuzz
 
 from evaluator import PredicateEvaluator, VolumeSufficiencyEvaluator
+from normalizer import is_dimension_compatible
 from models import (
     MatchRecord,
     NormalizedItem,
@@ -42,10 +43,31 @@ class CascadeMatcher:
         common_keys = dim_lsr.keys() & dim_spec.keys()
         return all(dim_lsr[k] == dim_spec[k] for k in common_keys)
 
+    @staticmethod
+    def _units_incompatible(lsr: NormalizedItem, spec: NormalizedItem) -> bool:
+        """Мягкий Unit Gate: блокирует только доказанную несовместимость.
+
+        Если единица хотя бы одной стороны не определена, сопоставление не
+        блокируется (``None``/``UNKNOWN``), а несовместимость фиксируется
+        предикатом R05_UNT как WARNING/SKIPPED.
+        """
+        if (
+            lsr.canonical_unit != UnitClass.UNKNOWN
+            and spec.canonical_unit != UnitClass.UNKNOWN
+        ):
+            return not is_dimension_compatible(
+                lsr.canonical_unit.value, spec.canonical_unit.value
+            )
+        raw_lsr = (lsr.raw_unit or "").strip()
+        raw_spec = (spec.raw_unit or "").strip()
+        if raw_lsr and raw_spec:
+            return not is_dimension_compatible(raw_lsr, raw_spec)
+        return False
+
     @classmethod
     def calculate_score(cls, lsr: NormalizedItem, spec: NormalizedItem) -> float:
-        # 1. Unit Gating: мгновенная блокировка при несовместимости физических групп единиц
-        if lsr.canonical_unit != spec.canonical_unit or lsr.canonical_unit == UnitClass.UNKNOWN:
+        # 1. Unit Gating: мягкая блокировка только при доказанной несовместимости
+        if cls._units_incompatible(lsr, spec):
             return 0.0
 
         # 2. Dimensional Lock: блокировка при несовпадении технических параметров (MR4)
