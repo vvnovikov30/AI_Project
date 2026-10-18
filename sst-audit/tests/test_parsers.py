@@ -229,6 +229,106 @@ class TestLSRParserSynthetic:
         assert excluded.volume == Decimal("-840.9744")
         assert excluded.canonical_unit == UnitClass.AREA
 
+    def test_detect_4b_layout_reduced_without_unit(self, tmp_path):
+        """Корни заголовков находят усеченную 4б при произвольном порядке граф."""
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.cell(row=1, column=1, value="Наименование работ и затрат")
+        ws.cell(row=1, column=2, value="Обоснование расценки")
+        ws.cell(row=1, column=3, value="Кол-во")
+        ws.cell(row=1, column=4, value="Общая стоимость, руб.")
+        ws.cell(row=2, column=1, value="Демонтаж светильников, 100 шт")
+        ws.cell(row=2, column=3, value=-5)
+
+        file_path = tmp_path / "lsr_reduced_layout.xlsx"
+        wb.save(file_path)
+
+        parser = LSRParser(str(file_path))
+        merge_map = parser._resolve_merged_cells_map(parser.wb.active)
+        layout = parser._detect_4b_layout(parser.wb.active, merge_map)
+
+        assert layout is not None
+        assert layout.is_reduced
+        assert layout.name_col == 1
+        assert layout.code_col == 2
+        assert layout.qty_col == 3
+        assert layout.total_cost_col == 4
+        assert layout.unit_col is None
+
+    def test_reduced_4b_parsing_without_unit_column(self, tmp_path):
+        """Усеченная 4б: единица из текста, отрицательные объемы и стоимость."""
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Смета"
+        ws.cell(row=1, column=1, value="№ п/п")
+        ws.cell(row=1, column=2, value="Обоснование расценки")
+        ws.cell(row=1, column=3, value="Наименование работ и затрат")
+        ws.cell(row=1, column=4, value="Кол-во")
+        ws.cell(row=1, column=5, value="Общая стоимость, руб.")
+
+        ws.cell(row=2, column=1, value="Раздел 1. Демонтаж")
+        ws.cell(row=3, column=1, value="1")
+        ws.cell(row=3, column=2, value="ТЕР10-01-060-01")
+        ws.cell(row=3, column=3, value="Демонтаж светильников, 100 шт")
+        ws.cell(row=3, column=4, value=-5)
+        ws.cell(row=3, column=5, value=-1000)
+
+        ws.cell(row=4, column=2, value="101-1805")
+        ws.cell(row=4, column=3, value="Гвозди строительные (кг)")
+        ws.cell(row=4, column=4, value="0,5")
+        ws.cell(row=4, column=5, value=-50)
+
+        ws.cell(row=5, column=1, value="2")
+        ws.cell(row=5, column=2, value="ТЕР15-01-047-15")
+        ws.cell(row=5, column=3, value="Прокладка кабеля")
+        ws.cell(row=5, column=4, value=10)
+        ws.cell(row=5, column=5, value=200)
+
+        ws.cell(row=6, column=3, value="НР от ФОТ")
+        ws.cell(row=6, column=4, value=90)
+
+        file_path = tmp_path / "lsr_reduced_4b.xlsx"
+        wb.save(file_path)
+
+        items = LSRParser(str(file_path)).parse()
+
+        assert len(items) == 3
+        work, resource, no_unit = items
+        assert work.code == "ТЕР10-01-060-01"
+        assert work.raw_unit == "100 шт"
+        assert work.canonical_unit == UnitClass.COUNT
+        assert work.volume == Decimal("-500")
+        assert work.total_cost == Decimal("-1000")
+        assert work.unit_price == Decimal("2.0000")
+        assert not work.is_resource
+        assert work.context_section == "Раздел 1. Демонтаж"
+
+        assert resource.is_resource
+        assert resource.parent_id == work.raw_id
+        assert resource.raw_unit == "кг"
+        assert resource.canonical_unit == UnitClass.MASS
+        assert resource.volume == Decimal("0.5")
+
+        assert no_unit.raw_unit == ""
+        assert no_unit.canonical_unit == UnitClass.UNKNOWN
+        assert no_unit.volume == Decimal("10")
+        assert no_unit.total_cost == Decimal("200")
+        assert no_unit.unit_price == Decimal("20.0000")
+
+    @pytest.mark.parametrize(
+        ("title", "expected"),
+        [
+            ("Демонтаж светильников, 100 шт", "100 шт"),
+            ("Кабель ВВГнг 3х1.5 (м)", "м"),
+            ("Приборы ПС (1 шт.)", "1 шт"),
+            ("Прокладка кабеля", None),
+        ],
+    )
+    def test_extract_unit_from_title(self, title, expected):
+        """Fallback-извлечение единицы измерения из наименования позиции."""
+        assert LSRParser._extract_unit_from_title(title) == expected
+
+
 
 # ==============================================================================
 # 2. МОДУЛЬНЫЕ ТЕСТЫ PDFSpecParser
