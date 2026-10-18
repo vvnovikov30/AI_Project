@@ -540,6 +540,62 @@ def test_dashboard_dash_for_missing_prices(
     assert dashboard["K21"].alignment.horizontal == "center"
 
 
+def test_exporter_reveals_price_columns_when_costs_present(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """При наличии реальных цен финансовые колонки J, K, O открыты."""
+    _seed_session(conn)
+    target = export_audit_to_excel(conn, SESSION_ID, tmp_path / "finance.xlsx")
+    worksheet = _open_sheet(target)
+
+    for column in ("J", "K", "O"):
+        assert worksheet.column_dimensions[column].hidden is False
+    for column in ("J5", "K5", "O5"):
+        assert "₽" in worksheet[column].number_format
+
+
+def test_exporter_calculates_total_financial_deltas(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """Строки содержат формулу дельты стоимости, итоги — SUM по K и O."""
+    _seed_session(conn)
+    target = export_audit_to_excel(conn, SESSION_ID, tmp_path / "money.xlsx")
+    worksheet = _open_sheet(target)
+
+    assert worksheet["O5"].value == "=N5*J5"
+    assert worksheet["K5"].value == "=I5*J5"
+
+    summary_row = exporter.FIRST_DATA_ROW + 2
+    for column in ("K", "O"):
+        assert (
+            worksheet[f"{column}{summary_row}"].value
+            == f"=SUM({column}5:{column}6)"
+        )
+        assert "₽" in worksheet[f"{column}{summary_row}"].number_format
+        assert worksheet[f"{column}{summary_row}"].font.bold is True
+
+
+def test_dashboard_displays_ruble_totals_when_available(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """Дашборд показывает стоимость сметы и дельту в рублях при наличии цен."""
+    _seed_session(conn)
+    target = export_audit_to_excel(conn, SESSION_ID, tmp_path / "rubles.xlsx")
+    dashboard = load_workbook(target)[DASHBOARD_TITLE]
+
+    cost_row = _kpi_row(dashboard, "Стоимость сметы, руб.")
+    delta_row = _kpi_row(dashboard, "Дельта стоимости, руб.")
+    assert dashboard[f"B{cost_row}"].value == pytest.approx(790000.0)
+    assert "₽" in dashboard[f"B{cost_row}"].number_format
+    assert dashboard[f"B{delta_row}"].value == pytest.approx(-360000.0)
+    assert "₽" in dashboard[f"B{delta_row}"].number_format
+
+    assert dashboard["J21"].value == pytest.approx(790000.0)
+    assert "₽" in dashboard["J21"].number_format
+    assert dashboard["K21"].value == pytest.approx(-360000.0)
+    assert "₽" in dashboard["K21"].number_format
+
+
 def test_sheet_has_summary_total_row(
     conn: sqlite3.Connection, tmp_path: Path
 ) -> None:

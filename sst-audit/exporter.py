@@ -53,7 +53,7 @@ HIDDEN_ID_COLUMN: Final[str] = "A"
 ONE: Final[Decimal] = Decimal("1.0")
 ZERO: Final[Decimal] = Decimal("0")
 
-MONEY_FORMAT: Final[str] = "#,##0.00"
+MONEY_FORMAT: Final[str] = '#,##0.00 "₽"'
 VOLUME_FORMAT: Final[str] = "#,##0.000"
 RATIO_FORMAT: Final[str] = "#,##0.0000"
 PERCENT_FORMAT: Final[str] = "0.0%"
@@ -253,6 +253,20 @@ class AuditRecord:
         if adjusted is None or self.smeta_quantity is None:
             return None
         return self.smeta_quantity - adjusted
+
+    @property
+    def estimated_cost(self) -> Optional[Decimal]:
+        """Сметная стоимость строки: ``total_cost`` либо ``I * J``.
+
+        Если парсер сохранил только цену и объем, стоимость выводится
+        расчетным путем — так финансовая реконсиляция не зависит от наличия
+        предрасчитанного поля в смете.
+        """
+        if self.total_cost is not None:
+            return self.total_cost
+        if self.smeta_quantity is not None and self.unit_price is not None:
+            return self.smeta_quantity * self.unit_price
+        return None
 
     @property
     def tolerance(self) -> Optional[Decimal]:
@@ -721,11 +735,22 @@ def _hide_price_columns(worksheet: Worksheet) -> None:
         worksheet.column_dimensions[column].hidden = True
 
 
+def _reveal_price_columns(worksheet: Worksheet) -> None:
+    """Открывает финансовые колонки, когда в разделе есть реальные цены."""
+    for column in ("J", "K", "O"):
+        worksheet.column_dimensions[column].hidden = False
+
+
 def _write_summary_row(
     worksheet: Worksheet,
     records: Sequence[AuditRecord],
+    has_prices: bool,
 ) -> int:
     """Добавляет бухгалтерскую строку «ИТОГО ПО РАЗДЕЛУ» с формулами SUM.
+
+    Объемные итоги (``E``, ``I``, ``M``, ``N``) выводятся всегда. Финансовые
+    итоги (``K`` — стоимость по смете, ``O`` — дельта стоимости) выводятся
+    только когда в разделе есть реальные цены, иначе колонки скрыты.
 
     :return: номер итоговой строки.
     """
@@ -741,6 +766,17 @@ def _write_summary_row(
             cell.value = 0
         cell.number_format = VOLUME_FORMAT
 
+    if has_prices:
+        for column in ("K", "O"):
+            cell = worksheet[f"{column}{summary_row}"]
+            if records:
+                cell.value = (
+                    f"=SUM({column}{FIRST_DATA_ROW}:{column}{last_data_row})"
+                )
+            else:
+                cell.value = 0
+            cell.number_format = MONEY_FORMAT
+
     for column in range(2, len(COLUMN_TITLES) + 1):
         cell = worksheet.cell(row=summary_row, column=column)
         cell.font = _SUMMARY_FONT
@@ -748,7 +784,7 @@ def _write_summary_row(
         cell.border = _SUMMARY_BORDER
         if column == 2:
             cell.alignment = Alignment(horizontal="left", vertical="center")
-        elif column in {5, 9, 13, 14}:
+        elif column in {5, 9, 11, 13, 14, 15}:
             cell.alignment = Alignment(horizontal="right", vertical="center")
         else:
             cell.alignment = Alignment(horizontal="center", vertical="center")
@@ -771,11 +807,16 @@ def _populate_worksheet(
     for offset, record in enumerate(records):
         _write_record(worksheet, FIRST_DATA_ROW + offset, offset + 1, record)
 
-    if not _has_price_data(records):
+    # Финансовые колонки активируются только при наличии реальных цен:
+    # иначе остаются скрытыми как визуальный шум нулевых расценок.
+    has_prices = _has_price_data(records)
+    if has_prices:
+        _reveal_price_columns(worksheet)
+    else:
         _hide_price_columns(worksheet)
 
     last_data_row = FIRST_DATA_ROW + len(records) - 1
-    _write_summary_row(worksheet, records)
+    _write_summary_row(worksheet, records, has_prices)
 
     _autosize_columns(worksheet)
     # Плашка возврата должна быть читаемой целиком, поэтому колонка B
@@ -938,9 +979,9 @@ def _measure_section(section: SectionExport) -> SectionMetrics:
     paid_records = [record for record in section.records if record.has_pair]
     total_cost = sum(
         (
-            record.total_cost
+            record.estimated_cost
             for record in section.records
-            if record.has_smeta_item and record.total_cost is not None
+            if record.has_smeta_item and record.estimated_cost is not None
         ),
         ZERO,
     )
