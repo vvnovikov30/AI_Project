@@ -6,7 +6,7 @@ import pytest
 
 from models import UnitClass
 import parsers
-from parsers import LSRParser, PDFSpecParser
+from parsers import LSRParser, PDFLSRParser, PDFSpecParser
 
 
 # ==============================================================================
@@ -330,6 +330,127 @@ class TestPDFSpecParserUnit:
         assert [item.raw_unit for item in items] == ["пм.", "шт", "шт."]
         assert all(item.context_section == "Фасады" for item in items)
 
+    def test_grand_smeta_vor_7_columns_mock(self, monkeypatch):
+        """Форма ВОР ПК «ГРАНД-Смета»: рамка только у шапки, объем в графе 4.
+
+        Строки данных идут без горизонтальных линий, поэтому find_tables()
+        видит лишь шапку. Границы граф берутся из рамки шапки, слова данных
+        раскладываются по графам, а перенос ячейки «Обоснование» не должен
+        попадать в наименование или количество.
+        """
+        header = [
+            "№\nп.п.",
+            "Наименование работ, ресурсов, затрат по проекту",
+            "Ед.\nизм.",
+            "Объем работ /\nКоличество",
+            "Формула расчета объемов работ",
+            "Ссылка на чертежи,\nспецификации",
+            "Дополнительная\nинформация",
+        ]
+        graph_numbers = ["1", "2", "3", "4", "5", "6", "7"]
+
+        class _BBoxRow:
+            def __init__(self, top, bottom):
+                self.bbox = (13.4, top, 829.0, bottom)
+
+        class _Column:
+            def __init__(self, x0, x1):
+                self.bbox = (x0, 0.2, x1, 41.7)
+
+        class _GrandVorTable:
+            """Размеченная часть формы: шапка и строка нумерации граф."""
+
+            bbox = (13.4, 0.2, 829.0, 41.7)
+
+            @property
+            def rows(self):
+                return [_BBoxRow(0.2, 30.5), _BBoxRow(30.5, 41.7)]
+
+            @property
+            def columns(self):
+                edges = [13.4, 33.4, 318.1, 341.0, 395.6, 650.6, 745.6, 829.0]
+                return [
+                    _Column(left, right)
+                    for left, right in zip(edges, edges[1:])
+                ]
+
+            def extract(self):
+                return [list(header), list(graph_numbers)]
+
+        def word(text, x0, x1, top):
+            return {"text": text, "x0": x0, "x1": x1, "top": top}
+
+        words = [
+            word("Раздел:", 16.5, 50.0, 45.0),
+            word("1.", 52.0, 60.0, 45.0),
+            word("Кровля", 62.0, 95.0, 45.0),
+            word("1", 21.7, 26.0, 55.0),
+            word("Разборка", 36.8, 78.0, 55.0),
+            word("кровель", 80.0, 120.0, 55.0),
+            word("м2", 320.0, 332.0, 55.0),
+            word("15", 345.0, 357.0, 55.0),
+            word("15", 400.0, 412.0, 55.0),
+            word("Файл:", 653.8, 680.0, 55.0),
+            word("03-2026.docx", 653.8, 700.0, 62.8),
+            word("2", 21.7, 26.0, 74.0),
+            word("Смена:", 36.8, 75.0, 74.0),
+            word("колен", 77.0, 110.0, 74.0),
+            word("шт", 320.0, 330.0, 74.0),
+            word("36", 345.0, 357.0, 74.0),
+            word("36", 400.0, 412.0, 74.0),
+            word("03-2026.docx", 653.8, 700.0, 81.8),
+        ]
+
+        class _FakePage:
+            width = 842.0
+            height = 595.0
+
+            def within_bbox(self, _bbox):
+                return self
+
+            def extract_text(self):
+                return (
+                    "Ведомость объемов работ № ВОР 02-01-01 "
+                    "Наименование работ, ресурсов, затрат по проекту"
+                )
+
+            def find_tables(self, _settings):
+                return [_GrandVorTable()]
+
+            def extract_table(self, _settings):
+                return None
+
+            def extract_words(self):
+                return words
+
+        class _FakePDF:
+            pages = [_FakePage()]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        monkeypatch.setattr(parsers.pdfplumber, "open", lambda _path: _FakePDF())
+
+        items = PDFSpecParser("vor_grand.pdf").extract_items()
+
+        assert [item.volume for item in items] == [Decimal("15"), Decimal("36")]
+        assert [item.raw_unit for item in items] == ["м2", "шт"]
+        assert [item.canonical_unit for item in items] == [
+            UnitClass.AREA,
+            UnitClass.COUNT,
+        ]
+        assert [item.context_section for item in items] == [
+            "Раздел: 1. Кровля",
+            "Раздел: 1. Кровля",
+        ]
+        assert items[0].raw_title == "Разборка кровель"
+        assert items[1].raw_title == "Смена: колен"
+        # Перенос графы «Ссылка на чертежи» не приклеивается к наименованию.
+        assert all("03-2026.docx" not in item.raw_title for item in items)
+
     def test_pdf_parser_empty_pages_returns_empty_list_without_error(self, monkeypatch):
         """Пустая таблица и строка длиной 1 не вызывают IndexError."""
         table = [
@@ -651,3 +772,272 @@ def test_lsr_parser_builds_work_resource_hierarchy():
     # Ресурс не может быть родителем другого ресурса.
     resource_ids = {it.raw_id for it in items if it.is_resource}
     assert all(it.parent_id not in resource_ids for it in items)
+
+
+# ==============================================================================
+# 4. МОДУЛЬНЫЕ ТЕСТЫ PDFLSRParser (УНИВЕРСАЛЬНАЯ СЕТКА И ШИФРЫ)
+# ==============================================================================
+
+
+def _pdf_word(
+    text: str,
+    x0: float,
+    x1: float,
+    top: float = 100.0,
+    bottom: float = 110.0,
+) -> dict:
+    """Формирует слово страницы в формате ``pdfplumber`` для unit-тестов."""
+    return {"text": text, "x0": x0, "x1": x1, "top": top, "bottom": bottom}
+
+
+class _FakePage:
+    """Минимальная заглушка страницы ``pdfplumber`` для тестов геометрии."""
+
+    def __init__(self, edges=None, tables=None):
+        self.edges = edges or []
+        self._tables = tables or []
+
+    def find_tables(self, table_settings=None):
+        """Возвращает заранее заданные таблицы (эмуляция pdfplumber)."""
+        del table_settings
+        return self._tables
+
+
+class _FakeTable:
+    """Заглушка таблицы ``pdfplumber`` с набором ячеек."""
+
+    def __init__(self, cells):
+        self.cells = cells
+
+
+class TestPDFLSRParserUnit:
+    """Проверка универсальных правил разбора PDF-смет формы 4б."""
+
+    @pytest.mark.parametrize(
+        ("code", "position", "expected"),
+        [
+            ("ГЭСН 46-04-008-02", "", True),
+            ("ГЭСНр 65-02-008-01", "", True),
+            ("ФЕР 15-02-001-01", "", True),
+            ("ТЕР 12-01-001-01", "", True),
+            ("ТСН 3.1-12-1", "", True),
+            ("3.1-12-1", "", True),
+            ("6.10-174-2", "", True),
+            ("1.2-34-5", "", False),
+            ("13.1-2-3", "", False),
+            ("Прайс-лист", "", True),
+            ("ФСБЦ-08.3.09.02-0025", "6", False),
+            ("ФССЦ-21.1.06.04-0012", "", False),
+            ("999-9900", "", False),
+            ("01.7.15.03-0012", "", False),
+            ("08.1.02.22", "2.1", False),
+            ("", "6", True),
+            ("", "2.1", False),
+        ],
+    )
+    def test_rate_row_detected_by_code(self, code, position, expected):
+        """Расценка определяется по шифру, номер позиции — резервное правило."""
+        assert PDFLSRParser._is_rate_row(code, position) is expected
+
+    def test_code_normalization_glues_wrapped_cipher(self):
+        """Перенос шифра на новую строку не оставляет разрывов у дефисов."""
+        assert (
+            PDFLSRParser._normalize_code("ГЭСНр 65-02- 008-01")
+            == "ГЭСНр 65-02-008-01"
+        )
+        assert (
+            PDFLSRParser._normalize_code("ФСБЦ-24.3.05.16 -0131")
+            == "ФСБЦ-24.3.05.16-0131"
+        )
+
+
+
+    def test_header_line_found_by_graph_numbers(self):
+        """Шапка распознается по последовательным номерам граф."""
+        lines = [
+            [_pdf_word("Смета", 20, 80)],
+            [_pdf_word(str(i), 20 + i * 30, 30 + i * 30) for i in range(1, 13)],
+            [_pdf_word("1", 20, 30)],
+        ]
+        assert PDFLSRParser._header_line_index(lines) == 1
+
+    def test_header_line_found_by_titles_without_numbering(self):
+        """Шапка без нумерации граф распознается по ключевым заголовкам."""
+        lines = [
+            [_pdf_word("Смета", 20, 80)],
+            [
+                _pdf_word("Обоснование", 20, 90),
+                _pdf_word("Наименование", 100, 200),
+                _pdf_word("Единица измерения", 210, 300),
+            ],
+            [_pdf_word("ГЭСН 46-04-008-02", 20, 90)],
+        ]
+        assert PDFLSRParser._header_line_index(lines) == 1
+
+    def test_text_column_bounds_from_body_alignment(self):
+        """Без линий таблицы границы колонок строятся по левым краям слов."""
+        starts = (20.0, 60.0, 140.0, 260.0, 320.0, 360.0, 400.0, 440.0, 480.0)
+        lines = [[_pdf_word("шапка", 20, 480)]]
+        for _ in range(3):
+            lines.append(
+                [
+                    _pdf_word(f"c{index}", start, start + 20)
+                    for index, start in enumerate(starts)
+                ]
+            )
+        bounds = PDFLSRParser("dummy.pdf")._text_column_bounds(lines, 0)
+
+        assert len(bounds) == len(starts) + 1
+        assert list(bounds) == sorted(bounds)
+        # Слово из колонки с началом 260 попадает в четвертую графу.
+        cells = PDFLSRParser._header_cells([_pdf_word("x", 265, 280)], bounds)
+        assert 3 in cells
+
+    def test_column_bounds_prefers_vertical_lines(self):
+        """Вертикальные линии таблицы имеют приоритет над текстовой сеткой."""
+        edges = [
+            {
+                "orientation": "v",
+                "x0": 20.0 + i * 40,
+                "x1": 20.0 + i * 40,
+                "top": 50.0,
+                "bottom": 700.0,
+            }
+            for i in range(10)
+        ]
+        page = _FakePage(edges=edges)
+        lines = [[_pdf_word("шапка", 20, 100)], [_pdf_word("тело", 20, 100)]]
+        parser = PDFLSRParser("dummy.pdf")
+
+        bounds = parser._column_bounds(page, lines, 0, header_top=100.0)
+        assert len(bounds) == 10
+
+    def test_column_bounds_falls_back_to_text_without_lines(self):
+        """При отсутствии линий и таблиц используется кластеризация слов."""
+        starts = (20.0, 70.0, 150.0, 270.0, 330.0, 370.0, 410.0, 450.0, 490.0)
+        lines = [[_pdf_word("шапка", 20, 490)]]
+        for _ in range(2):
+            lines.append(
+                [
+                    _pdf_word(f"c{index}", start, start + 20)
+                    for index, start in enumerate(starts)
+                ]
+            )
+        parser = PDFLSRParser("dummy.pdf")
+
+        bounds = parser._column_bounds(_FakePage(), lines, 0, header_top=100.0)
+        assert len(bounds) == len(starts) + 1
+        assert list(bounds) == sorted(bounds)
+
+    def test_column_bounds_uses_pdfplumber_table_cells(self):
+        """Ячейки pdfplumber (vertical_strategy='lines') дают сетку колонок."""
+        cells = [(20.0 + i * 40, 100.0, 60.0 + i * 40, 110.0) for i in range(9)]
+        page = _FakePage(tables=[_FakeTable(cells)])
+        parser = PDFLSRParser("dummy.pdf")
+
+        bounds = parser._table_column_bounds(page)
+        assert len(bounds) == 10
+        assert list(bounds) == sorted(bounds)
+
+# ==============================================================================
+# 5. ДИСПЕТЧЕРИЗАЦИЯ СМЕТНЫХ ПАРСЕРОВ И ИНТЕГРАЦИЯ PDF-СМЕТЫ
+# ==============================================================================
+
+
+def test_parse_smeta_items_dispatches_pdf(monkeypatch, tmp_path):
+    """Файл .pdf разбирается PDFLSRParser без параметра smeta_sheet."""
+    import main as main_module
+
+    calls = {}
+
+    class _StubPDFParser:
+        def __init__(self, path):
+            calls["path"] = path
+
+        def parse(self):
+            calls["parsed"] = True
+            return ["pdf_item"]
+
+    monkeypatch.setattr(main_module, "PDFLSRParser", _StubPDFParser)
+    result = main_module._parse_smeta_items(str(tmp_path / "smeta.pdf"), None)
+
+    assert result == ["pdf_item"]
+    assert calls["path"].endswith("smeta.pdf")
+    assert calls["parsed"] is True
+
+
+def test_parse_smeta_items_rejects_sheet_for_pdf(tmp_path):
+    """Для PDF-сметы имя листа XLSX запрещено."""
+    import main as main_module
+
+    with pytest.raises(ValueError, match="smeta_sheet"):
+        main_module._parse_smeta_items(str(tmp_path / "smeta.PDF"), "Лист1")
+
+
+def test_parse_smeta_items_dispatches_xlsx(monkeypatch, tmp_path):
+    """Файл .xlsx разбирается LSRParser с передачей имени листа."""
+    import main as main_module
+
+    seen = {}
+
+    class _StubXLSXParser:
+        def __init__(self, path):
+            seen["path"] = path
+
+        def parse(self, sheet_name=None):
+            seen["sheet"] = sheet_name
+            return ["xlsx_item"]
+
+    monkeypatch.setattr(main_module, "LSRParser", _StubXLSXParser)
+    path = str(tmp_path / "smeta.xlsx")
+
+    assert main_module._parse_smeta_items(path, "Смета") == ["xlsx_item"]
+    assert seen["sheet"] == "Смета"
+    assert main_module._parse_smeta_items(path, None) == ["xlsx_item"]
+    assert seen["sheet"] is None
+
+
+REAL_PDF_LSR = "data/ДАГ/ЛСР1.pdf"
+
+
+@pytest.mark.skipif(
+    not os.path.exists(REAL_PDF_LSR),
+    reason="Файл ЛСР1.pdf не найден",
+)
+def test_real_pdf_lsr_extracts_hierarchy_without_hardcoded_geometry():
+    """Реальная PDF-смета разбирается без привязки к координатам файла."""
+    items = PDFLSRParser(REAL_PDF_LSR).parse()
+
+    assert len(items) > 100
+    rates = [it for it in items if not it.is_resource]
+    resources = [it for it in items if it.is_resource]
+    assert len(rates) > 40
+    assert resources
+
+    # Расценки распознаны по шифрам сборников, а не по номеру строки.
+    coded_rates = [it for it in rates if it.code]
+    assert coded_rates
+    assert all(it.code.startswith(("ГЭСН", "ФЕР", "ТЕР", "ТСН")) for it in coded_rates)
+
+    # Ссылочная целостность иерархии «расценка -> ресурсы».
+    ids = {it.raw_id for it in items}
+    assert all(it.parent_id in ids for it in items if it.parent_id)
+    rate_ids = {it.raw_id for it in rates}
+    assert all(it.parent_id in rate_ids for it in items if it.parent_id)
+    # Вложенные ресурсы всегда идут после своего родителя.
+    by_id = {it.raw_id: it for it in items}
+    assert all(
+        it.pointer.row_idx > by_id[it.parent_id].pointer.row_idx
+        for it in items
+        if it.parent_id
+    )
+
+    # Итоги верхнего уровня заполнены, а их сумма совпадает с итогом сметы.
+    top_level = [it for it in items if it.parent_id is None]
+    assert all(it.total_cost is not None for it in top_level)
+    assert sum(it.total_cost for it in top_level) > 0
+
+    # Секции формы 4б не теряются при переходе между страницами.
+    sections = {it.context_section for it in rates}
+    assert "Раздел: 1 Кровля" in sections
+

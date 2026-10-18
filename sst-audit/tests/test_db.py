@@ -7,9 +7,12 @@ import sqlite3
 import pytest
 
 from db import (
+    SCHEMA_SQL,
     create_session,
     get_connection,
     get_pending_reviews,
+    get_rule_evaluations,
+    get_smeta_items_map,
     init_db,
     record_expert_review,
     save_matches,
@@ -20,6 +23,7 @@ from db import (
     update_match_link,
     update_session_status,
 )
+from models import RuleEvaluation
 
 SESSION_ID = "session-001"
 
@@ -53,7 +57,11 @@ def _first_id(connection: sqlite3.Connection, table: str) -> int:
     return int(row["id"])
 
 
-def _seed_full_chain(connection: sqlite3.Connection) -> int:
+def _seed_full_chain(
+    connection: sqlite3.Connection,
+    *,
+    with_rule_evaluation: bool = True,
+) -> int:
     """Создает цепочку session -> items -> match -> rule_evaluation -> review."""
     create_session(connection, SESSION_ID, "ЖК Север", "rd.pdf", "smeta.xlsx")
     save_rd_items(
@@ -102,14 +110,20 @@ def _seed_full_chain(connection: sqlite3.Connection) -> int:
     )
 
     match_id = _first_id(connection, "match_records")
-    connection.execute(
-        """
-        INSERT INTO rule_evaluations
-            (match_record_id, rule_name, is_violation, delta_volume, delta_cost, message)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (match_id, "UNIT_MULTIPLIER", 1, 5.0, 12500.0, "Расхождение кратности"),
-    )
+    if with_rule_evaluation:
+        save_rule_evaluations(
+            connection,
+            [
+                {
+                    "match_record_id": match_id,
+                    "rule_name": "UNIT_MULTIPLIER",
+                    "is_violation": True,
+                    "delta_volume": Decimal("5.0"),
+                    "delta_cost": Decimal("12500.0"),
+                    "message": "Расхождение кратности",
+                }
+            ],
+        )
     record_expert_review(
         connection,
         match_id,
@@ -405,3 +419,206 @@ def test_init_db_migrates_legacy_sessions_table(tmp_path) -> None:
         assert row["smeta_sheet"] is None
     finally:
         connection.close()
+
+
+def test_save_and_retrieve_rule_evaluations(conn: sqlite3.Connection) -> None:
+    """Батч RuleEvaluation пишется и читается с точным Decimal-весом."""
+    match_id = _seed_full_chain(conn, with_rule_evaluation=False)
+
+    saved = save_rule_evaluations(
+        conn,
+        [
+            RuleEvaluation(
+                session_id=SESSION_ID,
+                match_record_id=match_id,
+                rule_code="UNIT_MULTIPLIER",
+                status="FAILED",
+                details="Кратность 10 вместо 15",
+                score_weight=Decimal("0.35"),
+            ),
+            RuleEvaluation(
+                session_id=SESSION_ID,
+                match_record_id=match_id,
+                rule_code="COST_DELTA",
+                status="PASSED",
+                score_weight=Decimal("0.65000000000000000001"),
+            ),
+        ],
+    )
+    assert saved == 2
+
+    rows = get_rule_evaluations(conn, SESSION_ID, match_record_id=match_id)
+    assert [row.rule_code for row in rows] == ["UNIT_MULTIPLIER", "COST_DELTA"]
+    assert all(isinstance(row, RuleEvaluation) for row in rows)
+    assert rows[0].status == "FAILED"
+    assert rows[0].details == "Кратность 10 вместо 15"
+    # Точность веса не теряется: в колонке TEXT лежит str(Decimal).
+    assert rows[1].score_weight == Decimal("0.65000000000000000001")
+    assert str(rows[1].score_weight) == "0.65000000000000000001"
+    assert rows[1].score_weight is not None
+    assert rows[0].created_at
+
+    assert get_rule_evaluations(conn, SESSION_ID, match_record_id=match_id + 1) == []
+    assert get_rule_evaluations(conn, "missing-session") == []
+
+
+def test_save_empty_rule_evaluations_is_noop(conn: sqlite3.Connection) -> None:
+    """Пустой батч не открывает транзакцию и не создает строк."""
+    create_session(conn, SESSION_ID, "Проект", "rd.pdf", "smeta.xlsx")
+
+    assert save_rule_evaluations(conn, []) == 0
+    assert get_rule_evaluations(conn, SESSION_ID) == []
+
+
+def test_rule_evaluations_batch_rollback_on_error(conn: sqlite3.Connection) -> None:
+    """Ошибка FK в середине батча откатывает все уже вставленные предикаты."""
+    match_id = _seed_full_chain(conn, with_rule_evaluation=False)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        save_rule_evaluations(
+            conn,
+            [
+                RuleEvaluation(
+                    session_id=SESSION_ID,
+                    match_record_id=match_id,
+                    rule_code="VALID_RULE",
+                    status="PASSED",
+                ),
+                RuleEvaluation(
+                    session_id=SESSION_ID,
+                    match_record_id=999_999,
+                    rule_code="BROKEN_FK",
+                    status="FAILED",
+                ),
+            ],
+        )
+
+    assert get_rule_evaluations(conn, SESSION_ID) == []
+
+
+def test_get_smeta_items_map_exposes_parent_hierarchy(
+    conn: sqlite3.Connection,
+) -> None:
+    """Карта сметных строк отдает Decimal-поля и parent_id без N+1."""
+    create_session(conn, SESSION_ID, "Проект", "rd.pdf", "smeta.xlsx")
+    save_smeta_items(
+        conn,
+        SESSION_ID,
+        [
+            {
+                "row_idx": 10,
+                "code": "01-01-001",
+                "description": "Раздел: земляные работы",
+                "unit": "шт",
+                "quantity": Decimal("1"),
+                "unit_price": Decimal("0"),
+                "total_cost": Decimal("0"),
+            }
+        ],
+    )
+    parent_id = _first_id(conn, "smeta_items")
+    save_smeta_items(
+        conn,
+        SESSION_ID,
+        [
+            {
+                "row_idx": 11,
+                "code": "01-01-001-01",
+                "description": "Разработка грунта",
+                "unit": "100 м3",
+                "quantity": Decimal("15.0"),
+                "unit_price": Decimal("100.5"),
+                "total_cost": Decimal("1507.50"),
+                "parent_id": parent_id,
+                "raw_payload": {"coordinate": "E11"},
+            }
+        ],
+    )
+
+    items = get_smeta_items_map(conn, SESSION_ID)
+    assert len(items) == 2
+
+    parent = items[parent_id]
+    assert parent.parent_id is None
+    assert parent.quantity == Decimal("1")
+
+    child = next(item for item in items.values() if item.parent_id == parent_id)
+    assert child.code == "01-01-001-01"
+    assert child.quantity == Decimal("15.0")
+    assert child.total_cost == Decimal("1507.50")
+    assert child.raw_payload == {"coordinate": "E11"}
+    assert get_smeta_items_map(conn, "missing-session") == {}
+
+
+def test_init_db_migrates_legacy_rule_evaluations_and_parent_id(
+    tmp_path,
+) -> None:
+    """Устаревшая схема предикатов и сметы обновляется идемпотентно."""
+    connection = get_connection(tmp_path / "legacy-rules.db")
+    try:
+        connection.executescript(SCHEMA_SQL)
+        # Откатываем схему к состоянию до появления иерархии и rule_code.
+        connection.executescript(
+            """
+            DROP TABLE smeta_items;
+            CREATE TABLE smeta_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                row_idx INTEGER,
+                code TEXT NOT NULL,
+                description TEXT NOT NULL,
+                unit TEXT NOT NULL,
+                quantity REAL NOT NULL,
+                unit_price REAL NOT NULL,
+                total_cost REAL NOT NULL,
+                raw_payload JSON
+            );
+            CREATE TABLE rule_evaluations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_record_id INTEGER REFERENCES match_records(id) ON DELETE CASCADE,
+                rule_name TEXT NOT NULL,
+                is_violation INTEGER,
+                delta_volume REAL,
+                delta_cost REAL,
+                message TEXT
+            );
+            INSERT INTO sessions (id, project_name, rd_filename, smeta_filename)
+            VALUES ('legacy', 'Старый проект', 'rd.pdf', 'smeta.xlsx');
+            INSERT INTO match_records (session_id, confidence_score, match_method)
+            VALUES ('legacy', 80, 'FUZZY_CASCADE');
+            INSERT INTO rule_evaluations
+                (match_record_id, rule_name, is_violation, message)
+            VALUES (
+                (SELECT id FROM match_records LIMIT 1),
+                'UNIT_MULTIPLIER', 1, 'Расхождение кратности'
+            );
+            """
+        )
+        connection.commit()
+
+        init_db(connection)
+        init_db(connection)
+
+        rule_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(rule_evaluations)")
+        }
+        assert {"session_id", "rule_code", "status", "score_weight"} <= rule_columns
+        assert "rule_name" not in rule_columns
+
+        migrated = get_rule_evaluations(connection, "legacy")
+        assert len(migrated) == 1
+        assert migrated[0].rule_code == "UNIT_MULTIPLIER"
+        assert migrated[0].status == "FAILED"
+        assert migrated[0].details == "Расхождение кратности"
+        assert migrated[0].score_weight == Decimal("0.0")
+
+        smeta_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(smeta_items)")
+        }
+        assert "parent_id" in smeta_columns
+    finally:
+        connection.close()
+
+

@@ -259,8 +259,8 @@ def test_full_pipeline_persists_all_entities(conn: sqlite3.Connection) -> None:
     assert statuses == {"AUTO", "HITL_PENDING"}
 
     rules = {
-        row["rule_name"]
-        for row in conn.execute("SELECT rule_name FROM rule_evaluations")
+        row["rule_code"]
+        for row in conn.execute("SELECT rule_code FROM rule_evaluations")
     }
     assert "RD_NOT_IN_SMETA" in rules
     assert "VOLUME_WITHIN_TOLERANCE" in rules
@@ -390,11 +390,12 @@ def test_pipeline_handles_empty_rd_gracefully(conn: sqlite3.Connection) -> None:
     assert match["confidence_score"] == 0
 
     rule = conn.execute(
-        "SELECT rule_name FROM rule_evaluations WHERE match_record_id = ?",
+        "SELECT rule_code, status FROM rule_evaluations WHERE match_record_id = ?",
         (match["id"],),
     ).fetchone()
     assert rule is not None
-    assert rule["rule_name"] == "SMETA_NOT_IN_RD"
+    assert rule["rule_code"] == "SMETA_NOT_IN_RD"
+    assert rule["status"] == "FAILED"
 
 
 def test_audit_export_view_stitches_rows(conn: sqlite3.Connection) -> None:
@@ -666,10 +667,11 @@ def test_interactive_hitl_updates_link_and_rules(
         (match["id"],),
     ).fetchone()
     assert rule is not None
-    assert rule["rule_name"] == "VOLUME_DELTA_SUSPECT"
-    assert rule["is_violation"] == 1
+    assert rule["rule_code"] == "VOLUME_DELTA_SUSPECT"
+    assert rule["status"] == "FAILED"
     # Дельта рассчитана по выбранному кандидату (20 x 1.06), а не по первому.
-    assert rule["delta_volume"] == pytest.approx(-11.2)
+    details = json.loads(rule["details"])
+    assert Decimal(details["delta_volume"]) == Decimal("-11.2")
 
 
 def test_batch_pipeline_headless(

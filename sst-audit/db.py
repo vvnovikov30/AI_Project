@@ -26,6 +26,8 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Final, TypeAlias
 
+from models import RULE_EVALUATION_STATUSES, RuleEvaluation, SmetaItem
+
 DEFAULT_DB_PATH: Final[str] = "sst_audit.db"
 DEFAULT_CONVERSION_RATIO: Final[Decimal] = Decimal("1.0")
 
@@ -34,12 +36,16 @@ VALID_SESSION_STATUSES: Final[frozenset[str]] = frozenset(
 )
 VALID_MATCH_STATUSES: Final[frozenset[str]] = frozenset({"AUTO", "HITL_PENDING", "RESOLVED"})
 VALID_REVIEW_DECISIONS: Final[frozenset[str]] = frozenset({"APPROVED", "REJECTED", "ADJUSTED"})
+VALID_RULE_STATUSES: Final[frozenset[str]] = RULE_EVALUATION_STATUSES
 
 # Счетчик уникальных имен SAVEPOINT для вложенных транзакций.
 _SAVEPOINT_SEQ: Iterator[int] = count(1)
 
 # Тип значения, которое sqlite3 способен принять без дополнительных адаптеров.
-SQLNumber: TypeAlias = int | float | str | None
+SQLNumber: TypeAlias = int | str | None
+
+# Вход батча предикатов: типизированная модель либо legacy-словарь main.py.
+RuleEvaluationInput: TypeAlias = RuleEvaluation | Mapping[str, Any]
 
 SCHEMA_SQL: Final[str] = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -73,6 +79,7 @@ CREATE TABLE IF NOT EXISTS smeta_items (
     quantity REAL NOT NULL,
     unit_price REAL NOT NULL,
     total_cost REAL NOT NULL,
+    parent_id INTEGER,
     raw_payload JSON
 );
 
@@ -85,16 +92,6 @@ CREATE TABLE IF NOT EXISTS match_records (
     conversion_ratio REAL DEFAULT 1.0,
     match_method TEXT NOT NULL,
     status TEXT DEFAULT 'AUTO' CHECK (status IN ('AUTO', 'HITL_PENDING', 'RESOLVED'))
-);
-
-CREATE TABLE IF NOT EXISTS rule_evaluations (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    match_record_id INTEGER NOT NULL REFERENCES match_records(id) ON DELETE CASCADE,
-    rule_name TEXT NOT NULL,
-    is_violation BOOLEAN NOT NULL,
-    delta_volume REAL,
-    delta_cost REAL,
-    message TEXT
 );
 
 CREATE TABLE IF NOT EXISTS expert_reviews (
@@ -111,7 +108,6 @@ CREATE TABLE IF NOT EXISTS expert_reviews (
 CREATE INDEX IF NOT EXISTS idx_rd_items_session ON rd_items(session_id);
 CREATE INDEX IF NOT EXISTS idx_smeta_items_session ON smeta_items(session_id);
 CREATE INDEX IF NOT EXISTS idx_match_records_session_status ON match_records(session_id, status);
-CREATE INDEX IF NOT EXISTS idx_rule_evaluations_match ON rule_evaluations(match_record_id);
 CREATE INDEX IF NOT EXISTS idx_expert_reviews_match ON expert_reviews(match_record_id);
 
 CREATE VIEW IF NOT EXISTS v_audit_export AS
@@ -183,6 +179,35 @@ ORDER BY m.id ASC
 """
 
 
+# DDL предикатов аудита вынесен из общего SCHEMA_SQL: на устаревших БД
+# таблица сначала пересобирается миграцией, и только затем создаются индексы.
+RULE_EVALUATIONS_TABLE_SQL: Final[str] = """
+CREATE TABLE IF NOT EXISTS rule_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    match_record_id INTEGER REFERENCES match_records(id) ON DELETE CASCADE,
+    rule_code TEXT NOT NULL,
+    status TEXT NOT NULL,
+    details TEXT,
+    score_weight TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+RULE_EVALUATIONS_SQL: Final[str] = (
+    RULE_EVALUATIONS_TABLE_SQL
+    + """
+CREATE INDEX IF NOT EXISTS idx_rule_evaluations_match ON rule_evaluations(match_record_id);
+CREATE INDEX IF NOT EXISTS idx_rule_eval_lookup ON rule_evaluations(session_id, match_record_id);
+"""
+)
+
+# Индексы, зависящие от колонок, которые добавляются миграциями.
+POST_MIGRATION_INDEXES_SQL: Final[str] = """
+CREATE INDEX IF NOT EXISTS idx_smeta_items_parent ON smeta_items(session_id, parent_id);
+"""
+
+
 # ----------------------------------------------------------------------
 # 1. Соединения, транзакции и инициализация схемы
 # ----------------------------------------------------------------------
@@ -194,7 +219,7 @@ def get_connection(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     :param db_path: путь к файлу БД либо ``":memory:"`` для тестового контура.
     :return: соединение с ``row_factory = sqlite3.Row`` и включенными FK.
     """
-    connection = sqlite3.connect(str(db_path), timeout=10.0)
+    connection = sqlite3.connect(str(db_path), timeout=10)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
@@ -233,13 +258,60 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         raise
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Возвращает набор имен колонок существующей таблицы (пусто, если нет)."""
+    return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
 def _migrate_sessions_schema(conn: sqlite3.Connection) -> None:
     """Добавляет новые колонки в уже существующую БД без потери данных."""
-    columns = {
-        str(row["name"]) for row in conn.execute("PRAGMA table_info(sessions)")
-    }
-    if "smeta_sheet" not in columns:
+    if "smeta_sheet" not in _table_columns(conn, "sessions"):
         conn.execute("ALTER TABLE sessions ADD COLUMN smeta_sheet TEXT")
+
+
+def _migrate_smeta_items_schema(conn: sqlite3.Connection) -> None:
+    """Добавляет колонку иерархии ``parent_id`` в устаревшие сметы."""
+    columns = _table_columns(conn, "smeta_items")
+    if columns and "parent_id" not in columns:
+        conn.execute("ALTER TABLE smeta_items ADD COLUMN parent_id INTEGER")
+
+
+def _migrate_rule_evaluations_schema(conn: sqlite3.Connection) -> None:
+    """Пересобирает legacy-таблицу предикатов под схему ``rule_code``/``status``.
+
+    Старая схема (``rule_name``/``is_violation``/``delta_volume``) не совместима
+    с моделью ``RuleEvaluation``. Данные переносятся в новую таблицу с
+    привязкой к сессии через ``match_records``; ``score_weight`` остается
+    ``NULL`` (вес правил на момент старой схемы не рассчитывался).
+    """
+    columns = _table_columns(conn, "rule_evaluations")
+    if not columns or {"session_id", "rule_code", "status", "score_weight"} <= columns:
+        return
+
+    legacy_table = "rule_evaluations_legacy"
+    conn.execute(f"DROP TABLE IF EXISTS {legacy_table}")
+    conn.execute(f"ALTER TABLE rule_evaluations RENAME TO {legacy_table}")
+    conn.executescript(RULE_EVALUATIONS_TABLE_SQL)
+
+    legacy_columns = _table_columns(conn, legacy_table)
+    if {"match_record_id", "rule_name", "is_violation"} <= legacy_columns:
+        conn.execute(
+            """
+            INSERT INTO rule_evaluations
+                (session_id, match_record_id, rule_code, status, details, score_weight)
+            SELECT
+                m.session_id,
+                legacy.match_record_id,
+                legacy.rule_name,
+                CASE WHEN legacy.is_violation THEN 'FAILED' ELSE 'PASSED' END,
+                legacy.message,
+                NULL
+            FROM rule_evaluations_legacy AS legacy
+            JOIN match_records AS m ON m.id = legacy.match_record_id
+            """
+        )
+
+    conn.execute(f"DROP TABLE {legacy_table}")
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -248,6 +320,11 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA_SQL)
     _migrate_sessions_schema(conn)
+    _migrate_smeta_items_schema(conn)
+    _migrate_rule_evaluations_schema(conn)
+    # Индексы по колонкам, которые могли быть добавлены миграциями.
+    conn.executescript(RULE_EVALUATIONS_SQL)
+    conn.executescript(POST_MIGRATION_INDEXES_SQL)
     conn.commit()
 
 
@@ -256,17 +333,67 @@ def init_db(conn: sqlite3.Connection) -> None:
 # ----------------------------------------------------------------------
 
 
-def _to_sql_number(value: Decimal | int | float | str | None) -> SQLNumber:
+def _to_sql_number(value: object) -> SQLNumber:
     """Приводит значение ядра к типу, нативно принимаемому sqlite3.
 
     SQLite не имеет встроенного адаптера ``Decimal``, поэтому конвертация
-    выполняется только здесь — на границе записи в REAL-колонки.
+    выполняется только здесь — на границе записи в REAL-колонки. ``Decimal``
+    передается строкой: REAL-аффинити колонки SQLite приводят ее к числу без
+    промежуточного Python-float и связанной с ним потери точности.
     """
-    if isinstance(value, Decimal):
-        return float(value)
+    if value is None:
+        return None
     if isinstance(value, bool):
         return int(value)
-    return value
+    if isinstance(value, (int, str)):
+        return value
+    if isinstance(value, Decimal):
+        return str(value)
+    return str(value)
+
+
+def _to_decimal(value: object, default: Decimal = Decimal("0")) -> Decimal:
+    """Приводит значение из SQLite (REAL/TEXT) обратно к ``Decimal``."""
+    if value is None:
+        return default
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, bool):
+        return Decimal(int(value))
+    return Decimal(str(value).strip())
+
+
+def _to_optional_int(value: object) -> int | None:
+    """Приводит ``parent_id``/идентификатор к ``int`` либо ``None``."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"Ожидалось целое число, получено bool: {value!r}")
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise ValueError(f"Ожидалось целое число: {value!r}") from exc
+
+
+def _deserialize_payload(payload: object) -> dict[str, Any] | None:
+    """Разбирает JSON-колонку ``raw_payload`` в словарь аудиторского следа."""
+    if payload is None:
+        return None
+    if isinstance(payload, Mapping):
+        return dict(payload)
+    text = str(payload)
+    try:
+        decoded = json.loads(text)
+    except (TypeError, ValueError):
+        return {"raw": text}
+    if isinstance(decoded, Mapping):
+        return dict(decoded)
+    return {"value": decoded}
 
 
 def _serialize_payload(payload: object) -> str | None:
@@ -370,6 +497,7 @@ def save_smeta_items(
             _to_sql_number(_require(item, "quantity")),
             _to_sql_number(_require(item, "unit_price")),
             _to_sql_number(_require(item, "total_cost")),
+            _to_optional_int(item.get("parent_id")),
             _serialize_payload(item.get("raw_payload")),
         )
         for item in items
@@ -380,8 +508,8 @@ def save_smeta_items(
             """
             INSERT INTO smeta_items
                 (session_id, row_idx, code, description, unit,
-                 quantity, unit_price, total_cost, raw_payload)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 quantity, unit_price, total_cost, parent_id, raw_payload)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -455,39 +583,180 @@ def get_match_records(
     return list(cursor.fetchall())
 
 
-def save_rule_evaluations(
+def _load_session_ids_for_matches(
     conn: sqlite3.Connection,
-    evaluations: Sequence[Mapping[str, Any]],
-) -> int:
-    """Сохраняет результаты проверки правил. Возвращает число строк.
+    match_ids: Sequence[int | None],
+) -> dict[int, str]:
+    """Разрешает ``match_record_id -> session_id`` одним запросом (без N+1)."""
+    unique_ids = sorted({int(match_id) for match_id in match_ids if match_id is not None})
+    if not unique_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in unique_ids)
+    rows = conn.execute(
+        f"SELECT id, session_id FROM match_records WHERE id IN ({placeholders})",
+        unique_ids,
+    )
+    return {int(row["id"]): str(row["session_id"]) for row in rows}
 
-    Обязательные поля записи: ``match_record_id``, ``rule_name``,
-    ``is_violation``. Поля ``delta_volume``/``delta_cost`` и ``message``
-    опциональны; ``Decimal`` конвертируется на границе персистентности.
+
+def _legacy_rule_details(evaluation: Mapping[str, Any]) -> str | None:
+    """Формирует ``details`` для legacy-словаря main.py.
+
+    Если переданы числовые дельты (``delta_volume``/``delta_cost``), они
+    сохраняются в JSON строковыми значениями, чтобы не потерять точность
+    ``Decimal`` в TEXT-колонке.
     """
-    if not evaluations:
-        return 0
+    details = evaluation.get("details")
+    if details is not None:
+        return str(details)
 
-    rows = []
-    for evaluation in evaluations:
-        rule_name = _require(evaluation, "rule_name")
-        if not isinstance(rule_name, str) or not rule_name.strip():
+    message = evaluation.get("message")
+    delta_volume = evaluation.get("delta_volume")
+    delta_cost = evaluation.get("delta_cost")
+    if delta_volume is None and delta_cost is None:
+        return None if message is None else str(message)
+
+    payload: dict[str, str] = {}
+    if message is not None:
+        payload["message"] = str(message)
+    if delta_volume is not None:
+        payload["delta_volume"] = str(_to_decimal(delta_volume))
+    if delta_cost is not None:
+        payload["delta_cost"] = str(_to_decimal(delta_cost))
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+
+def _coerce_rule_evaluation(
+    evaluation: RuleEvaluationInput,
+    session_by_match: Mapping[int, str],
+) -> RuleEvaluation:
+    """Приводит вход батча (модель либо legacy-словарь) к ``RuleEvaluation``."""
+    if isinstance(evaluation, RuleEvaluation):
+        if evaluation.session_id.strip():
+            return evaluation
+        if evaluation.match_record_id is None:
             raise ValueError(
-                f"Поле 'rule_name' должно быть непустой строкой: {rule_name!r}"
+                "Не удалось определить session_id: укажите session_id или match_record_id"
             )
-        is_violation = _require(evaluation, "is_violation")
+        session_id = session_by_match.get(int(evaluation.match_record_id))
+        if session_id is None:
+            raise ValueError(
+                f"Не найдена сессия для match_record_id={evaluation.match_record_id}"
+            )
+        return RuleEvaluation(
+            session_id=session_id,
+            rule_code=evaluation.rule_code,
+            status=evaluation.status,
+            id=evaluation.id,
+            match_record_id=evaluation.match_record_id,
+            details=evaluation.details,
+            score_weight=evaluation.score_weight,
+            created_at=evaluation.created_at,
+        )
+
+    match_record_id = _to_optional_int(evaluation.get("match_record_id"))
+
+    rule_code = evaluation.get("rule_code") or evaluation.get("rule_name")
+    if not isinstance(rule_code, str) or not rule_code.strip():
+        raise ValueError(
+            "Поле 'rule_code' (legacy: 'rule_name') должно быть "
+            f"непустой строкой: {rule_code!r}"
+        )
+
+    raw_status = evaluation.get("status")
+    if raw_status is None:
+        is_violation = evaluation.get("is_violation", False)
         if not isinstance(is_violation, (bool, int)):
             raise ValueError(
                 f"Поле 'is_violation' должно быть bool/int: {is_violation!r}"
             )
+        raw_status = "FAILED" if bool(is_violation) else "PASSED"
+    status = str(raw_status)
+    if status not in VALID_RULE_STATUSES:
+        raise ValueError(
+            f"Недопустимый статус правила '{status}'. "
+            f"Разрешены: {sorted(VALID_RULE_STATUSES)}"
+        )
+
+    session_id = evaluation.get("session_id")
+    if session_id is None:
+        if match_record_id is None:
+            raise ValueError(
+                "Не удалось определить session_id: укажите session_id или match_record_id"
+            )
+        session_id = session_by_match.get(match_record_id)
+        if session_id is None:
+            raise ValueError(
+                f"Не найдена сессия для match_record_id={match_record_id}"
+            )
+    session_id_text = str(session_id).strip()
+
+    raw_weight = evaluation.get("score_weight", Decimal("0"))
+    if isinstance(raw_weight, bool) or raw_weight is None:
+        raise TypeError("score_weight должен быть Decimal")
+    if isinstance(raw_weight, Decimal):
+        score_weight = raw_weight
+    elif isinstance(raw_weight, (int, str)):
+        score_weight = _to_decimal(raw_weight)
+    else:
+        raise TypeError(
+            "score_weight должен быть Decimal: иные числовые типы запрещены"
+        )
+
+    created_at = evaluation.get("created_at")
+    return RuleEvaluation(
+        session_id=session_id_text,
+        rule_code=rule_code.strip(),
+        status=status,
+        match_record_id=match_record_id,
+        details=_legacy_rule_details(evaluation),
+        score_weight=score_weight,
+        created_at=None if created_at is None else str(created_at),
+    )
+
+
+def save_rule_evaluations(
+    conn: sqlite3.Connection,
+    evaluations: Sequence[RuleEvaluationInput],
+) -> int:
+    """Батчево сохраняет предикаты аудита в ``rule_evaluations``.
+
+    :param evaluations: модели ``RuleEvaluation`` (основной путь) либо
+        legacy-словари main.py с ключами ``rule_name``/``is_violation``/
+        ``message``/``delta_volume``/``delta_cost``.
+    :return: количество вставленных строк.
+    :raises ValueError: некорректный код правила/статус/неразрешимая сессия.
+    :raises sqlite3.IntegrityError: нарушение FK (транзакция откатывается).
+
+    ``score_weight`` записывается как ``str(Decimal)``, поэтому точность
+    сохраняется полностью (колонка TEXT).
+    """
+    if not evaluations:
+        return 0
+
+    match_ids = [
+        item.match_record_id
+        if isinstance(item, RuleEvaluation)
+        else _to_optional_int(item.get("match_record_id"))
+        for item in evaluations
+    ]
+    session_by_match = _load_session_ids_for_matches(conn, match_ids)
+
+    rows: list[
+        tuple[str, int | None, str, str, str | None, str, str | None]
+    ] = []
+    for evaluation in evaluations:
+        normalized = _coerce_rule_evaluation(evaluation, session_by_match)
         rows.append(
             (
-                _require(evaluation, "match_record_id"),
-                rule_name,
-                int(bool(is_violation)),
-                _to_sql_number(evaluation.get("delta_volume")),
-                _to_sql_number(evaluation.get("delta_cost")),
-                evaluation.get("message"),
+                normalized.session_id,
+                normalized.match_record_id,
+                normalized.rule_code,
+                normalized.status,
+                normalized.details,
+                str(normalized.score_weight),
+                normalized.created_at,
             )
         )
 
@@ -495,13 +764,98 @@ def save_rule_evaluations(
         conn.executemany(
             """
             INSERT INTO rule_evaluations
-                (match_record_id, rule_name, is_violation,
-                 delta_volume, delta_cost, message)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (session_id, match_record_id, rule_code, status, details,
+                 score_weight, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
             """,
             rows,
         )
     return len(rows)
+
+
+def get_rule_evaluations(
+    conn: sqlite3.Connection,
+    session_id: str,
+    match_record_id: int | None = None,
+) -> list[RuleEvaluation]:
+    """Читает предикаты сессии (опционально — только по одной связи).
+
+    ``score_weight`` конвертируется обратно в ``Decimal`` без промежуточного
+    float: колонка хранит точную строку ``str(Decimal)``.
+    """
+    sql = (
+        "SELECT id, session_id, match_record_id, rule_code, status, details, "
+        "score_weight, created_at FROM rule_evaluations WHERE session_id = ?"
+    )
+    params: list[Any] = [session_id]
+    if match_record_id is not None:
+        sql += " AND match_record_id = ?"
+        params.append(match_record_id)
+    sql += " ORDER BY id ASC"
+
+    evaluations: list[RuleEvaluation] = []
+    for row in conn.execute(sql, params).fetchall():
+        raw_weight = row["score_weight"]
+        evaluations.append(
+            RuleEvaluation(
+                session_id=str(row["session_id"]),
+                rule_code=str(row["rule_code"]),
+                status=str(row["status"]),
+                id=int(row["id"]),
+                match_record_id=(
+                    None
+                    if row["match_record_id"] is None
+                    else int(row["match_record_id"])
+                ),
+                details=None if row["details"] is None else str(row["details"]),
+                score_weight=(
+                    Decimal("0.0") if raw_weight is None else _to_decimal(raw_weight)
+                ),
+                created_at=(
+                    None if row["created_at"] is None else str(row["created_at"])
+                ),
+            )
+        )
+    return evaluations
+
+
+def get_smeta_items_map(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> dict[int, SmetaItem]:
+    """Загружает все сметные строки сессии в словарь ``{item.id: item}``.
+
+    Словарь позволяет матчеру получать родительскую работу по ``item.parent_id``
+    за O(1) без N+1 запросов.
+    """
+    cursor = conn.execute(
+        """
+        SELECT id, session_id, row_idx, code, description, unit,
+               quantity, unit_price, total_cost, parent_id, raw_payload
+        FROM smeta_items
+        WHERE session_id = ?
+        ORDER BY id ASC
+        """,
+        (session_id,),
+    )
+
+    items: dict[int, SmetaItem] = {}
+    for row in cursor.fetchall():
+        item_id = int(row["id"])
+        items[item_id] = SmetaItem(
+            id=item_id,
+            session_id=str(row["session_id"]),
+            code=str(row["code"]),
+            description=str(row["description"]),
+            unit=str(row["unit"]),
+            quantity=_to_decimal(row["quantity"]),
+            unit_price=_to_decimal(row["unit_price"]),
+            total_cost=_to_decimal(row["total_cost"]),
+            row_idx=None if row["row_idx"] is None else int(row["row_idx"]),
+            parent_id=None if row["parent_id"] is None else int(row["parent_id"]),
+            raw_payload=_deserialize_payload(row["raw_payload"]),
+        )
+    return items
 
 
 def update_session_status(

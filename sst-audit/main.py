@@ -36,7 +36,7 @@ import exporter
 from evaluator import DiscrepancyDetector
 from matcher import CascadeMatcher
 from models import CollisionSeverity, NormalizedItem
-from parsers import LSRParser, PDFSpecParser
+from parsers import LSRParser, PDFLSRParser, PDFSpecParser
 
 # Жесткий порог отсечки семантического шума (шкала матчера 0-100).
 # Ниже него позиция сметы считается отсутствующей в РД и не попадает в HITL.
@@ -242,6 +242,17 @@ def build_rule_evaluations(
             f"записей match_records ({len(match_ids)})"
         )
 
+    # Родительские расценки, покрытые сопоставленными дочерними ресурсами:
+    # для них правило SMETA_NOT_IN_RD не применяется.
+    covered_parents: set[str] = {
+        str(decision.smeta_item.parent_id)
+        for decision in decisions
+        if decision.rd_item is not None
+        and decision.smeta_item is not None
+        and decision.smeta_item.is_resource
+        and decision.smeta_item.parent_id
+    }
+
     evaluations: list[dict[str, Any]] = []
     for decision, match_id in zip(decisions, match_ids):
         if decision.smeta_item is not None and decision.rd_item is not None:
@@ -272,16 +283,31 @@ def build_rule_evaluations(
                 }
             )
         elif decision.smeta_item is not None:
-            evaluations.append(
-                {
-                    "match_record_id": match_id,
-                    "rule_name": "SMETA_NOT_IN_RD",
-                    "is_violation": True,
-                    "delta_volume": -decision.smeta_item.volume,
-                    "delta_cost": None,
-                    "message": "Позиция сметы не подтверждена РД",
-                }
-            )
+            if str(decision.smeta_item.raw_id) in covered_parents:
+                evaluations.append(
+                    {
+                        "match_record_id": match_id,
+                        "rule_name": "SMETA_PARENT_COVERED",
+                        "is_violation": False,
+                        "delta_volume": Decimal("0"),
+                        "delta_cost": None,
+                        "message": (
+                            "Расценка покрыта сопоставленным дочерним "
+                            "ресурсом узла сметы"
+                        ),
+                    }
+                )
+            else:
+                evaluations.append(
+                    {
+                        "match_record_id": match_id,
+                        "rule_name": "SMETA_NOT_IN_RD",
+                        "is_violation": True,
+                        "delta_volume": -decision.smeta_item.volume,
+                        "delta_cost": None,
+                        "message": "Позиция сметы не подтверждена РД",
+                    }
+                )
     return evaluations
 
 
@@ -332,6 +358,29 @@ def _decisions_from_match_rows(
     return decisions
 
 
+def _parse_smeta_items(
+    smeta_path: str, smeta_sheet: Optional[str]
+) -> Sequence[NormalizedItem]:
+    """Парсит сметный документ в зависимости от формата файла.
+
+    Поддерживаются два формата: XLSX-ЛСР (``LSRParser``) и PDF-смета
+    по форме 4б (``PDFLSRParser``).
+
+    :param smeta_path: путь к файлу сметы.
+    :param smeta_sheet: имя листа XLSX; для PDF не используется.
+    :return: список нормализованных позиций сметы.
+    :raises ValueError: если для PDF-сметы передан ``smeta_sheet``.
+    """
+    if Path(smeta_path).suffix.lower() == ".pdf":
+        if smeta_sheet is not None:
+            raise ValueError("Для PDF-сметы параметр smeta_sheet не применяется")
+        return PDFLSRParser(smeta_path).parse()
+    smeta_parser = LSRParser(smeta_path)
+    if smeta_sheet is None:
+        return smeta_parser.parse()
+    return smeta_parser.parse(sheet_name=smeta_sheet)
+
+
 def run_pipeline(
     conn: sqlite3.Connection,
     config: SessionConfig,
@@ -356,11 +405,7 @@ def run_pipeline(
     if rd_items is None:
         rd_items = PDFSpecParser(config.rd_path).extract_items()
     if smeta_items is None:
-        smeta_parser = LSRParser(config.smeta_path)
-        if config.smeta_sheet is None:
-            smeta_items = smeta_parser.parse()
-        else:
-            smeta_items = smeta_parser.parse(sheet_name=config.smeta_sheet)
+        smeta_items = _parse_smeta_items(config.smeta_path, config.smeta_sheet)
 
     rd_items = list(rd_items)
     smeta_items = list(smeta_items)
@@ -707,12 +752,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--smeta",
         required=True,
-        help="Путь к локальной смете (.xlsx)",
+        help="Путь к локальной смете (.xlsx или .pdf формы 4б)",
     )
     parser.add_argument(
         "--sheet",
         default=None,
-        help="Конкретный лист сметы для точечного запуска",
+        help="Конкретный лист XLSX-сметы (для PDF не применяется)",
     )
     parser.add_argument(
         "--db",

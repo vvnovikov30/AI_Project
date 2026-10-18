@@ -1,8 +1,262 @@
 import pytest
 from decimal import Decimal
 from models import NormalizedItem, CellPointer, UnitClass
-from matcher import CascadeMatcher
+from matcher import CascadeMatcher, CompositeMatcher
 from normalizer import UnitNormalizer
+
+
+def _node(
+    raw_id: str,
+    title: str,
+    unit: UnitClass,
+    volume: str,
+    raw_unit: str,
+    code=None,
+    is_resource: bool = False,
+    parent_id=None,
+) -> NormalizedItem:
+    """Сметный узел/позиция РД с полным контролем признаков ресурса."""
+    return NormalizedItem(
+        raw_id=raw_id,
+        code=code,
+        raw_title=title,
+        clean_title=title.lower(),
+        raw_unit=raw_unit,
+        canonical_unit=unit,
+        unit_multiplier=Decimal("1.0"),
+        volume=Decimal(volume),
+        dimensions={},
+        context_section="Default_Section",
+        pointer=CellPointer("LSR", "test.xlsx", "Sheet1", 1, "A", "A1"),
+        is_resource=is_resource,
+        parent_id=parent_id,
+    )
+
+
+class TestCompositeNodeMatching:
+    """Композитные узлы сметы: работа-родитель + дочерний ресурс."""
+
+    @staticmethod
+    def _parent_work() -> NormalizedItem:
+        return _node(
+            "LSR_1",
+            "Монтаж строительных конструкций",
+            UnitClass.COUNT,
+            "4",
+            "шт",
+        )
+
+    @staticmethod
+    def _child_resource() -> NormalizedItem:
+        return _node(
+            "LSR_2",
+            "Камера видеонаблюдения",
+            UnitClass.COUNT,
+            "4",
+            "шт",
+            code="RVi-1NCT4053",
+            is_resource=True,
+            parent_id="LSR_1",
+        )
+
+    def test_composite_node_equipment_matches_child_resource(self):
+        """Дочерний ресурс наследует родителя и покрывает его расценку."""
+        rd_item = _node(
+            "SPEC_1",
+            "Камера видеонаблюдения",
+            UnitClass.COUNT,
+            "4",
+            "шт",
+            code="RVI-1NCT4053",
+        )
+        records = CompositeMatcher.match_composite(
+            [rd_item], [self._parent_work(), self._child_resource()]
+        )
+
+        child_records = [
+            record
+            for record in records
+            if record.smeta_item.raw_id == "LSR_2"
+        ]
+        assert len(child_records) == 1
+        child_record = child_records[0]
+        assert child_record.parent_work_id == "LSR_1"
+        assert child_record.is_resource_covered is True
+        assert child_record.status == "AUTO"
+        assert child_record.is_auto_confirmed is True
+        assert child_record.confidence > Decimal("0.7")
+        assert child_record.confidence.as_tuple().exponent == -4
+        assert "LSR_1" in CompositeMatcher.covered_parent_ids(records)
+
+    def test_unit_gate_mismatch_blocks_auto_match(self):
+        """R05_UNT: несовместимые размерности блокируют автоподтверждение."""
+        rd_item = _node(
+            "SPEC_1",
+            "Камера видеонаблюдения",
+            UnitClass.AREA,
+            "4",
+            "м2",
+        )
+        smeta_item = _node(
+            "LSR_2",
+            "Камера видеонаблюдения",
+            UnitClass.VOLUME,
+            "4",
+            "м3",
+            is_resource=True,
+            parent_id="LSR_1",
+        )
+
+        record = CompositeMatcher.match_pair(rd_item, smeta_item)
+
+        assert record.is_unit_blocked is True
+        assert record.status == "BLOCKED"
+        assert record.is_auto_confirmed is False
+        assert record.confidence == Decimal("0.0000")
+        unit_gate = record.breakdown.get("R05_UNT")
+        assert unit_gate is not None
+        assert unit_gate.status == "FAILED"
+        assert unit_gate.score == Decimal("0")
+        assert "INCOMPATIBLE_DIMENSIONS" in unit_gate.message
+
+
+    def test_volume_deficit_blocks_composite_match(self):
+        """R_CMP_VOLUME_DEFICIT: ресурс больше работы-родителя блокирует связь."""
+        parent_work = _node(
+            "LSR_1",
+            "Монтаж строительных конструкций",
+            UnitClass.COUNT,
+            "2",
+            "шт",
+        )
+        child_resource = self._child_resource()
+        rd_item = _node(
+            "SPEC_1",
+            "Камера видеонаблюдения",
+            UnitClass.COUNT,
+            "4",
+            "шт",
+            code="RVI-1NCT4053",
+        )
+
+        record = CompositeMatcher.match_pair(rd_item, child_resource, parent_work)
+
+        volume_gate = next(
+            evaluation
+            for evaluation in record.evaluations
+            if evaluation.rule_code == "R_CMP_VOLUME_DEFICIT"
+        )
+        assert volume_gate.status == "FAILED"
+        assert volume_gate.score == Decimal("0")
+        assert record.status == "BLOCKED"
+        assert record.is_auto_confirmed is False
+        assert record.parent_work_id == "LSR_1"
+
+
+class TestRuleBreakdownConfidence:
+    """Композитная уверенность R01-R05 строго на Decimal."""
+
+    def test_rule_breakdown_confidence_strict_decimal(self):
+        """Веса в сумме 1.0000, итог квантуется до 4 знаков без float."""
+        from evaluator import PredicateEvaluator
+        from models import RuleBreakdown
+
+        rd_item = _node(
+            "SPEC_1",
+            "Камера видеонаблюдения",
+            UnitClass.COUNT,
+            "4",
+            "шт",
+        )
+        smeta_item = _node(
+            "LSR_2",
+            "Камера видеонаблюдения",
+            UnitClass.COUNT,
+            "4",
+            "шт",
+            is_resource=True,
+            parent_id="LSR_1",
+        )
+
+        breakdown = PredicateEvaluator.evaluate_pair(rd_item, smeta_item)
+
+        assert breakdown.weight_sum == Decimal("1.0000")
+        assert breakdown.calculate_total_confidence() == Decimal("1.0000")
+        assert breakdown.total_confidence == Decimal("1.0000")
+        assert breakdown.total_confidence.as_tuple().exponent == -4
+        assert breakdown.is_valid is True
+        assert breakdown.is_blocked is False
+        assert len(breakdown.rule_evaluations) == 5
+        for evaluation in breakdown.rule_evaluations:
+            assert isinstance(evaluation.weight, Decimal)
+            assert isinstance(evaluation.score, Decimal)
+            assert isinstance(evaluation.score_weight, Decimal)
+
+        # Ручная проверка взвешенной суммы без float-арифметики.
+        expected = (
+            RuleBreakdown.R01_CAT * Decimal("1")
+            + RuleBreakdown.R02_DIM * Decimal("1")
+            + RuleBreakdown.R03_STD * Decimal("1")
+            + RuleBreakdown.R04_MAT * Decimal("1")
+            + RuleBreakdown.R05_UNT * Decimal("1")
+        )
+        assert breakdown.total_confidence == expected
+
+
+class TestParentCoverage:
+    """Родительская расценка не должна попадать в SMETA_NOT_IN_RD."""
+
+    def test_parent_work_not_flagged_as_missing_when_child_matched(self):
+        """Покрытый ресурсом родитель фиксируется как SMETA_PARENT_COVERED."""
+        from main import MatchDecision, build_rule_evaluations
+
+        parent_work = _node(
+            "LSR_1",
+            "Монтаж строительных конструкций",
+            UnitClass.COUNT,
+            "4",
+            "шт",
+        )
+        child_resource = _node(
+            "LSR_2",
+            "Камера видеонаблюдения",
+            UnitClass.COUNT,
+            "4",
+            "шт",
+            is_resource=True,
+            parent_id="LSR_1",
+        )
+        rd_item = _node(
+            "SPEC_1",
+            "Камера видеонаблюдения",
+            UnitClass.COUNT,
+            "4",
+            "шт",
+        )
+
+        decisions = [
+            MatchDecision(
+                smeta_item=child_resource,
+                rd_item=rd_item,
+                confidence=Decimal("0.95"),
+                status="AUTO",
+                method="FUZZY_CASCADE",
+            ),
+            MatchDecision(
+                smeta_item=parent_work,
+                rd_item=None,
+                confidence=Decimal("0"),
+                status="AUTO",
+                method="NO_MATCH",
+            ),
+        ]
+
+        evaluations = build_rule_evaluations(decisions, [1, 2])
+
+        assert len(evaluations) == 2
+        assert evaluations[0]["rule_name"] != "SMETA_NOT_IN_RD"
+        assert evaluations[1]["rule_name"] == "SMETA_PARENT_COVERED"
+        assert evaluations[1]["is_violation"] is False
 
 
 def make_item(raw_id="1", title="Камера", code=None, section="Default_Section", unit=UnitClass.COUNT, dims=None):

@@ -3,6 +3,7 @@
 Проверяет:
 - Pydantic v2 строгие схемы и барьер против типа float.
 - UnitNormalizer: соответствие классов ОКЕИ и коэффициентов кратности (100 м2, 1000 шт и т.д.).
+- Unit Gate (R05_UNT): семейства физических размерностей, кратности и предикат совместимости.
 - DimensionLockExtractor: извлечение инвариантов DN, PN, диаметров и классов бетона.
 - DiscrepancyDetector: формулы погрешностей, отходы ГЭСН и ошибки делителей расценок.
 - Неизменность пространственных координат CellPointer.
@@ -14,8 +15,28 @@ from pydantic import ValidationError
 
 from conftest import StrictCellPointerSchema, StrictNormalizedItemSchema
 from evaluator import DiscrepancyDetector
-from models import CellPointer, CollisionSeverity, NormalizedItem, UnitClass
-from normalizer import DimensionLockExtractor, UnitNormalizer
+from models import (
+    CellPointer,
+    CollisionSeverity,
+    DimensionFamily,
+    NormalizedItem,
+    UnitClass,
+)
+from normalizer import (
+    DimensionLockExtractor,
+    UnitNormalizer,
+    evaluate_unit_gate,
+    is_dimension_compatible,
+)
+
+WeightValue = Decimal | float
+
+
+def _to_decimal(value: WeightValue) -> Decimal:
+    """Приводит weight_score предиката к Decimal (совместимо с float и Decimal)."""
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
 
 # ----------------------------------------------------------------------
 # 1. Тестирование Pydantic v2 схем и Zero Float Policy
@@ -391,3 +412,295 @@ class TestAuditTrailPreservation:
         assert record.lsr_item.pointer.file_name == "LSR_01_Foundation.xlsx"
         assert record.spec_item.pointer.coordinate == "p.12 [row 15]"
         assert record.spec_item.pointer.file_name == "02_2026_KJ_Spec.pdf"
+
+
+# ----------------------------------------------------------------------
+# 6. Тестирование Unit Gate (R05_UNT): физические размерности
+# ----------------------------------------------------------------------
+
+
+class TestDimensionFamilies:
+    """Классификация единиц по семействам физических величин и кратностям."""
+
+    @pytest.mark.parametrize(
+        ("raw_unit", "expected_family", "expected_multiplier"),
+        [
+            # --- LENGTH ---
+            ("м", DimensionFamily.LENGTH, Decimal("1")),
+            ("метр", DimensionFamily.LENGTH, Decimal("1")),
+            ("метров", DimensionFamily.LENGTH, Decimal("1")),
+            ("пог. м", DimensionFamily.LENGTH, Decimal("1")),
+            ("п.м.", DimensionFamily.LENGTH, Decimal("1")),
+            ("м.п.", DimensionFamily.LENGTH, Decimal("1")),
+            ("км", DimensionFamily.LENGTH, Decimal("1000")),
+            ("мм", DimensionFamily.LENGTH, Decimal("0.001")),
+            ("100 м", DimensionFamily.LENGTH, Decimal("100")),
+            ("1000 м", DimensionFamily.LENGTH, Decimal("1000")),
+            # --- AREA ---
+            ("м2", DimensionFamily.AREA, Decimal("1")),
+            ("м²", DimensionFamily.AREA, Decimal("1")),
+            ("кв. м", DimensionFamily.AREA, Decimal("1")),
+            ("м.кв.", DimensionFamily.AREA, Decimal("1")),
+            ("100 м2", DimensionFamily.AREA, Decimal("100")),
+            ("1000 м2", DimensionFamily.AREA, Decimal("1000")),
+            # --- VOLUME ---
+            ("м3", DimensionFamily.VOLUME, Decimal("1")),
+            ("м³", DimensionFamily.VOLUME, Decimal("1")),
+            ("куб. м", DimensionFamily.VOLUME, Decimal("1")),
+            ("м.куб.", DimensionFamily.VOLUME, Decimal("1")),
+            ("л", DimensionFamily.VOLUME, Decimal("0.001")),
+            ("литр", DimensionFamily.VOLUME, Decimal("0.001")),
+            # --- MASS ---
+            ("т", DimensionFamily.MASS, Decimal("1000")),
+            ("тн", DimensionFamily.MASS, Decimal("1000")),
+            ("тонна", DimensionFamily.MASS, Decimal("1000")),
+            ("кг", DimensionFamily.MASS, Decimal("1")),
+            ("килограмм", DimensionFamily.MASS, Decimal("1")),
+            ("г", DimensionFamily.MASS, Decimal("0.001")),
+            # --- COUNT ---
+            ("шт", DimensionFamily.COUNT, Decimal("1")),
+            ("штука", DimensionFamily.COUNT, Decimal("1")),
+            ("компл.", DimensionFamily.COUNT, Decimal("1")),
+            ("комплект", DimensionFamily.COUNT, Decimal("1")),
+            ("упак.", DimensionFamily.COUNT, Decimal("1")),
+            ("упаковка", DimensionFamily.COUNT, Decimal("1")),
+            ("уп", DimensionFamily.COUNT, Decimal("1")),
+            ("рул.", DimensionFamily.COUNT, Decimal("1")),
+            ("боб.", DimensionFamily.COUNT, Decimal("1")),
+            ("пар", DimensionFamily.COUNT, Decimal("1")),
+            ("100 шт", DimensionFamily.COUNT, Decimal("100")),
+            ("1000 шт", DimensionFamily.COUNT, Decimal("1000")),
+            ("тыс. шт", DimensionFamily.COUNT, Decimal("1000")),
+            # --- ELECTRICAL / WORK ---
+            ("точка", DimensionFamily.ELECTRICAL, Decimal("1")),
+            ("ввод", DimensionFamily.ELECTRICAL, Decimal("1")),
+            ("панель", DimensionFamily.ELECTRICAL, Decimal("1")),
+            ("шкаф", DimensionFamily.ELECTRICAL, Decimal("1")),
+            ("система", DimensionFamily.ELECTRICAL, Decimal("1")),
+        ],
+    )
+    def test_classify_unit_family_and_multiplier(
+        self,
+        raw_unit: str,
+        expected_family: DimensionFamily,
+        expected_multiplier: Decimal,
+    ) -> None:
+        """Единица получает верное семейство и кратность относительно базы."""
+        dimension = UnitNormalizer.classify_unit(raw_unit)
+
+        assert dimension is not None
+        assert dimension.family is expected_family
+        assert dimension.multiplier == expected_multiplier
+        assert UnitNormalizer.dimension_family(raw_unit) is expected_family
+
+    @pytest.mark.parametrize("raw_unit", [None, "", "   ", "чел.-час", "м/с"])
+    def test_unknown_units_are_not_classified(self, raw_unit: str | None) -> None:
+        """Неопределенные и нераспознанные единицы не имеют семейства."""
+        assert UnitNormalizer.classify_unit(raw_unit) is None
+        assert UnitNormalizer.dimension_family(raw_unit) is None
+
+
+class TestUnitGatePredicate:
+    """R05_UNT: жесткое отсечение несовместимых физических размерностей."""
+
+    @pytest.mark.parametrize(
+        ("unit_rd", "unit_smeta"),
+        [
+            ("м2", "м3"),
+            ("м", "м2"),
+            ("м", "шт"),
+            ("т", "м"),
+            ("м3", "шт"),
+            ("кг", "компл"),
+            ("м2", "точка"),
+            ("км", "кг"),
+            ("рулон", "м3"),
+        ],
+    )
+    def test_incompatible_dimensions_are_rejected(
+        self, unit_rd: str, unit_smeta: str
+    ) -> None:
+        """AREA/VOLUME, LENGTH/COUNT, MASS/LENGTH и подобные пары блокируются."""
+        assert UnitNormalizer.is_dimension_compatible(unit_rd, unit_smeta) is False
+        assert is_dimension_compatible(unit_rd, unit_smeta) is False
+
+        is_compatible, weight, reason = UnitNormalizer.evaluate_unit_gate(
+            unit_rd, unit_smeta
+        )
+
+        assert is_compatible is False
+        assert _to_decimal(weight) == Decimal("0.0")
+        assert reason.startswith("INCOMPATIBLE_DIMENSIONS: ")
+        assert " vs " in reason
+
+    def test_incompatible_reason_contains_family_names(self) -> None:
+        """Причина блокировки содержит имена обоих семейств размерностей."""
+        is_compatible, _, reason = evaluate_unit_gate("м2", "м3")
+
+        assert is_compatible is False
+        assert reason == "INCOMPATIBLE_DIMENSIONS: AREA vs VOLUME"
+
+    @pytest.mark.parametrize(
+        ("unit_rd", "unit_smeta"),
+        [
+            ("м", "100 м"),
+            ("100 м", "м"),
+            ("шт", "100 шт"),
+            ("м", "1000 м"),
+            ("км", "1000 м"),
+            ("м2", "100 м2"),
+            ("м3", "100 м3"),
+            ("кг", "т"),
+            ("г", "кг"),
+        ],
+    )
+    def test_scaled_units_match_exactly(
+        self, unit_rd: str, unit_smeta: str
+    ) -> None:
+        """Кратности (100 м, 1000 шт, км, т) не мешают точному совпадению."""
+        assert UnitNormalizer.is_dimension_compatible(unit_rd, unit_smeta) is True
+
+        is_compatible, weight, reason = evaluate_unit_gate(unit_rd, unit_smeta)
+
+        assert is_compatible is True
+        assert _to_decimal(weight) == Decimal("1.0")
+        assert reason == "EXACT_OR_SCALED_MATCH"
+
+    @pytest.mark.parametrize(
+        ("unit_rd", "unit_smeta"),
+        [
+            ("пог.м", "м"),
+            ("пог. м", "м"),
+            ("п.м.", "м"),
+            ("кв. м", "м2"),
+            ("м.кв.", "м2"),
+            ("м²", "м2"),
+            ("куб. м", "м3"),
+            ("м.куб.", "м3"),
+            ("м³", "м3"),
+            ("компл.", "комплект"),
+            ("тыс. шт", "1000 шт"),
+        ],
+    )
+    def test_complex_spellings_are_normalized(
+        self, unit_rd: str, unit_smeta: str
+    ) -> None:
+        """Пунктуация, пробелы и надстрочные индексы не создают ложных коллизий."""
+        is_compatible, weight, reason = UnitNormalizer.evaluate_unit_gate(
+            unit_rd, unit_smeta
+        )
+
+        assert is_compatible is True
+        assert _to_decimal(weight) == Decimal("1.0")
+        assert reason == "EXACT_OR_SCALED_MATCH"
+
+    @pytest.mark.parametrize(
+        ("unit_rd", "unit_smeta"),
+        [
+            ("шт", "компл"),
+            ("шт", "система"),
+            ("компл", "система"),
+            ("точка", "шт"),
+            ("упак", "рулон"),
+            ("пара", "бобина"),
+        ],
+    )
+    def test_allowed_cross_unit_conversions(
+        self, unit_rd: str, unit_smeta: str
+    ) -> None:
+        """Штуки совместимы с комплектами/системами с пониженным весом 0.7."""
+        assert UnitNormalizer.is_dimension_compatible(unit_rd, unit_smeta) is True
+
+        is_compatible, weight, reason = evaluate_unit_gate(unit_rd, unit_smeta)
+
+        assert is_compatible is True
+        assert _to_decimal(weight) == Decimal("0.7")
+        assert reason == "COMPATIBLE_CROSS_UNIT"
+
+
+class TestUnitGateBoundaries:
+    """Граничные значения Unit Gate: HITL-пропуски и симметрия предиката."""
+
+    @pytest.mark.parametrize(
+        ("unit_rd", "unit_smeta"),
+        [
+            (None, "м2"),
+            ("м2", None),
+            (None, None),
+            ("", "м"),
+            ("м", ""),
+            ("   ", "\xa0"),
+            ("чел.-час", "м"),
+            ("м", "чел.-час"),
+            ("м/с", "кг"),
+        ],
+    )
+    def test_undefined_and_unknown_units_are_soft_skipped(
+        self, unit_rd: str | None, unit_smeta: str | None
+    ) -> None:
+        """Отсутствующие/неизвестные единицы не блокируются (мягкий HITL)."""
+        assert UnitNormalizer.is_dimension_compatible(unit_rd, unit_smeta) is True
+        assert is_dimension_compatible(unit_rd, unit_smeta) is True
+
+        is_compatible, weight, reason = evaluate_unit_gate(unit_rd, unit_smeta)
+
+        assert is_compatible is True
+        assert _to_decimal(weight) == Decimal("0.5")
+        assert reason.endswith("_SKIPPED")
+
+    def test_both_undefined_units_have_dedicated_reason(self) -> None:
+        """Если обе единицы не определены — причина UNDEFINED_UNITS_SKIPPED."""
+        is_compatible, weight, reason = UnitNormalizer.evaluate_unit_gate(None, "")
+
+        assert is_compatible is True
+        assert _to_decimal(weight) == Decimal("0.5")
+        assert reason == "UNDEFINED_UNITS_SKIPPED"
+
+    def test_one_unknown_unit_has_unknown_reason(self) -> None:
+        """Если не распознана одна единица — причина UNKNOWN_UNIT_SKIPPED."""
+        is_compatible, weight, reason = UnitNormalizer.evaluate_unit_gate("м", "")
+
+        assert is_compatible is True
+        assert _to_decimal(weight) == Decimal("0.5")
+        assert reason == "UNKNOWN_UNIT_SKIPPED"
+
+    def test_weight_score_is_decimal(self) -> None:
+        """Вес предиката — Decimal (Zero Float Policy расчетного ядра)."""
+        _, weight, _ = evaluate_unit_gate("м", "100 м")
+
+        assert isinstance(weight, Decimal)
+
+    def test_gate_verdict_is_symmetric(self) -> None:
+        """Вердикт и вес не зависят от порядка аргументов (РД/смета)."""
+        probes: list[str | None] = [
+            "м",
+            "100 м",
+            "км",
+            "мм",
+            "м2",
+            "100 м2",
+            "м3",
+            "л",
+            "т",
+            "кг",
+            "г",
+            "шт",
+            "100 шт",
+            "компл",
+            "система",
+            "точка",
+            "чел.-час",
+            "",
+            None,
+        ]
+
+        for left in probes:
+            for right in probes:
+                assert is_dimension_compatible(left, right) == is_dimension_compatible(
+                    right, left
+                )
+                left_gate = evaluate_unit_gate(left, right)
+                right_gate = evaluate_unit_gate(right, left)
+                assert left_gate[0] == right_gate[0]
+                assert left_gate[1] == right_gate[1]
+
