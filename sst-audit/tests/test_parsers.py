@@ -577,3 +577,77 @@ def test_real_pdf_spec_file_clean_extraction():
     pipe_item = next(it for it in items if "гофротруба" in it.clean_title)
     assert pipe_item.volume == Decimal("1000")
     assert pipe_item.canonical_unit == UnitClass.LENGTH
+
+
+# ==============================================================================
+# 4. СПРИНТ 2: РЕАЛЬНЫЕ СТОИМОСТИ И ИЕРАРХИЯ «РАБОТА + РЕСУРС» (ТСН-2001)
+# ==============================================================================
+
+REAL_LSR_FILE = "data/all/Сметная_документация.xlsx"
+REAL_LSR_SHEET = "ЛС 02-01-14"
+
+
+@pytest.mark.skipif(
+    not os.path.exists(REAL_LSR_FILE),
+    reason="Файл Сметная_документация.xlsx не найден",
+)
+def test_lsr_parser_extracts_real_costs():
+    """Блок «ВСЕГО по позиции:» (графа 11) дает total_cost и unit_price > 0."""
+    items = LSRParser(REAL_LSR_FILE).parse(REAL_LSR_SHEET)
+    assert len(items) == 44
+
+    priced = [it for it in items if it.total_cost is not None and it.total_cost > 0]
+    assert len(priced) == 40
+    for item in priced:
+        assert item.total_cost > 0
+        assert item.unit_price is not None
+        assert item.unit_price > 0
+
+    # Расценка монтажа: цена в заголовке отсутствует, поэтому
+    # unit_price рассчитывается как total_cost / quantity.
+    work = next(it for it in items if it.code == "4.10-174-2")
+    assert work.total_cost == Decimal("32477.06")
+    assert work.unit_price == (Decimal("32477.06") / work.volume).quantize(
+        Decimal("0.0001")
+    )
+
+    # Ресурс «Прайс-лист»: собственный итог блока и цена из графы 6.
+    resource = next(it for it in items if it.raw_id == "LSR_37")
+    assert resource.total_cost == Decimal("46619.82")
+    assert resource.unit_price == Decimal("1236.6")
+
+
+@pytest.mark.skipif(
+    not os.path.exists(REAL_LSR_FILE),
+    reason="Файл Сметная_документация.xlsx не найден",
+)
+def test_lsr_parser_builds_work_resource_hierarchy():
+    """Материалы и оборудование привязаны parent_id к расценке монтажа."""
+    items = LSRParser(REAL_LSR_FILE).parse(REAL_LSR_SHEET)
+
+    work_items = [
+        it for it in items
+        if it.code and it.code.startswith(("3.", "4.", "6."))
+    ]
+    assert work_items
+    assert all(not it.is_resource for it in work_items)
+    assert all(it.parent_id is None for it in work_items)
+
+    # Дочерние ресурсы первой расценки монтажа видеокамеры.
+    work = next(it for it in items if it.code == "4.10-174-2")
+    children = [it for it in items if it.parent_id == work.raw_id]
+    assert children
+    assert all(it.is_resource for it in children)
+    assert any("видеокамера" in it.clean_title for it in children)
+    assert all(it.pointer.row_idx > work.pointer.row_idx for it in children)
+
+    # Новая расценка сбрасывает родителя: последующий «Прайс-лист»
+    # привязан к ней, а не к предыдущей работе.
+    next_work = next(it for it in items if it.code == "4.10-136-1")
+    next_children = [it for it in items if it.parent_id == next_work.raw_id]
+    assert any(it.code == "Прайс-лист" for it in next_children)
+    assert all(it.pointer.row_idx > next_work.pointer.row_idx for it in next_children)
+
+    # Ресурс не может быть родителем другого ресурса.
+    resource_ids = {it.raw_id for it in items if it.is_resource}
+    assert all(it.parent_id not in resource_ids for it in items)

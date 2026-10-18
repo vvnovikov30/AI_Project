@@ -1,7 +1,7 @@
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 import re
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable
 import openpyxl
 import openpyxl.utils
 import pdfplumber
@@ -17,6 +17,15 @@ class LSRParser:
     # Ловит федеральные расценки (ГЭСН, ФЕР, ТЕР, 2-значные главы 421/пр)
     # и расценки на работы ТСН-2001 (главы 3, 4, 5, 6: монтаж, строительные, пусконаладка)
     BASE_RATE_PATTERN = re.compile(r"^(ГЭСН|ФЕР|ТЕР|[3-6]\.[\d\-]+|\d{2}\.\d+\.\d+)")
+
+    # Ресурсные строки ТСН-2001: главы 1 (материалы), 2 (оборудование),
+    # 13 (неучтенные материалы) и позиции прейскурантов «Прайс-лист».
+    RESOURCE_CODE_PATTERN = re.compile(
+        r"^(?:Прайс-лист|(?:1|2|13)\.[\d\-]+)", re.IGNORECASE
+    )
+
+    # Итоговая строка блока позиции: «ВСЕГО по позиции:» (графа 11).
+    TOTAL_ROW_PATTERN = re.compile(r"^всего\s+по\s+позиции\s*:?", re.IGNORECASE)
 
     def __init__(self, file_path: str):
         self.file_path = file_path
@@ -46,6 +55,42 @@ class LSRParser:
         text = re.sub(r"^\s*оборудование\s*:\s*", "", text, flags=re.IGNORECASE)
         return re.sub(r"\s+", " ", text).lower().strip()
 
+    @staticmethod
+    def _to_decimal(value: Any) -> Optional[Decimal]:
+        """Приведение ячейки Excel к ``Decimal`` (запятая, пробелы, ``None``)."""
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, Decimal):
+            return value
+        if isinstance(value, (int, float)):
+            return Decimal(str(value))
+        text = (
+            str(value)
+            .strip()
+            .replace("\xa0", "")
+            .replace(" ", "")
+            .replace(",", ".")
+        )
+        if not text:
+            return None
+        try:
+            return Decimal(text)
+        except (InvalidOperation, ValueError):
+            return None
+
+    @classmethod
+    def _extract_total_cost(cls, get_val: Callable[[int], Any]) -> Optional[Decimal]:
+        """Итог блока «ВСЕГО по позиции:» из графы 11 (fallback: графы 10..6).
+
+        В форме 4б ТСН-2001 итоговая ячейка графы 11 объединена с графой 10
+        (``J:K``), поэтому значение читается через карту merged-ячеек.
+        """
+        for col_idx in (11, 10, 9, 8, 7, 6):
+            value = cls._to_decimal(get_val(col_idx))
+            if value is not None and value > 0:
+                return value
+        return None
+
     def parse(self, sheet_name: Optional[str] = None) -> List[NormalizedItem]:
         """Парсинг листа сметы в нормализованную плоскую коллекцию DTO.
 
@@ -64,6 +109,8 @@ class LSRParser:
 
         current_parent_id = None
         current_section = "Default_Section"
+        # Индекс последней позиции, для которой еще не прочитан итог блока.
+        pending_item_idx: Optional[int] = None
 
         for row_idx in range(1, ws.max_row + 1):
             def get_val(col_idx: int):
@@ -79,6 +126,21 @@ class LSRParser:
             val_col_a = str(col_n_pp or "")
             if "раздел:" in val_col_a.lower():
                 current_section = val_col_a.strip()
+
+            # Итоговая строка блока: «ВСЕГО по позиции:» (графа 11).
+            # Закрывает последнюю прочитанную позицию и проставляет стоимость.
+            title_cell = str(get_val(3) or "").strip()
+            if self.TOTAL_ROW_PATTERN.match(title_cell):
+                total_cost = self._extract_total_cost(get_val)
+                if total_cost is not None and pending_item_idx is not None:
+                    pending_item = items[pending_item_idx]
+                    pending_item.total_cost = total_cost
+                    if pending_item.unit_price is None and pending_item.volume > 0:
+                        pending_item.unit_price = (
+                            total_cost / pending_item.volume
+                        ).quantize(Decimal("0.0001"))
+                    pending_item_idx = None
+                continue
 
             if not raw_title or raw_qty is None:
                 continue
@@ -112,12 +174,17 @@ class LSRParser:
                 coordinate=f"{col_letter}{row_idx}"
             )
 
-            # Проверка, является ли строка базовой расценкой работ
+            # Иерархия «Работа + Ресурс» ТСН-2001: строки глав 3, 4, 6 —
+            # родительские расценки; главы 1, 2, 13 и «Прайс-лист» — ресурсы.
             first_code_line = raw_code.split("\n")[0].strip() if raw_code else ""
-            is_base_rate = bool(self.BASE_RATE_PATTERN.match(first_code_line))
+            is_explicit_resource = bool(self.RESOURCE_CODE_PATTERN.match(first_code_line))
+            is_work_rate = (
+                bool(self.BASE_RATE_PATTERN.match(first_code_line))
+                and not is_explicit_resource
+            )
             item_id = f"LSR_{row_idx}"
 
-            if is_base_rate:
+            if is_work_rate:
                 current_parent_id = item_id
                 parent_ref = None
             else:
@@ -126,6 +193,8 @@ class LSRParser:
             canonical_u, norm_qty, mult = UnitNormalizer.normalize(raw_unit, qty_decimal)
             clean_title = self._clean_estimate_title(raw_title)
             dimensions = DimensionLockExtractor.extract(raw_title)
+            # Цена за единицу из графы 6 заголовка (для работ обычно пуста).
+            header_price = self._to_decimal(get_val(6))
 
             items.append(NormalizedItem(
                 raw_id=item_id,
@@ -139,9 +208,11 @@ class LSRParser:
                 dimensions=dimensions,
                 context_section=current_section,
                 pointer=pointer,
-                is_resource=not is_base_rate,
-                parent_id=parent_ref
+                is_resource=not is_work_rate,
+                parent_id=parent_ref,
+                unit_price=header_price if header_price is not None and header_price > 0 else None
             ))
+            pending_item_idx = len(items) - 1
 
         return items
 
