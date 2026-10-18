@@ -155,6 +155,80 @@ class TestLSRParserSynthetic:
         assert it_res2.parent_id == "LSR_10"
         assert it_res2.volume == Decimal("300")
 
+    def test_lsr_parser_detects_421pr_format(self, tmp_path):
+        """421/пр: графы «Обоснование | Наименование | Ед. изм. | Количество».
+
+        Колонки единицы измерения и количества сдвинуты из-за объединенной
+        шапки наименования — парсер обязан найти их по заголовкам, а не по
+        фиксированным A..E. Отрицательный объем исключения сохраняется.
+        """
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Смета"
+
+        ws.cell(row=1, column=1, value="ЛОКАЛЬНЫЙ СМЕТНЫЙ РАСЧЕТ № ЛСР-02-01-01")
+        ws.cell(row=2, column=1, value="№ п/п")
+        ws.cell(row=2, column=2, value="Обоснование")
+        ws.cell(row=2, column=3, value="Наименование работ и затрат")
+        ws.merge_cells(start_row=2, start_column=3, end_row=2, end_column=5)
+        ws.cell(row=2, column=6, value="Единица измерения")
+        ws.cell(row=2, column=7, value="Количество")
+
+        # Строка нумерации граф: 1 | 2 | 3 | 4 | 5
+        for column, value in ((1, 1), (2, 2), (3, 3), (6, 4), (7, 5)):
+            ws.cell(row=3, column=column, value=value)
+
+        ws.cell(row=4, column=1, value="Раздел 1. Монтаж")
+
+        # Позиция 1: расценка ТЕР, единица «100 м ...», дробный объем.
+        ws.cell(row=5, column=1, value="1")
+        ws.cell(row=5, column=2, value="ТЕР10-01-060-01")
+        ws.cell(row=5, column=3, value="Установка и крепление наличников")
+        ws.cell(row=5, column=6, value="100 м коробок блоков")
+        ws.cell(row=5, column=7, value="1,314")
+
+        # Ресурс без номера позиции — дочерняя строка расценки.
+        ws.cell(row=6, column=2, value="101-1805")
+        ws.cell(row=6, column=3, value="Гвозди строительные")
+        ws.cell(row=6, column=6, value="т")
+        ws.cell(row=6, column=7, value="0,00071")
+
+        # Позиция 2: отрицательный объем исключаемых работ.
+        ws.cell(row=7, column=1, value="2")
+        ws.cell(row=7, column=2, value="ТЕР15-01-047-15")
+        ws.cell(row=7, column=3, value="Демонтаж подвесных потолков")
+        ws.cell(row=7, column=6, value="м2")
+        ws.cell(row=7, column=7, value="-840,9744")
+
+        file_path = tmp_path / "lsr_421.xlsx"
+        wb.save(file_path)
+
+        # Лист не начинается с «ЛС » — должен сработать fallback на активный.
+        items = LSRParser(str(file_path)).parse()
+
+        assert len(items) == 3
+        work = items[0]
+        assert work.code == "ТЕР10-01-060-01"
+        assert work.raw_unit == "100 м коробок блоков"
+        assert work.volume == Decimal("1.314")
+        assert not work.is_resource
+        assert work.parent_id is None
+        assert work.context_section == "Раздел 1. Монтаж"
+        assert work.pointer.sheet_name == "Смета"
+        assert work.pointer.col_letter == "G"
+
+        resource = items[1]
+        assert resource.code == "101-1805"
+        assert resource.is_resource
+        assert resource.parent_id == work.raw_id
+        assert resource.canonical_unit == UnitClass.MASS
+        assert resource.volume == Decimal("0.71")
+
+        excluded = items[2]
+        assert excluded.code == "ТЕР15-01-047-15"
+        assert excluded.volume == Decimal("-840.9744")
+        assert excluded.canonical_unit == UnitClass.AREA
+
 
 # ==============================================================================
 # 2. МОДУЛЬНЫЕ ТЕСТЫ PDFSpecParser
@@ -329,6 +403,66 @@ class TestPDFSpecParserUnit:
         ]
         assert [item.raw_unit for item in items] == ["пм.", "шт", "шт."]
         assert all(item.context_section == "Фасады" for item in items)
+
+    def test_vor_5_columns_with_negative_volumes(self, monkeypatch):
+        """ВОР СПб: 5 граф, отрицательные объемы исключаемых работ.
+
+        Схема определяется по шапке («Наименование» + «Кол-во»), поэтому
+        количество читается из графы 4, а не из фиксированной графы 7.
+        Служебные строки подписей не должны становиться позициями.
+        """
+        table = [
+            ["№ п/п", "Наименование", "Ед. изм.", "Кол-во", "Примечание"],
+            ["1", "2", "3", "4", "5"],
+            ["", "Раздел 1. Демонтаж", "", "", ""],
+            ["", "Демонтаж подвесных потолков", "м2", "-840,9744", ""],
+            ["", "Монтаж подвесных потолков", "м2", "120,5", ""],
+            ["Составил:", "Иванов И.И.", "", "", ""],
+            ["Проверил:", "Петров П.П.", "", "", ""],
+        ]
+
+        class _FakePage:
+            width = 842.0
+            height = 595.0
+
+            def extract_text(self):
+                return (
+                    "ВЕДОМОСТЬ ОБЪЕМОВ РАБОТ\n"
+                    "Добавляемые объемы работ\n"
+                    "Исключаемые объемы работ"
+                )
+
+            def within_bbox(self, _bbox):
+                return self
+
+            def extract_table(self, _settings):
+                return table
+
+        class _FakePDF:
+            pages = [_FakePage()]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        monkeypatch.setattr(parsers.pdfplumber, "open", lambda _path: _FakePDF())
+
+        items = PDFSpecParser("vor_5.pdf").extract_items()
+
+        assert len(items) == 2
+        assert [item.volume for item in items] == [
+            Decimal("-840.9744"),
+            Decimal("120.5"),
+        ]
+        assert [item.raw_unit for item in items] == ["м2", "м2"]
+        assert all(item.canonical_unit == UnitClass.AREA for item in items)
+        assert all(
+            item.context_section == "Раздел 1. Демонтаж" for item in items
+        )
+        assert all("Иванов" not in item.raw_title for item in items)
+        assert all("Петров" not in item.raw_title for item in items)
 
     def test_grand_smeta_vor_7_columns_mock(self, monkeypatch):
         """Форма ВОР ПК «ГРАНД-Смета»: рамка только у шапки, объем в графе 4.
