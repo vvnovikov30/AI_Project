@@ -164,7 +164,7 @@ class TestPDFSpecParserUnit:
     """Проверка вспомогательных методов извлечения спецификации."""
 
     def test_crop_box_calculation(self):
-        """Проверка формулы отсечения штампа по ГОСТ 21.110 (55 мм снизу)."""
+        """Проверка динамической области таблицы (отступы 15/15/15 и срез штампа 65 pt)."""
         class DummyPage:
             width = 842.0   # A4 альбомная
             height = 595.0
@@ -172,11 +172,122 @@ class TestPDFSpecParserUnit:
         parser = PDFSpecParser("dummy.pdf", debug=False)
         box = parser._get_crop_box(DummyPage())
 
-        stamp_h = 55 * 2.83465
-        assert box[0] == 0
-        assert box[1] == 0
-        assert box[2] == 842.0
-        assert pytest.approx(box[3], 0.01) == 595.0 - stamp_h
+        assert box[0] == PDFSpecParser.CROP_LEFT_PT
+        assert box[1] == PDFSpecParser.CROP_TOP_PT
+        assert pytest.approx(box[2], 0.01) == 842.0 - PDFSpecParser.CROP_RIGHT_PT
+        assert pytest.approx(box[3], 0.01) == 595.0 - PDFSpecParser.CROP_BOTTOM_STAMP_PT
+
+    def test_crop_box_a3_landscape_uses_actual_page_width(self):
+        """А3-ландшафт (1191x842): правые графы «Ед. изм.» и «Количество» не срезаются.
+
+        CropBox считается от фактической ширины листа, а не от константы А4,
+        поэтому широкие спецификации ЭОМ разбираются полностью.
+        """
+        class A3LandscapePage:
+            width = 1191.0
+            height = 842.0
+
+        parser = PDFSpecParser("dummy.pdf", debug=False)
+        left, top, right, bottom = parser._get_crop_box(A3LandscapePage())
+
+        assert (left, top) == (15, 15)
+        assert pytest.approx(right, 0.01) == 1176.0
+        assert pytest.approx(bottom, 0.01) == 777.0
+        # Правая граница шире листа А4 — графа количества не отрезана.
+        assert right > 595.0
+
+    def test_quantity_mapping_gost_21_110(self):
+        """Количество берется из графы 8; масса (графа 7) не становится количеством.
+
+        Дополнительно проверяется сдвиг колонок на страницах-продолжениях:
+        при пустой графе 8 количество ищется как первое число справа от ед. изм.
+        """
+        schema = PDFSpecParser._gost_positional_schema()
+
+        # Графа 8 заполнена — значение берется напрямую.
+        row_full = ["8", "Лоток перфорированный", "УЛП-100", "", "", "м", "12", "120", ""]
+        assert PDFSpecParser._resolve_quantity(row_full, schema, 5) == Decimal("120")
+
+        # Графа 8 пуста: масса 12 кг не должна попасть в количество.
+        row_mass_only = ["7", "Лоток перфорированный", "УЛП-100", "", "", "м", "12", "", ""]
+        assert PDFSpecParser._resolve_quantity(row_mass_only, schema, 5) is None
+
+        # Страница-продолжение без шапки: 11 колонок, ед. изм. в графе 7.
+        continuation = parsers._ColumnSchema(
+            kind="SPECIFICATION",
+            title_col=1,
+            unit_col=10,
+            qty_col=11,
+            position_col=0,
+            mark_col=2,
+            code_col=6,
+            mass_col=13,
+        )
+        row_shifted = ["19", "Щиток учета", "ЯТП-0,25/36", "", "", "", "компл.", "1", "", ""]
+        unit_text, unit_index = PDFSpecParser._resolve_unit(row_shifted, continuation)
+        assert unit_text == "компл."
+        assert unit_index == 6
+        assert PDFSpecParser._resolve_quantity(
+            row_shifted, continuation, unit_index
+        ) == Decimal("1")
+
+    def test_section_headings_are_context_not_titles(self, monkeypatch):
+        """Подзаголовки разделов дают context_section и не склеиваются с позициями.
+
+        Сшивка «продолжение наименования» сбрасывается на границе листа, поэтому
+        строка с количеством без наименования с новой страницы не создает фантом.
+        """
+        page_one = [
+            [
+                "Позиция",
+                "Наименование и техническая характеристика",
+                "Тип, марка",
+                "Код оборудования",
+                "",
+                "Ед. изм.",
+                "Масса",
+                "Количество",
+            ],
+            ["", "КАБЕЛИ", "", "", "", "", "", ""],
+            ["1", "Кабель ППГнг(А)-HF 3х2,5", "ППГнг(А)-HF", "", "", "м", "", "120"],
+            ["", "Кабель ВВГнг 3х1,5 (продолжение линии 2)", "", "", "", "", "", ""],
+        ]
+        page_two = [
+            ["2", "", "", "", "", "м", "", "15"],
+            ["", "ТРУБЫ, ЛОТКИ", "", "", "", "", "", ""],
+            ["3", "Труба гофрированная Д=20", "IEK", "", "", "м", "", "1800"],
+        ]
+
+        class _FakePage:
+            def __init__(self, table):
+                self.width = 1191.0
+                self.height = 842.0
+                self._table = table
+
+            def extract_table(self, _settings):
+                return self._table
+
+        class _FakePDF:
+            pages = [_FakePage(page_one), _FakePage(page_two)]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        monkeypatch.setattr(parsers.pdfplumber, "open", lambda _path: _FakePDF())
+
+        items = PDFSpecParser("eom_spec.pdf").extract_items()
+
+        assert len(items) == 2
+        assert [item.volume for item in items] == [Decimal("120"), Decimal("1800")]
+        assert [item.context_section for item in items] == ["КАБЕЛИ", "ТРУБЫ, ЛОТКИ"]
+        # Наименования не содержат приклеенного заголовка раздела.
+        assert items[0].raw_title == "Кабель ППГнг(А)-HF 3х2,5"
+        assert items[1].raw_title == "Труба гофрированная Д=20"
+        # Фантом из строки без наименования на новом листе не появился.
+        assert all("продолжение" not in item.clean_title for item in items)
 
     def test_pdf_parser_extracts_vor_4_columns(self, monkeypatch):
         """ВОР из 4 колонок распознается без жесткого требования 7 колонок."""
@@ -248,6 +359,176 @@ class TestPDFSpecParserUnit:
         monkeypatch.setattr(parsers.pdfplumber, "open", lambda _path: _FakePDF())
 
         assert PDFSpecParser("empty.pdf").extract_items() == []
+
+    def test_page_without_spec_markers_skips_table_extraction(self, monkeypatch):
+        """Страница чертежа без маркеров не доходит до табличных методов.
+
+        Предфильтр по ``extract_text()`` обязан отсечь страницу до вызова
+        ``find_tables()``/``extract_table()``: иначе разбор векторных планов
+        и однолинейных схем зависает на десятках тысяч линий.
+        """
+        class _DrawingPage:
+            width = 1191.0
+            height = 842.0
+
+            def extract_text(self):
+                return "План 1-го этажа. Однолинейная схема ВРУ-1"
+
+            def find_tables(self, *_args, **_kwargs):
+                raise AssertionError("find_tables не должен вызываться для чертежа")
+
+            def extract_table(self, *_args, **_kwargs):
+                raise AssertionError("extract_table не должен вызываться для чертежа")
+
+        class _FakePDF:
+            pages = [_DrawingPage()]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        monkeypatch.setattr(parsers.pdfplumber, "open", lambda _path: _FakePDF())
+
+        assert PDFSpecParser("eom_drawings.pdf").extract_items() == []
+
+    def test_page_with_spec_marker_is_parsed(self, monkeypatch):
+        """Страница с маркером спецификации разбирается как обычно."""
+        table = [
+            [
+                "Позиция",
+                "Наименование и техническая характеристика",
+                "Тип, марка",
+                "Код оборудования",
+                "",
+                "Ед. изм.",
+                "Масса",
+                "Количество",
+            ],
+            ["1", "Щиток учета", "ЯТП-0,25/36", "", "", "компл.", "", "1"],
+        ]
+
+        class _SpecPage:
+            width = 1191.0
+            height = 842.0
+
+            def extract_text(self):
+                return "2025-00224-01-0-ИОС1.С Спецификация оборудования"
+
+            def extract_table(self, _settings):
+                return table
+
+        class _FakePDF:
+            pages = [_SpecPage()]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        monkeypatch.setattr(parsers.pdfplumber, "open", lambda _path: _FakePDF())
+
+        items = PDFSpecParser("eom_spec.pdf").extract_items()
+
+        assert [item.raw_title for item in items] == ["Щиток учета"]
+        assert items[0].raw_unit == "компл."
+        assert items[0].volume == Decimal("1")
+
+    def test_spec_marker_is_recognized_in_mojibake_text(self):
+        """Маркер находится и в битой кодировке текстового слоя PDF."""
+        mojibake = "спецификация оборудования".encode("cp1251").decode("cp866")
+
+        class _MojibakePage:
+            def extract_text(self):
+                return mojibake
+
+        assert PDFSpecParser._page_has_spec_markers(_MojibakePage()) is True
+
+    def test_prescreen_keeps_spec_tables_and_vor_continuation(self, monkeypatch):
+        """Предфильтр PDFium отсекает чертежи, но не продолжения ВОР.
+
+        Штамп чертежа содержит «Спецификация оборудования» и марку «ИОС1.С»,
+        поэтому лист принимается только при наличии строк данных либо шапки
+        таблицы. Продолжения ВОР идут без шапки и удерживаются, пока на
+        странице есть строки «ед. изм. + объем».
+        """
+        texts = {
+            1: "Спецификация оборудования 2025-00224-01-0-ИОС1.С лист 2025",
+            2: "Наименование и техническая характеристика Код оборудования",
+            3: "ИОС1.С Кабель ВВГнг 3х2,5 м 120",
+            4: (
+                "Ведомость объемов работ Наименование вида работ "
+                "Обоснование объема"
+            ),
+            5: "Установка лотка м 25",
+            6: "План на отм. 0,000",
+            7: "Прокладка кабеля м 12",
+        }
+        monkeypatch.setattr(
+            PDFSpecParser, "_scan_page_texts", lambda self: texts
+        )
+
+        parser = PDFSpecParser("eom.pdf")
+
+        assert parser._prescreen_pages() == {2, 3, 4, 5}
+        assert parser._fast_page_texts == texts
+
+    def test_prescreen_excludes_dialux_lighting_report(self, monkeypatch):
+        """Расчет освещенности Dialux отсекается по заголовку таблицы."""
+        texts = {
+            1: (
+                "Спецификация оборудования ИОС1.С "
+                "Перпендикулярная освещенность 120 лк"
+            ),
+            2: "Спецификация оборудования ИОС1.С Щит групповой комп. 1",
+        }
+        monkeypatch.setattr(
+            PDFSpecParser, "_scan_page_texts", lambda self: texts
+        )
+
+        parser = PDFSpecParser("eom.pdf")
+
+        assert parser._prescreen_pages() == {2}
+
+    def test_prescreen_keeps_raster_spec_sheet_by_image(self, monkeypatch):
+        """Лист с растровой таблицей принимается, пустой лист Dialux — нет."""
+        texts = {
+            5: "Спецификация оборудования формат А3 2025-00224-01-0-ИОС1.С",
+            6: "Спецификация оборудования формат А3 2025-00224-01-0-ИОС1.С",
+        }
+        monkeypatch.setattr(
+            PDFSpecParser, "_scan_page_texts", lambda self: texts
+        )
+        monkeypatch.setattr(
+            PDFSpecParser,
+            "_pages_with_raster_images",
+            lambda self, pages: pages & {5},
+        )
+
+        parser = PDFSpecParser("eom.pdf")
+
+        assert parser._prescreen_pages() == {5}
+
+    def test_prescreen_falls_back_when_scan_unavailable(self, monkeypatch):
+        """При сбое PDFium возвращается None и тексты не кэшируются."""
+        monkeypatch.setattr(
+            PDFSpecParser, "_scan_page_texts", lambda self: None
+        )
+
+        parser = PDFSpecParser("broken.pdf")
+
+        assert parser._prescreen_pages() is None
+        assert parser._fast_page_texts is None
+
+    def test_table_row_pattern_ignores_stamp_year(self):
+        """«лист 2025» в штампе не считается строкой данных спецификации."""
+        text = PDFSpecParser._marker_text(
+            "Спецификация оборудования лист 2025"
+        )
+
+        assert PDFSpecParser._text_has_table_rows(text) is False
 
 
 # ==============================================================================
