@@ -12,6 +12,58 @@ from models import NormalizedItem, CellPointer
 from normalizer import UnitNormalizer, DimensionLockExtractor
 
 
+_LSR_421_NOISE_PREFIXES: Final[tuple[str, ...]] = (
+    "нр ",
+    "нр от",
+    "сп ",
+    "сп от",
+    "фот",
+    "зп",
+    "эм",
+    "мр",
+    "зтр",
+    "зт",
+    "в т.ч.",
+    "в том числе",
+    "итого",
+    "всего",
+    "накладные",
+    "сметная прибыль",
+    "ндс",
+    "прямые затраты",
+    "затраты труда",
+    "оплата труда",
+    "эксплуатация машин",
+    "материальные ресурсы",
+    "наименование работ и затрат",
+)
+_LSR_421_SECTION_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^раздел\b", re.IGNORECASE
+)
+_LSR_421_POSITION_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^\d+(?:[.,]\d+)?$"
+)
+
+
+@dataclass(frozen=True)
+class _LSR421Layout:
+    """Фактические графы сметы по Приказу 421/пр в листе Excel.
+
+    Номера граф берутся из шапки, а не из физических колонок: в печатной
+    форме 421/пр «Ед. изм.» и «Количество» часто сдвинуты вправо из-за
+    объединенных ячеек наименования и блока стоимости.
+    """
+
+    header_row: int
+    code_col: int
+    title_col: int
+    unit_col: int
+    qty_col: int
+    position_col: int = 1
+    unit_price_col: Optional[int] = None
+    total_col: Optional[int] = None
+
+
 class LSRParser:
     """Парсер сметных расчетов Excel (форма по Приказу 421/пр и ТСН-2001 г. Москвы)."""
 
@@ -92,20 +144,312 @@ class LSRParser:
                 return value
         return None
 
+    def _resolve_worksheet(self, sheet_name: Optional[str]):
+        """Лист для разбора: явный ``sheet_name`` → ``ЛС ...`` → активный.
+
+        В комплектах СПб единственный лист называется
+        «Раздел ПД №11_ЛСР-...», поэтому fallback на активный (первый) лист
+        применяется только при отсутствии листов с префиксом ``ЛС ``.
+        """
+        if sheet_name:
+            return self.wb[sheet_name]
+        for name in self.wb.sheetnames:
+            if name.startswith("ЛС "):
+                return self.wb[name]
+        active = self.wb.active
+        if active is not None:
+            return active
+        return self.wb[self.wb.sheetnames[0]]
+
+    @staticmethod
+    def _header_cell_text(value: Any) -> str:
+        """Текст ячейки шапки: без переносов и в нижнем регистре."""
+        return re.sub(r"\s+", " ", str(value or "")).strip().lower()
+
+    @classmethod
+    def _find_header_column(
+        cls,
+        values: List[str],
+        predicate: Callable[[str], bool],
+        start: int = 0,
+    ) -> Optional[int]:
+        """Индекс (0-based) первой ячейки шапки, удовлетворяющей предикату."""
+        for index in range(start, len(values)):
+            if predicate(values[index]):
+                return index
+        return None
+
+    @classmethod
+    def _detect_421_layout(
+        cls, ws: Any, merge_map: Dict[tuple, Any]
+    ) -> Optional[_LSR421Layout]:
+        """Распознает шапку сметы по Приказу 421/пр.
+
+        Признак — одновременное присутствие граф «Обоснование»,
+        «Наименование», «Единица измерения» и «Количество». Форма 4б
+        ТСН-2001 содержит «Шифр расценки и коды ресурсов» и «Кол-во
+        единиц», поэтому под эту проверку не попадает.
+        """
+        max_row = min(ws.max_row, 80)
+        max_col = min(ws.max_column, 40)
+        for row_idx in range(1, max_row + 1):
+            values = [
+                cls._header_cell_text(
+                    merge_map.get(
+                        (row_idx, col), ws.cell(row=row_idx, column=col).value
+                    )
+                )
+                for col in range(1, max_col + 1)
+            ]
+            code_col = cls._find_header_column(
+                values, lambda value: value.startswith("обоснование")
+            )
+            title_col = cls._find_header_column(
+                values, lambda value: value.startswith("наименование")
+            )
+            unit_col = cls._find_header_column(
+                values,
+                lambda value: value.startswith(
+                    ("единица измерения", "ед. изм", "ед.изм")
+                ),
+            )
+            qty_col = cls._find_header_column(
+                values,
+                lambda value: value.startswith(("количество", "кол-во", "кол.")),
+            )
+            if None in (code_col, title_col, unit_col, qty_col):
+                continue
+            if not (code_col < title_col < unit_col < qty_col):
+                continue
+
+            unit_price_col: Optional[int] = None
+            total_col: Optional[int] = None
+            for sub_row in range(row_idx, min(row_idx + 4, ws.max_row) + 1):
+                sub_values = [
+                    cls._header_cell_text(
+                        merge_map.get(
+                            (sub_row, col),
+                            ws.cell(row=sub_row, column=col).value,
+                        )
+                    )
+                    for col in range(1, max_col + 1)
+                ]
+                if unit_price_col is None:
+                    unit_price_col = cls._find_header_column(
+                        sub_values,
+                        lambda value: value == "на единицу",
+                        start=qty_col + 1,
+                    )
+                total_candidates = [
+                    index
+                    for index in range(qty_col + 1, len(sub_values))
+                    if sub_values[index] == "всего"
+                ]
+                if total_candidates:
+                    total_col = total_candidates[-1]
+
+            return _LSR421Layout(
+                header_row=row_idx,
+                code_col=code_col + 1,
+                title_col=title_col + 1,
+                unit_col=unit_col + 1,
+                qty_col=qty_col + 1,
+                unit_price_col=(
+                    unit_price_col + 1 if unit_price_col is not None else None
+                ),
+                total_col=total_col + 1 if total_col is not None else None,
+            )
+        return None
+
+    @classmethod
+    def _resolve_421_section(cls, n_pp: str, title: str) -> str:
+        """Заголовок раздела 421/пр: «Раздел 1. ...» в графах 1 или 3."""
+        for value in (n_pp, title):
+            text = re.sub(r"\s+", " ", value).strip()
+            if text and _LSR_421_SECTION_PATTERN.match(text):
+                return text
+        return ""
+
+    @classmethod
+    def _extract_421_total(
+        cls, get_val: Callable[[int], Any], layout: _LSR421Layout
+    ) -> Optional[Decimal]:
+        """Итог блока «Всего по позиции» из графы базисной стоимости."""
+        if layout.total_col is None:
+            return None
+        value = cls._to_decimal(get_val(layout.total_col))
+        if value is not None and value != 0:
+            return value
+        return None
+
+    def _parse_421_items(
+        self,
+        ws: Any,
+        merge_map: Dict[tuple, Any],
+        layout: _LSR421Layout,
+    ) -> List[NormalizedItem]:
+        """Позиции сметы 421/пр: шифр, наименование, ед. изм., количество.
+
+        Читаются строки позиций и ресурсов; ресурсные строки привязываются
+        к последней расценке через ``parent_id``. Объемы — только ``Decimal``
+        (включая отрицательные значения исключаемых объемов).
+        """
+        items: List[NormalizedItem] = []
+        current_parent_id: Optional[str] = None
+        current_section = "Default_Section"
+        # Итог «Всего по позиции» относится к последней расценке, а не к
+        # последней ресурсной строке внутри нее.
+        pending_work_idx: Optional[int] = None
+
+        for row_idx in range(layout.header_row + 1, ws.max_row + 1):
+            def get_val(col_idx: int):
+                return merge_map.get(
+                    (row_idx, col_idx),
+                    ws.cell(row=row_idx, column=col_idx).value,
+                )
+
+            n_pp = str(get_val(layout.position_col) or "").strip()
+            raw_code = str(get_val(layout.code_col) or "").strip()
+            raw_title = str(get_val(layout.title_col) or "").strip()
+            raw_unit = str(get_val(layout.unit_col) or "").strip()
+            raw_qty = get_val(layout.qty_col)
+            title_lower = re.sub(r"\s+", " ", raw_title).strip().lower()
+
+            section = self._resolve_421_section(n_pp, raw_title)
+            if section:
+                current_section = section
+                pending_work_idx = None
+                continue
+
+            if self.TOTAL_ROW_PATTERN.match(title_lower):
+                total_cost = self._extract_421_total(get_val, layout)
+                if total_cost is not None and pending_work_idx is not None:
+                    pending_item = items[pending_work_idx]
+                    pending_item.total_cost = total_cost
+                    if pending_item.unit_price is None and pending_item.volume != 0:
+                        pending_item.unit_price = (
+                            total_cost / pending_item.volume
+                        ).quantize(Decimal("0.0001"))
+                    pending_work_idx = None
+                continue
+
+            # Строка нумерации граф: 1 | 2 | 3 | 4 | 5 ...
+            graph_row_values = [
+                str(get_val(col) or "").strip()
+                for col in (
+                    layout.position_col,
+                    layout.code_col,
+                    layout.title_col,
+                    layout.unit_col,
+                    layout.qty_col,
+                )
+            ]
+            if all(
+                value.isdigit() and len(value) <= 2
+                for value in graph_row_values
+            ):
+                continue
+            if not raw_title or not raw_unit:
+                continue
+
+            title_lower = re.sub(r"\s+", " ", raw_title).strip().lower()
+            if any(title_lower.startswith(p) for p in _LSR_421_NOISE_PREFIXES):
+                continue
+
+            qty_decimal = self._to_decimal(raw_qty)
+            if qty_decimal is None:
+                continue
+
+            first_code_line = raw_code.split("\n")[0].strip()
+            is_explicit_resource = bool(
+                self.RESOURCE_CODE_PATTERN.match(first_code_line)
+            )
+            is_numbered_position = bool(
+                _LSR_421_POSITION_PATTERN.fullmatch(n_pp)
+            )
+            is_work_rate = is_numbered_position or (
+                bool(self.BASE_RATE_PATTERN.match(first_code_line))
+                and not is_explicit_resource
+            )
+            item_id = f"LSR_{row_idx}"
+
+            if is_work_rate:
+                current_parent_id = item_id
+                parent_ref = None
+            else:
+                parent_ref = current_parent_id
+
+            canonical_u, norm_qty, mult = UnitNormalizer.normalize(
+                raw_unit, qty_decimal
+            )
+            clean_title = self._clean_estimate_title(raw_title)
+            dimensions = DimensionLockExtractor.extract(raw_title)
+            header_price = (
+                self._to_decimal(get_val(layout.unit_price_col))
+                if layout.unit_price_col is not None
+                else None
+            )
+            col_letter = openpyxl.utils.get_column_letter(layout.qty_col)
+            pointer = CellPointer(
+                doc_type="LSR",
+                file_name=self.file_path,
+                sheet_name=str(ws.title),
+                row_idx=row_idx,
+                col_letter=col_letter,
+                coordinate=f"{col_letter}{row_idx}",
+            )
+
+            items.append(NormalizedItem(
+                raw_id=item_id,
+                code=first_code_line if first_code_line else None,
+                raw_title=raw_title,
+                clean_title=clean_title,
+                raw_unit=raw_unit,
+                canonical_unit=canonical_u,
+                unit_multiplier=mult,
+                volume=norm_qty,
+                dimensions=dimensions,
+                context_section=current_section,
+                pointer=pointer,
+                is_resource=not is_work_rate,
+                parent_id=parent_ref,
+                unit_price=(
+                    header_price
+                    if header_price is not None and header_price > 0
+                    else None
+                ),
+            ))
+            if is_work_rate:
+                pending_work_idx = len(items) - 1
+
+        return items
+
     def parse(self, sheet_name: Optional[str] = None) -> List[NormalizedItem]:
         """Парсинг листа сметы в нормализованную плоскую коллекцию DTO.
 
         :param sheet_name: имя листа ``ЛС ...`` для пакетного/точечного
-            прогона. Без параметра используется активный лист книги.
+            прогона. Без параметра выбирается первый лист, начинающийся с
+            ``ЛС ``; только если таких листов нет — активный/первый лист
+            книги (комплект СПб именует лист «Раздел ПД №11_ЛСР-...»).
         :raises ValueError: запрошенный лист отсутствует в книге.
+
+        Методика определяется контекстно по шапке листа: структура 421/пр
+        (графы «Обоснование», «Наименование», «Ед. изм.», «Количество»)
+        разбирается отдельной веткой, иначе работает алгоритм ТСН-2001
+        формы 4б без изменений.
         """
         if sheet_name is not None and sheet_name not in self.wb.sheetnames:
             raise ValueError(
                 f"Лист '{sheet_name}' не найден в книге {self.file_path}. "
                 f"Доступны: {', '.join(self.wb.sheetnames)}"
             )
-        ws = self.wb[sheet_name] if sheet_name else self.wb.active
+        ws = self._resolve_worksheet(sheet_name)
         merge_map = self._resolve_merged_cells_map(ws)
+
+        layout_421 = self._detect_421_layout(ws, merge_map)
+        if layout_421 is not None:
+            return self._parse_421_items(ws, merge_map, layout_421)
+
         items: List[NormalizedItem] = []
 
         current_parent_id = None
@@ -266,6 +610,12 @@ _SPEC_TABLE_PAGE_MARKERS: tuple[str, ...] = (
 _VOR_PAGE_MARKERS: tuple[str, ...] = (
     "ведомость монтажных работ",
     "ведомость объемов работ",
+    "ведомость объёмов работ",
+    "добавляемые объемы",
+    "добавляемые объёмы",
+    "исключаемые объемы",
+    "исключаемые объёмы",
+    "дефектный акт",
     "наименование вида работ",
     "обоснование объема",
     # Форма ВОР ПК «ГРАНД-Смета»: шапка печатается на каждом листе и служит
@@ -295,6 +645,9 @@ _POSITION_PATTERN = re.compile(r"^\d{1,3}(?:[.,]\d{1,2})?[A-Za-zА-Яа-я]?$")
 # Служебный текст штампа и колонтитулов, который не является позицией.
 _SERVICE_ROW_TOKENS: tuple[str, ...] = (
     "согласовано",
+    "составил",
+    "проверил",
+    "утверждаю",
     "взам. инв",
     "инв. №",
     "подп. и дата",
@@ -981,6 +1334,23 @@ class PDFSpecParser:
         # сравнение выполняется по склеенному тексту без пробелов и дефисов.
         keys = [re.sub(r"[\s\-]+", "", cell) for cell in cells]
         joined = " ".join(cells)
+        # Форма ВОР СПб (5 граф): «№ п/п | Наименование | Ед. изм. | Кол. |
+        # Примечание». В такой форме заголовок количества сокращен до «Кол.»,
+        # поэтому общий поиск по «количество»/«объем» не срабатывает.
+        is_vor_5 = (
+            len(cells) == 5
+            and any("наименование" in cell for cell in cells)
+            and any(cell.startswith("кол") for cell in cells)
+        )
+        if is_vor_5:
+            return _ColumnSchema(
+                kind="VOR",
+                title_col=1,
+                unit_col=2,
+                qty_col=3,
+                position_col=0,
+                column_count=len(cells),
+            )
         # Форма ВОР ПК «ГРАНД-Смета»: 7 граф, количество в графе 4.
         is_grand_vor = cls._is_grand_vor_header(row)
 
