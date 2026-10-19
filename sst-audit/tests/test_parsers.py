@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import re
 from decimal import Decimal
 import openpyxl
@@ -6,7 +7,13 @@ import pytest
 
 from models import UnitClass
 import parsers
-from parsers import LSRParser, PDFLSRParser, PDFSpecParser
+from parsers import (
+    ExcelVORParser,
+    LSRParser,
+    PDFLSRParser,
+    PDFSpecParser,
+    get_spec_parser,
+)
 
 
 # ==============================================================================
@@ -1274,4 +1281,92 @@ def test_real_pdf_lsr_extracts_hierarchy_without_hardcoded_geometry():
     # Секции формы 4б не теряются при переходе между страницами.
     sections = {it.context_section for it in rates}
     assert "Раздел: 1 Кровля" in sections
+
+
+# ==============================================================================
+# 6. ПАРСЕР ДЕФЕКТНЫХ ВЕДОМОСТЕЙ И ВОР ИЗ EXCEL
+# ==============================================================================
+
+
+class TestExcelVORParserSynthetic:
+    """Разбор дефектной ведомости XLSX на синтетической таблице."""
+
+    @staticmethod
+    def _make_vor(path: Path) -> Path:
+        """Формирует таблицу с шапкой не в первой строке и сносками."""
+        workbook = openpyxl.Workbook()
+        worksheet = workbook.active
+        worksheet.title = "Дефектная ведомость"
+        worksheet.append(["УТВЕРЖДАЮ"])
+        worksheet.append(["ВЕДОМОСТЬ ОБЪЕМОВ РАБОТ № 02-01"])
+        worksheet.append(
+            ["№ п/п", "Наименование работ", "Ед. изм.", "Кол-во", "Обоснование"]
+        )
+        worksheet.append(["Раздел 1. Демонтаж"])
+        worksheet.append(
+            [1, "Демонтаж светильников", "шт", "1 234,5*", "ГЭСНр67-01-004-05"]
+        )
+        worksheet.append([2, "Разборка покрытий полов", "м2", 2.52, "ГЭСНр57-01-002-01"])
+        worksheet.append([3, "Монтаж кабеля", "100 м", "0,75", "ГЭСН16-04-005-02"])
+        worksheet.append([4, "Подзаголовок без объема", "", "", ""])
+        worksheet.append([5, "Укладка бетона", "м3", 12, "ГЭСН06-01-001-01"])
+        workbook.save(path)
+        return path
+
+    def test_excel_vor_parser_extracts_items(self, tmp_path: Path) -> None:
+        """Позиции извлекаются в NormalizedItem, объемы строго Decimal."""
+        path = self._make_vor(tmp_path / "defect.xlsx")
+
+        items = ExcelVORParser(path).extract_items()
+
+        assert len(items) == 4
+        assert [item.raw_id for item in items] == [
+            "VOR_EXCEL_1",
+            "VOR_EXCEL_2",
+            "VOR_EXCEL_3",
+            "VOR_EXCEL_4",
+        ]
+        assert [item.volume for item in items] == [
+            Decimal("1234.5"),
+            Decimal("2.52"),
+            Decimal("75"),
+            Decimal("12"),
+        ]
+        assert all(isinstance(item.volume, Decimal) for item in items)
+        assert [item.canonical_unit for item in items] == [
+            UnitClass.COUNT,
+            UnitClass.AREA,
+            UnitClass.LENGTH,
+            UnitClass.VOLUME,
+        ]
+        assert items[2].unit_multiplier == Decimal("100.0")
+
+        assert items[0].raw_title == "Демонтаж светильников"
+        assert items[0].clean_title == "демонтаж светильников"
+        assert items[0].raw_unit == "шт"
+        assert items[0].context_section == "Раздел 1. Демонтаж"
+        assert items[0].pointer.doc_type == "VOR_EXCEL"
+        assert items[0].pointer.sheet_name == "Дефектная ведомость"
+        assert items[0].pointer.row_idx == 5
+        assert items[0].pointer.col_letter == "B"
+        assert items[0].pointer.coordinate == "D5"
+
+
+def test_get_spec_parser_selects_parser_by_suffix(tmp_path: Path) -> None:
+    """Фабрика отдает ExcelVORParser для .xlsx и PDF-парсер для остальных."""
+    xlsx = tmp_path / "vor.xlsx"
+    xlsx.write_bytes(b"")
+
+    assert isinstance(get_spec_parser(xlsx), ExcelVORParser)
+
+    class _StubPDFParser:
+        def __init__(self, path: str) -> None:
+            self.path = path
+
+    parser = get_spec_parser(
+        tmp_path / "vor.PDF", pdf_parser_cls=_StubPDFParser
+    )
+
+    assert isinstance(parser, _StubPDFParser)
+    assert parser.path.endswith("vor.PDF")
 
