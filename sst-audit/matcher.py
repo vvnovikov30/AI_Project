@@ -1,5 +1,7 @@
 import re
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
+from enum import Enum
 from typing import Any, Dict, Final, Optional, Sequence
 
 from rapidfuzz import fuzz
@@ -17,6 +19,38 @@ from models import (
     RuleEvaluation,
     UnitClass,
 )
+
+
+# Порог Exact Match Bypass: лексическое сходство, при котором связь
+# считается точной без проверки отрыва от второго кандидата.
+EXACT_MATCH_THRESHOLD: Final[Decimal] = Decimal("0.95")
+# Порог автоматического принятия связи в серой зоне.
+AUTO_MATCH_THRESHOLD: Final[Decimal] = Decimal("0.70")
+# Минимальный отрыв лидера от второго уникального кандидата.
+AMBIGUITY_MARGIN: Final[Decimal] = Decimal("0.05")
+# Допуск на погрешность округления объемов при проверке нулевой дельты.
+VOLUME_ABS_TOLERANCE: Final[Decimal] = Decimal("0.001")
+VOLUME_REL_TOLERANCE: Final[Decimal] = Decimal("0.01")
+
+
+class MatchStatus(str, Enum):
+    """Контракт терминальных статусов связи «смета ↔ РД» (SSOT-строки)."""
+
+    AUTO = "AUTO"
+    HITL_PENDING = "HITL_PENDING"
+
+
+@dataclass(frozen=True)
+class CandidateDecision:
+    """Решение по дедуплицированному пулу кандидатов одной позиции сметы."""
+
+    smeta_item: NormalizedItem
+    rd_item: Optional[NormalizedItem]
+    score: Decimal
+    status: MatchStatus
+    margin: Decimal
+    reason: str
+    candidates: tuple[tuple[Any, Decimal], ...] = ()
 
 
 class CascadeMatcher:
@@ -183,12 +217,197 @@ class CompositeMatcher:
         return base_confidence, final_confidence
 
     @staticmethod
-    def _candidate_key(item: NormalizedItem) -> tuple[str, Decimal, str]:
-        """Ключ уникальности кандидата: имя + объем + единица измерения."""
-        return (
-            item.raw_title.strip().lower(),
-            item.volume,
-            (item.raw_unit or item.canonical_unit.value).strip().lower(),
+    def _to_decimal(value: Any) -> Decimal:
+        """Приводит score/объем к ``Decimal`` без потери точности ``str``."""
+        if isinstance(value, Decimal):
+            return value
+        if value is None:
+            return Decimal("0")
+        return Decimal(str(value))
+
+    @classmethod
+    def _extract_candidate_payload(cls, cand: Any) -> tuple[Any, Decimal]:
+        """Безопасно распаковывает кандидата любой поддерживаемой формы.
+
+        В пуле встречаются ``ScoredCandidate`` (``cand.item`` /
+        ``cand.rd_item``), кортежи ``(score, item)`` / ``(item, score)`` и
+        «голые» :class:`NormalizedItem`. Хелпер исключает ``AttributeError``
+        на любой из этих форм.
+
+        :return: кортеж ``(item, score)``, где ``score`` — строго ``Decimal``.
+        """
+        if hasattr(cand, "item"):
+            return cand.item, cls._to_decimal(getattr(cand, "score", None))
+        if hasattr(cand, "rd_item"):
+            return cand.rd_item, cls._to_decimal(getattr(cand, "score", None))
+        if isinstance(cand, (tuple, list)):
+            if len(cand) != 2:
+                return cand, cls._to_decimal(getattr(cand, "score", None))
+            first, second = cand
+            if isinstance(first, (int, float, Decimal)) and not isinstance(first, bool):
+                return second, cls._to_decimal(first)
+            return first, cls._to_decimal(second)
+        return cand, cls._to_decimal(getattr(cand, "score", None))
+
+    # Обратная совместимость с контрактом ``_unwrap_candidate``.
+    _unwrap_candidate = _extract_candidate_payload
+
+    @classmethod
+    def _candidate_key(cls, item: Any) -> tuple[str, Optional[Decimal], str]:
+        """Ключ уникальности кандидата: имя + объем + единица измерения.
+
+        Наименование берется из ``clean_title`` (fallback ``raw_title``),
+        единица — из ``canonical_unit`` (fallback ``raw_unit``), поэтому
+        косметические различия источников не порождают ложных дубликатов.
+        """
+        title = getattr(item, "clean_title", None) or getattr(item, "raw_title", "") or ""
+        volume = getattr(item, "volume", None)
+        if volume is not None and not isinstance(volume, Decimal):
+            volume = Decimal(str(volume))
+        unit = getattr(item, "canonical_unit", None)
+        if unit is None:
+            unit = getattr(item, "raw_unit", None)
+        unit_value = getattr(unit, "value", unit)
+        return (str(title).strip().lower(), volume, str(unit_value or "").strip().lower())
+
+    @classmethod
+    def deduplicate_candidates(
+        cls, candidates: Sequence[Any]
+    ) -> list[tuple[Any, Decimal]]:
+        """Схлопывает семантические дубликаты до расчета отрыва (Margin).
+
+        Из группы с идентичным ``(clean_title, volume, canonical_unit)``
+        остается только кандидат с максимальным score. Результат отсортирован
+        по убыванию score; при равенстве сохраняется исходный порядок пула.
+        """
+        best: dict[tuple[str, Optional[Decimal], str], tuple[Any, Decimal]] = {}
+        order: list[tuple[str, Optional[Decimal], str]] = []
+        for cand in candidates:
+            item, score = cls._extract_candidate_payload(cand)
+            if item is None:
+                continue
+            key = cls._candidate_key(item)
+            current = best.get(key)
+            if current is None:
+                best[key] = (item, score)
+                order.append(key)
+            elif score > current[1]:
+                best[key] = (item, score)
+        return sorted((best[key] for key in order), key=lambda pair: pair[1], reverse=True)
+
+    @classmethod
+    def _volume_delta(cls, rd_item: Any, smeta_item: Any) -> Optional[Decimal]:
+        """Абсолютная дельта объемов пары либо ``None`` без количественных данных."""
+        rd_volume = getattr(rd_item, "volume", None)
+        smeta_volume = getattr(smeta_item, "volume", None)
+        if rd_volume is None or smeta_volume is None:
+            return None
+        return abs(cls._to_decimal(rd_volume) - cls._to_decimal(smeta_volume))
+
+    @classmethod
+    def _volume_within_tolerance(
+        cls,
+        rd_item: Any,
+        smeta_item: Any,
+        tolerance: Optional[Decimal] = None,
+    ) -> bool:
+        """Zero Float Policy: ``abs(delta_volume) <= tolerance``.
+
+        Без явного допуска применяется регламентированная комбинация
+        абсолютного (``0.001``) и относительного (``1%``) порогов.
+        """
+        delta = cls._volume_delta(rd_item, smeta_item)
+        if delta is None:
+            return False
+        if tolerance is not None:
+            return delta <= tolerance
+        rd_value = abs(cls._to_decimal(getattr(rd_item, "volume", Decimal("0"))))
+        smeta_value = abs(
+            cls._to_decimal(getattr(smeta_item, "volume", Decimal("0")))
+        )
+        allowed = max(
+            VOLUME_ABS_TOLERANCE, VOLUME_REL_TOLERANCE * max(rd_value, smeta_value)
+        )
+        return delta <= allowed
+
+    @staticmethod
+    def _units_compatible(smeta_item: Any, rd_item: Any) -> bool:
+        """Совместимость размерностей пары (мягкий Unit Gate)."""
+        return not CascadeMatcher._units_incompatible(rd_item, smeta_item)
+
+    @classmethod
+    def resolve_match(
+        cls,
+        smeta_item: NormalizedItem,
+        candidates: Sequence[Any],
+        *,
+        exact_threshold: Decimal = EXACT_MATCH_THRESHOLD,
+        auto_threshold: Decimal = AUTO_MATCH_THRESHOLD,
+        margin_threshold: Decimal = AMBIGUITY_MARGIN,
+        tolerance: Optional[Decimal] = None,
+    ) -> CandidateDecision:
+        """Классифицирует связь по дедуплицированному пулу кандидатов.
+
+        Порядок решений:
+
+        1. Exact Match Bypass: ``score >= exact_threshold``, нулевая дельта
+           объема в пределах допуска и совместимые единицы дают ``AUTO``
+           без проверки отрыва от Top-2.
+        2. Иначе отрыв считается по уникальным кандидатам; отсутствие Top-2
+           трактуется как полный отрыв ``Decimal("1.0")``.
+        3. ``AUTO`` при ``score >= auto_threshold`` и
+           ``margin >= margin_threshold``, иначе ``HITL_PENDING``.
+
+        :param candidates: пул в любой форме, поддерживаемой
+            :meth:`_extract_candidate_payload`; score — в долевой шкале ``0..1``.
+        """
+        pool = cls.deduplicate_candidates(candidates)
+        if not pool:
+            return CandidateDecision(
+                smeta_item=smeta_item,
+                rd_item=None,
+                score=Decimal("0"),
+                status=MatchStatus.AUTO,
+                margin=Decimal("1.0"),
+                reason="NO_CANDIDATE",
+                candidates=(),
+            )
+
+        best_item, best_score = pool[0]
+        margin = (
+            (best_score - pool[1][1]).quantize(
+                cls.SCORE_QUANTUM, rounding=ROUND_HALF_UP
+            )
+            if len(pool) > 1
+            else Decimal("1.0")
+        )
+
+        if (
+            best_score >= exact_threshold
+            and cls._volume_within_tolerance(best_item, smeta_item, tolerance)
+            and cls._units_compatible(smeta_item, best_item)
+        ):
+            status = MatchStatus.AUTO
+            reason = "EXACT_MATCH_BYPASS"
+        elif best_score >= auto_threshold and margin >= margin_threshold:
+            status = MatchStatus.AUTO
+            reason = "MARGIN_CONFIRMED"
+        else:
+            status = MatchStatus.HITL_PENDING
+            reason = (
+                "AMBIGUOUS_MARGIN"
+                if best_score >= auto_threshold
+                else "BELOW_AUTO_THRESHOLD"
+            )
+
+        return CandidateDecision(
+            smeta_item=smeta_item,
+            rd_item=best_item,
+            score=best_score,
+            status=status,
+            margin=margin,
+            reason=reason,
+            candidates=tuple(pool),
         )
 
     @classmethod

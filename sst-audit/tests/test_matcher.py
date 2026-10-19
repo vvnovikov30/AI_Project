@@ -1,8 +1,9 @@
 import pytest
 from decimal import Decimal
+from types import SimpleNamespace
 from models import NormalizedItem, CellPointer, UnitClass
 from evaluator import PredicateEvaluator
-from matcher import CascadeMatcher, CompositeMatcher
+from matcher import CascadeMatcher, CompositeMatcher, MatchStatus
 from normalizer import UnitNormalizer
 
 
@@ -493,3 +494,153 @@ class TestVolumeGateCandidates:
         assert len(ranked) == 1
         assert ranked[0][0] is rd_item
         assert ranked[0][1] == Decimal("1.0000")
+
+
+class TestExactMatchBypassAndDeduplication:
+    """Margin Trap: 100% совпадение и клоны кандидатов (Спринт 5.3)."""
+
+    def test_exact_match_with_zero_delta_gets_auto_status(self) -> None:
+        """Top-1 100% + нулевая дельта получает AUTO без проверки отрыва."""
+        smeta_item = _node(
+            "LSR_1", "Труба стальная 57х3.5", UnitClass.LENGTH, "10", "м"
+        )
+        exact = _node(
+            "SPEC_1", "Труба стальная 57х3.5", UnitClass.LENGTH, "10", "м"
+        )
+        clone = _node(
+            "SPEC_2", "  труба стальная 57х3.5 ", UnitClass.LENGTH, "10", "м"
+        )
+        other = _node(
+            "SPEC_3", "Труба стальная 89х4", UnitClass.LENGTH, "10", "м"
+        )
+
+        decision = CompositeMatcher.resolve_match(
+            smeta_item,
+            [
+                (exact, Decimal("1.0")),
+                (clone, Decimal("1.0")),
+                (other, Decimal("0.96")),
+            ],
+        )
+
+        assert decision.status is MatchStatus.AUTO
+        assert decision.status.value == "AUTO"
+        assert decision.reason == "EXACT_MATCH_BYPASS"
+        assert decision.rd_item is exact
+        # Клон не участвует в отрыве: margin считается от семантически
+        # отличного кандидата и равен 0.04, что ниже порога 0.05.
+        assert decision.margin == Decimal("0.0400")
+
+    def test_candidate_pool_deduplication_by_clean_title_and_volume(self) -> None:
+        """Клоны по clean_title + volume + canonical_unit схлопываются до margin."""
+        smeta_item = _node(
+            "LSR_1", "Кабель силовой ВВГнг 3х1.5", UnitClass.LENGTH, "10", "м"
+        )
+        first = _node(
+            "SPEC_1", "Кабель силовой ВВГнг 3х1.5", UnitClass.LENGTH, "10", "м"
+        )
+        duplicate = _node(
+            "SPEC_2", "кабель силовой ввгнг 3х1.5 ", UnitClass.LENGTH, "10", "м"
+        )
+        third = _node(
+            "SPEC_3", "Кабель силовой ВВГнг 3х2.5", UnitClass.LENGTH, "10", "м"
+        )
+
+        pool = CompositeMatcher.deduplicate_candidates(
+            [
+                (first, Decimal("0.94")),
+                (duplicate, Decimal("0.92")),
+                (third, Decimal("0.90")),
+            ]
+        )
+
+        assert [item.raw_id for item, _ in pool] == ["SPEC_1", "SPEC_3"]
+        assert all(score <= Decimal("0.94") for _, score in pool)
+
+        decision = CompositeMatcher.resolve_match(
+            smeta_item,
+            [
+                (first, Decimal("0.94")),
+                (duplicate, Decimal("0.92")),
+                (third, Decimal("0.90")),
+            ],
+        )
+
+        assert len(decision.candidates) == 2
+        assert decision.rd_item is first
+        # Отрыв считается от SPEC_3, а не от клона SPEC_2.
+        assert decision.margin == Decimal("0.0400")
+        assert decision.status is MatchStatus.HITL_PENDING
+        assert decision.reason == "AMBIGUOUS_MARGIN"
+
+    def test_auto_status_records_excluded_from_hitl_pending_queue(self) -> None:
+        """AUTO-записи не попадают в очередь ручной проверки HITL_PENDING."""
+        from main import match_items
+
+        smeta_exact = _node(
+            "LSR_EXACT", "Труба стальная 57х3.5", UnitClass.LENGTH, "10", "м"
+        )
+        rd_exact = _node(
+            "SPEC_EXACT", "Труба стальная 57х3.5", UnitClass.LENGTH, "10", "м"
+        )
+        smeta_ambiguous = _node(
+            "LSR_AMB", "Кабель силовой ВВГнг 3х1.5", UnitClass.LENGTH, "10", "м"
+        )
+        rd_ambiguous = _node(
+            "SPEC_AMB1", "Кабель силовой ВВГнг 3х1.5", UnitClass.LENGTH, "12", "м"
+        )
+        rd_similar = _node(
+            "SPEC_AMB2", "Кабель силовой ВВГнг 3х2.5", UnitClass.LENGTH, "10", "м"
+        )
+
+        decisions = match_items(
+            [rd_exact, rd_ambiguous, rd_similar],
+            [smeta_exact, smeta_ambiguous],
+        )
+
+        auto_decisions = [d for d in decisions if d.status == "AUTO"]
+        pending = [d for d in decisions if d.status == "HITL_PENDING"]
+
+        exact_decision = next(
+            d for d in decisions if d.smeta_item is not None
+            and d.smeta_item.raw_id == "LSR_EXACT"
+        )
+        assert exact_decision.status == "AUTO"
+        assert exact_decision.rd_item is rd_exact
+        assert exact_decision not in pending
+
+        assert pending, "Неоднозначная пара должна остаться в очереди HITL"
+        assert all(d.status == "HITL_PENDING" for d in pending)
+        assert all(d not in pending for d in auto_decisions)
+        pending_smeta_ids = {
+            d.smeta_item.raw_id for d in pending if d.smeta_item is not None
+        }
+        assert "LSR_EXACT" not in pending_smeta_ids
+        assert "LSR_AMB" in pending_smeta_ids
+
+    def test_candidate_payload_unwrap_handles_all_shapes(self) -> None:
+        """Хелпер распаковки не падает на ScoredCandidate, кортежах и item."""
+        item = _node(
+            "SPEC_1", "Труба стальная 57х3.5", UnitClass.LENGTH, "10", "м"
+        )
+        wrapped = SimpleNamespace(item=item, score=Decimal("0.97"))
+        rd_wrapped = SimpleNamespace(rd_item=item, score=0.97)
+
+        assert CompositeMatcher._extract_candidate_payload(wrapped) == (
+            item,
+            Decimal("0.97"),
+        )
+        assert CompositeMatcher._unwrap_candidate(rd_wrapped) == (
+            item,
+            Decimal("0.97"),
+        )
+        assert CompositeMatcher._extract_candidate_payload(
+            (Decimal("0.5"), item)
+        ) == (item, Decimal("0.5"))
+        assert CompositeMatcher._extract_candidate_payload(
+            (item, Decimal("0.8"))
+        ) == (item, Decimal("0.8"))
+        assert CompositeMatcher._extract_candidate_payload(item) == (
+            item,
+            Decimal("0"),
+        )
