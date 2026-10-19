@@ -9,10 +9,11 @@
 * Все операции записи выполняются в явных транзакциях с rollback при ошибке.
   Вложенные вызовы ``transaction()`` используют SAVEPOINT, поэтому пайплайн
   может атомарно объединить несколько CRUD-операций в одну транзакцию.
-* Объемы и стоимости хранятся в числовых колонках SQLite (REAL) для
-  совместимости с отчетными/BI-инструментами. На входе CRUD-методов
-  допускается ``Decimal``: конвертация выполняется только на границе
-  персистентности, расчетное ядро остается целиком на ``Decimal``.
+* Объемы, стоимости и веса правил хранятся в TEXT-колонках: SQLite не
+  выполняет неявный float-кастинг 8-байтного IEEE 754, а точность
+  ``Decimal`` сохраняется полностью (``str(Decimal)`` на записи,
+  ``Decimal(str)`` на чтении). Расчетное ядро остается целиком на
+  ``Decimal``.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from itertools import count
 import json
 import logging
 from pathlib import Path
+import re
 import sqlite3
 from typing import Any, Final, TypeAlias
 
@@ -53,7 +55,7 @@ VALID_RULE_STATUSES: Final[frozenset[str]] = RULE_EVALUATION_STATUSES
 _SAVEPOINT_SEQ: Iterator[int] = count(1)
 
 # Тип значения, которое sqlite3 способен принять без дополнительных адаптеров.
-SQLNumber: TypeAlias = int | str | None
+SQLNumber: TypeAlias = str | None
 
 # Вход батча предикатов: типизированная модель либо legacy-словарь main.py.
 RuleEvaluationInput: TypeAlias = RuleEvaluation | Mapping[str, Any]
@@ -76,7 +78,7 @@ CREATE TABLE IF NOT EXISTS rd_items (
     code TEXT,
     description TEXT NOT NULL,
     unit TEXT NOT NULL,
-    quantity REAL NOT NULL,
+    quantity TEXT NOT NULL,
     raw_payload JSON
 );
 
@@ -87,9 +89,9 @@ CREATE TABLE IF NOT EXISTS smeta_items (
     code TEXT NOT NULL,
     description TEXT NOT NULL,
     unit TEXT NOT NULL,
-    quantity REAL NOT NULL,
-    unit_price REAL NOT NULL,
-    total_cost REAL NOT NULL,
+    quantity TEXT NOT NULL,
+    unit_price TEXT NOT NULL,
+    total_cost TEXT NOT NULL,
     parent_id INTEGER,
     raw_payload JSON
 );
@@ -216,7 +218,17 @@ CREATE INDEX IF NOT EXISTS idx_rule_eval_lookup ON rule_evaluations(session_id, 
 # Индексы, зависящие от колонок, которые добавляются миграциями.
 POST_MIGRATION_INDEXES_SQL: Final[str] = """
 CREATE INDEX IF NOT EXISTS idx_smeta_items_parent ON smeta_items(session_id, parent_id);
+CREATE INDEX IF NOT EXISTS idx_rd_items_session ON rd_items(session_id);
+CREATE INDEX IF NOT EXISTS idx_smeta_items_session ON smeta_items(session_id);
 """
+
+# Числовые колонки, которые обязаны иметь TEXT-аффинити: REAL в SQLite
+# приводит Decimal к IEEE 754 float уже на записи.
+NUMERIC_TEXT_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
+    "rd_items": ("quantity",),
+    "smeta_items": ("quantity", "unit_price", "total_cost"),
+    "rule_evaluations": ("score_weight",),
+}
 
 
 # ----------------------------------------------------------------------
@@ -325,6 +337,121 @@ def _migrate_rule_evaluations_schema(conn: sqlite3.Connection) -> None:
     conn.execute(f"DROP TABLE {legacy_table}")
 
 
+def _needs_text_migration(
+    conn: sqlite3.Connection,
+    table: str,
+    numeric_columns: tuple[str, ...],
+) -> bool:
+    """Проверяет, объявлена ли хотя бы одна числовая колонка не как TEXT."""
+    declared = {
+        str(row["name"]): str(row["type"] or "").upper()
+        for row in conn.execute(f"PRAGMA table_info({table})")
+    }
+    return any(
+        declared.get(column, "TEXT") != "TEXT" for column in numeric_columns
+    )
+
+
+def _rebuild_numeric_columns_as_text(
+    conn: sqlite3.Connection,
+    table: str,
+    numeric_columns: tuple[str, ...],
+) -> None:
+    """Пересобирает таблицу с TEXT-аффинити, сохраняя все данные и колонки.
+
+    REAL-значения переводятся в текст через ``CAST(... AS TEXT)``: исходная
+    точность уже потеряна при записи во float, но дальнейшие записи идут
+    только строкой. Схема берется из ``sqlite_master``, поэтому миграция
+    сохраняет legacy-колонки и ограничения.
+    """
+    source = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    if source is None or not source["sql"]:
+        return
+
+    new_table = f"{table}__text_migration"
+    create_sql = str(source["sql"])
+    for column in numeric_columns:
+        create_sql = re.sub(
+            rf"\b{re.escape(column)}\s+REAL\b",
+            f"{column} TEXT",
+            create_sql,
+            flags=re.IGNORECASE,
+        )
+
+    renamed_sql, replacements = re.subn(
+        rf"^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\"']?{re.escape(table)}[\"']?",
+        f'CREATE TABLE "{new_table}"',
+        create_sql,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    if replacements != 1:
+        raise RuntimeError(
+            f"Не удалось разобрать DDL таблицы {table}: {create_sql[:120]!r}"
+        )
+
+    column_names = [
+        str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")
+    ]
+    quoted_columns = ", ".join(f'"{name}"' for name in column_names)
+    select_columns = ", ".join(
+        f'CAST("{name}" AS TEXT)' if name in numeric_columns else f'"{name}"'
+        for name in column_names
+    )
+
+    conn.execute(f'DROP TABLE IF EXISTS "{new_table}"')
+    conn.execute(renamed_sql)
+    conn.execute(
+        f'INSERT INTO "{new_table}" ({quoted_columns}) '
+        f'SELECT {select_columns} FROM "{table}"'
+    )
+    conn.execute(f'DROP TABLE "{table}"')
+    conn.execute(f'ALTER TABLE "{new_table}" RENAME TO "{table}"')
+
+
+def _migrate_numeric_columns_to_text(conn: sqlite3.Connection) -> None:
+    """Идемпотентно переводит числовые колонки устаревшей БД в TEXT.
+
+    Пересборка выполняется при отключенных FK и в одной транзакции:
+    ``match_records`` ссылается на ``rd_items``/``smeta_items``, поэтому
+    каскадное удаление при ``DROP TABLE`` недопустимо.
+    """
+    pending = [
+        (table, columns)
+        for table, columns in NUMERIC_TEXT_COLUMNS.items()
+        if _needs_text_migration(conn, table, columns)
+    ]
+    if not pending:
+        return
+
+    # Представление ссылается на пересобираемые таблицы: на время DDL его
+    # нужно снять, иначе SQLite проверяет схему при RENAME и падает.
+    view = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = 'v_audit_export'"
+    ).fetchone()
+
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("BEGIN")
+        try:
+            conn.execute("DROP VIEW IF EXISTS v_audit_export")
+            for table, columns in pending:
+                _rebuild_numeric_columns_as_text(conn, table, columns)
+            if view is not None and view["sql"]:
+                conn.execute(str(view["sql"]))
+        except BaseException:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     """Идемпотентно создает таблицы, индексы и представление v_audit_export."""
     conn.execute("PRAGMA foreign_keys = ON")
@@ -333,6 +460,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _migrate_sessions_schema(conn)
     _migrate_smeta_items_schema(conn)
     _migrate_rule_evaluations_schema(conn)
+    _migrate_numeric_columns_to_text(conn)
     # Индексы по колонкам, которые могли быть добавлены миграциями.
     conn.executescript(RULE_EVALUATIONS_SQL)
     conn.executescript(POST_MIGRATION_INDEXES_SQL)
@@ -345,26 +473,24 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 def _to_sql_number(value: object) -> SQLNumber:
-    """Приводит значение ядра к типу, нативно принимаемому sqlite3.
+    """Приводит значение ядра к TEXT-представлению для sqlite3.
 
     SQLite не имеет встроенного адаптера ``Decimal``, поэтому конвертация
-    выполняется только здесь — на границе записи в REAL-колонки. ``Decimal``
-    передается строкой: REAL-аффинити колонки SQLite приводят ее к числу без
-    промежуточного Python-float и связанной с ним потери точности.
+    выполняется только здесь — на границе записи. Любое непустое значение
+    сериализуется в ``str``: TEXT-аффинити колонки сохраняют точную строку
+    без промежуточного Python-float и связанной с ним потери точности.
     """
     if value is None:
         return None
     if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, (int, str)):
-        return value
+        return str(int(value))
     if isinstance(value, Decimal):
         return str(value)
     return str(value)
 
 
 def _to_decimal(value: object, default: Decimal = Decimal("0")) -> Decimal:
-    """Приводит значение из SQLite (REAL/TEXT) обратно к ``Decimal``."""
+    """Приводит значение из SQLite (TEXT) обратно к ``Decimal``."""
     if value is None:
         return default
     if isinstance(value, Decimal):
@@ -898,7 +1024,7 @@ def update_match_link(
     conn: sqlite3.Connection,
     match_id: int,
     rd_item_id: int | None,
-    confidence_score: Decimal | int | float | str,
+    confidence_score: Decimal | int | str,
 ) -> None:
     """Уточняет связь по решению эксперта (кандидат РД, выбранный в HITL).
 
@@ -931,7 +1057,7 @@ def record_expert_review(
     decision: str,
     reason_code: str | None = None,
     comment: str | None = None,
-    adjusted_ratio: Decimal | int | float | str | None = None,
+    adjusted_ratio: Decimal | int | str | None = None,
 ) -> int:
     """Фиксирует экспертизу связи и переводит ее в статус RESOLVED.
 

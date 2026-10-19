@@ -1092,6 +1092,131 @@ _GRAND_VOR_HEADER_MARKERS: tuple[str, ...] = (
 # Строка раздела ведомости: «Раздел: 1. Кровля», «Раздел 2. Фасад».
 _VOR_SECTION_PATTERN = re.compile(r"^раздел\b", re.IGNORECASE)
 
+# ----------------------------------------------------------------------
+# 3.0. Метрологические фильтры табличного мусора
+# ----------------------------------------------------------------------
+# Служебные слова шапок ВОР/спецификаций. Строка, целиком состоящая из
+# них, является артефактом распознавания таблицы, а не позицией.
+_TABLE_HEADER_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "наименование",
+        "наименования",
+        "наименований",
+        "обоснование",
+        "обоснования",
+        "обоснований",
+        "единица",
+        "единицы",
+        "единиц",
+        "измерение",
+        "измерения",
+        "измерений",
+        "количество",
+        "количества",
+        "количеств",
+        "примечание",
+        "примечания",
+        "примечаний",
+        "масса",
+        "массы",
+        "код",
+        "кода",
+        "колво",
+        "кол",
+        "ед",
+        "изм",
+        "номер",
+        "номера",
+        "пп",
+        "работ",
+        "работы",
+        "затрат",
+        "затраты",
+    }
+)
+# Основания служебных слов: «наименование вида работ», «количество».
+_TABLE_HEADER_STEMS: Final[tuple[str, ...]] = (
+    "наименован",
+    "обоснован",
+    "количеств",
+    "измерен",
+    "примечан",
+)
+# Явные надписи шапок, которые встречаются без знаков препинания.
+_TABLE_HEADER_LITERALS: Final[frozenset[str]] = frozenset(
+    {
+        "наименование",
+        "наименование работ",
+        "наименование вида работ",
+        "наименование работ, ресурсов, затрат",
+        "кол-во",
+        "ед. изм.",
+        "ед.изм.",
+        "единица измерения",
+    }
+)
+# Системные надписи томов РД: колонтитулы, штампы и титулы разделов.
+_STAMP_OR_TITLE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^(?:(?:раздел|том)(?:\s*\d+(?:[.\-]\d+)*)?"
+    r"|проектная\s+документация"
+    r"|архитектурные\s+решения"
+    r"|ведомость\s+объемов"
+    r"|лист\s*\d+)$"
+)
+
+
+def _artifact_text(value: str) -> str:
+    """Нормализует надпись для сравнения с шапками и штампами таблиц.
+
+    Восстанавливает битую кодировку PDF (cp866/cp1251), приводит строку к
+    нижнему регистру, заменяет ``ё`` на ``е`` и схлопывает пробелы.
+    """
+    text = _repair_pdf_text(str(value or "")).replace("\xa0", " ")
+    return re.sub(r"\s+", " ", text.casefold().replace("ё", "е")).strip()
+
+
+def _is_table_header_artifact(name: str) -> bool:
+    """Является ли наименование шапкой таблицы, а не позицией ВОР.
+
+    Строка отсекается, когда все ее токены (после удаления пунктуации)
+    входят в набор служебных слов шапки либо начинаются с их оснований.
+    """
+    text = _artifact_text(name)
+    if not text:
+        return False
+    if text in _TABLE_HEADER_LITERALS:
+        return True
+    tokens = [
+        token for token in re.sub(r"[^\w\s]", " ", text).split() if token
+    ]
+    if not tokens:
+        return False
+    return all(
+        token in _TABLE_HEADER_WORDS
+        or any(token.startswith(stem) for stem in _TABLE_HEADER_STEMS)
+        for token in tokens
+    )
+
+
+def _is_stamp_or_title_artifact(name: str, code: Optional[str] = None) -> bool:
+    """Отсекает колонтитулы и штампы томов РД («Лист 1», «Том 1»).
+
+    ``code`` принимается для совместимости с единым барьером валидности:
+    номер графы не подтверждает физический объем, поэтому надпись
+    отсекается независимо от заполненного кода позиции.
+    """
+    text = _artifact_text(name)
+    if not text:
+        return False
+    return _STAMP_OR_TITLE_PATTERN.fullmatch(text) is not None
+
+
+def _has_measured_title(name: str) -> bool:
+    """Проверяет, что в наименовании есть осмысленная буквенная часть."""
+    letters = re.sub(r"[^A-Za-zА-Яа-яЁё]", "", name or "")
+    return len(letters) >= 3
+
+
 
 @dataclass(frozen=True)
 class _ColumnSchema:
@@ -2363,6 +2488,13 @@ class PDFSpecParser:
                     )
 
                     if parsed_qty is None:
+                        # Шапка/штамп не участвует ни в разделах, ни в
+                        # сшивке переносов наименований.
+                        if _is_table_header_artifact(
+                            raw_title
+                        ) or _is_stamp_or_title_artifact(raw_title):
+                            carried_over_row = None
+                            continue
                         section = self._resolve_vor_section(row, current_schema)
                         if section:
                             current_section = section
@@ -2386,6 +2518,24 @@ class PDFSpecParser:
                         )
 
                     if not raw_title or self._is_service_value(raw_title):
+                        carried_over_row = None
+                        continue
+
+                    # Метрологический барьер: шапки таблиц, штампы томов и
+                    # строки без осмысленного наименования не являются
+                    # материалами/работами ведомости.
+                    if _is_table_header_artifact(raw_title):
+                        carried_over_row = None
+                        continue
+                    if _is_stamp_or_title_artifact(
+                        raw_title, self._resolve_code(row, row_schema)
+                    ):
+                        carried_over_row = None
+                        continue
+                    if not _has_measured_title(raw_title):
+                        carried_over_row = None
+                        continue
+                    if str(parsed_qty).strip() in ("", "None", "unknown"):
                         carried_over_row = None
                         continue
 

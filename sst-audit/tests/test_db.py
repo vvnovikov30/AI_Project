@@ -166,6 +166,82 @@ def test_init_db_creates_tables_and_view(conn: sqlite3.Connection) -> None:
         "reviewed_at",
     } <= view_columns
 
+def test_db_schema_numeric_columns_are_text(conn: sqlite3.Connection) -> None:
+    """Числовые колонки объявлены TEXT: SQLite не кастует Decimal во float."""
+    expected = {
+        "rd_items": {"quantity"},
+        "smeta_items": {"quantity", "unit_price", "total_cost"},
+        "rule_evaluations": {"score_weight"},
+    }
+    for table, columns in expected.items():
+        declared = {
+            row["name"]: str(row["type"]).upper()
+            for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        for column in columns:
+            assert declared.get(column) == "TEXT", (
+                f"{table}.{column} объявлена как {declared.get(column)!r}, "
+                "ожидался TEXT"
+            )
+
+
+def test_db_stores_and_loads_decimal_as_text_without_float_conversion(
+    conn: sqlite3.Connection,
+) -> None:
+    """Точность Decimal сохраняется: запись строкой, чтение через Decimal(str)."""
+    create_session(conn, SESSION_ID, "Проект", "rd.pdf", "smeta.xlsx")
+    quantity = Decimal("-840.97440001")
+    unit_price = Decimal("1234.567890123456789")
+    total_cost = Decimal("-1038903.45678901")
+
+    save_rd_items(
+        conn,
+        SESSION_ID,
+        [
+            {
+                "row_idx": 12,
+                "code": "ФССЦ-21.1.06.04-0012",
+                "description": "Кабель силовой",
+                "unit": "100 м",
+                "quantity": quantity,
+            }
+        ],
+    )
+    save_smeta_items(
+        conn,
+        SESSION_ID,
+        [
+            {
+                "row_idx": 40,
+                "code": "08-02-001-01",
+                "description": "Прокладка кабеля",
+                "unit": "100 м",
+                "quantity": quantity,
+                "unit_price": unit_price,
+                "total_cost": total_cost,
+            }
+        ],
+    )
+
+    rd_row = conn.execute("SELECT quantity FROM rd_items").fetchone()
+    smeta_row = conn.execute(
+        "SELECT quantity, unit_price, total_cost FROM smeta_items"
+    ).fetchone()
+
+    assert isinstance(rd_row["quantity"], str)
+    assert rd_row["quantity"] == str(quantity)
+    assert smeta_row["quantity"] == str(quantity)
+    assert smeta_row["unit_price"] == str(unit_price)
+    assert smeta_row["total_cost"] == str(total_cost)
+
+    loaded = get_smeta_items_map(conn, SESSION_ID)
+    item = next(iter(loaded.values()))
+    assert item.quantity == quantity
+    assert item.unit_price == unit_price
+    assert item.total_cost == total_cost
+
+
+
 
 def test_foreign_keys_cascade_deletion(conn: sqlite3.Connection) -> None:
     """Удаление сессии каскадно очищает все дочерние сущности."""
@@ -302,9 +378,9 @@ def test_save_and_retrieve_audit_data(conn: sqlite3.Connection) -> None:
     row = rows[0]
     assert row["project_name"] == "ЖК Север, корпус 3"
     assert row["rd_code"] == "ФССЦ-21.1.06.04-0012"
-    assert row["rd_quantity"] == pytest.approx(15.0)
-    assert row["smeta_quantity"] == pytest.approx(10.0)
-    assert row["total_cost"] == pytest.approx(25000.0)
+    assert Decimal(str(row["rd_quantity"])) == Decimal("15.0")
+    assert Decimal(str(row["smeta_quantity"])) == Decimal("10.0")
+    assert Decimal(str(row["total_cost"])) == Decimal("25000.00")
     assert row["match_method"] == "FUZZY_CASCADE"
     assert row["match_status"] == "RESOLVED"
     assert row["decision"] == "ADJUSTED"
@@ -551,9 +627,113 @@ def test_get_smeta_items_map_exposes_parent_hierarchy(
     assert get_smeta_items_map(conn, "missing-session") == {}
 
 
+def test_init_db_migrates_legacy_real_columns_to_text(tmp_path) -> None:
+    """Устаревшие REAL-колонки пересобираются в TEXT без потери связей."""
+    connection = get_connection(tmp_path / "legacy-real.db")
+    try:
+        connection.executescript(SCHEMA_SQL)
+        connection.executescript(
+            """
+            DROP TABLE rd_items;
+            CREATE TABLE rd_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                row_idx INTEGER,
+                code TEXT,
+                description TEXT NOT NULL,
+                unit TEXT NOT NULL,
+                quantity REAL NOT NULL,
+                raw_payload JSON
+            );
+            DROP TABLE smeta_items;
+            CREATE TABLE smeta_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                row_idx INTEGER,
+                code TEXT NOT NULL,
+                description TEXT NOT NULL,
+                unit TEXT NOT NULL,
+                quantity REAL NOT NULL,
+                unit_price REAL NOT NULL,
+                total_cost REAL NOT NULL,
+                parent_id INTEGER,
+                raw_payload JSON
+            );
+            INSERT INTO sessions (id, project_name, rd_filename, smeta_filename)
+            VALUES ('legacy', 'Старый проект', 'rd.pdf', 'smeta.xlsx');
+            INSERT INTO rd_items
+                (session_id, code, description, unit, quantity)
+            VALUES ('legacy', 'ФССЦ-1', 'Кабель', 'м', 15.0);
+            INSERT INTO smeta_items
+                (session_id, code, description, unit,
+                 quantity, unit_price, total_cost)
+            VALUES ('legacy', '01-01', 'Прокладка кабеля', 'м',
+                    10.0, 2500.0, 25000.0);
+            INSERT INTO match_records
+                (session_id, rd_item_id, smeta_item_id,
+                 confidence_score, match_method)
+            VALUES ('legacy', 1, 1, 90, 'FUZZY_CASCADE');
+            """
+        )
+        connection.commit()
+
+        init_db(connection)
+        init_db(connection)
+
+        for table, columns in {
+            "rd_items": ("quantity",),
+            "smeta_items": ("quantity", "unit_price", "total_cost"),
+        }.items():
+            declared = {
+                row["name"]: str(row["type"]).upper()
+                for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            assert all(declared[column] == "TEXT" for column in columns)
+
+        rd_row = connection.execute(
+            "SELECT quantity FROM rd_items WHERE session_id = 'legacy'"
+        ).fetchone()
+        smeta_row = connection.execute(
+            "SELECT quantity, unit_price, total_cost FROM smeta_items "
+            "WHERE session_id = 'legacy'"
+        ).fetchone()
+        assert isinstance(rd_row["quantity"], str)
+        assert isinstance(smeta_row["unit_price"], str)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM match_records WHERE session_id = 'legacy'"
+        ).fetchone()[0] == 1
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+        loaded = get_smeta_items_map(connection, "legacy")
+        item = next(iter(loaded.values()))
+        assert item.quantity == Decimal("10.0")
+        assert item.unit_price == Decimal("2500.0")
+        assert item.total_cost == Decimal("25000.0")
+
+        save_rd_items(
+            connection,
+            "legacy",
+            [
+                {
+                    "row_idx": 13,
+                    "code": "ФССЦ-2",
+                    "description": "Кабель силовой",
+                    "unit": "100 м",
+                    "quantity": Decimal("-840.97440001"),
+                }
+            ],
+        )
+        inserted = connection.execute(
+            "SELECT quantity FROM rd_items WHERE code = 'ФССЦ-2'"
+        ).fetchone()
+        assert inserted["quantity"] == "-840.97440001"
+    finally:
+        connection.close()
+
 def test_init_db_migrates_legacy_rule_evaluations_and_parent_id(
     tmp_path,
 ) -> None:
+
     """Устаревшая схема предикатов и сметы обновляется идемпотентно."""
     connection = get_connection(tmp_path / "legacy-rules.db")
     try:

@@ -16,6 +16,34 @@ from parsers import (
 )
 
 
+def _install_pdf_table(monkeypatch, table):
+    """Подменяет pdfplumber.open страницей с готовой распознанной таблицей."""
+
+    class _FakePage:
+        width = 842.0
+        height = 595.0
+
+        def extract_text(self):
+            return "ВЕДОМОСТЬ ОБЪЕМОВ РАБОТ"
+
+        def within_bbox(self, _bbox):
+            return self
+
+        def extract_table(self, _settings):
+            return table
+
+    class _FakePDF:
+        pages = [_FakePage()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(parsers.pdfplumber, "open", lambda _path: _FakePDF())
+
+
 # ==============================================================================
 # 1. МОДУЛЬНЫЕ ТЕСТЫ LSRParser (СИНТЕТИЧЕСКИЕ ДАННЫЕ В ПАМЯТИ)
 # ==============================================================================
@@ -571,7 +599,57 @@ class TestPDFSpecParserUnit:
         assert all("Иванов" not in item.raw_title for item in items)
         assert all("Петров" not in item.raw_title for item in items)
 
-    def test_grand_smeta_vor_7_columns_mock(self, monkeypatch):
+    def test_pdf_parser_filters_table_header_artifacts(self, monkeypatch):
+        """Строка шапки с числом в графе объема не становится позицией ВОР."""
+        table = [
+            ["№ п/п", "Наименование", "Ед. изм.", "Кол-во", "Примечание"],
+            ["", "Наименование", "м2", "10", ""],
+            ["", "Кол-во", "шт", "5", ""],
+            ["", "Ед. изм.", "", "1", ""],
+            ["", "Монтаж подвесных потолков", "м2", "12,5", ""],
+        ]
+        _install_pdf_table(monkeypatch, table)
+
+        items = PDFSpecParser("vor_headers.pdf").extract_items()
+
+        assert [item.raw_title for item in items] == [
+            "Монтаж подвесных потолков"
+        ]
+        assert [item.volume for item in items] == [Decimal("12.5")]
+
+    def test_pdf_parser_filters_stamp_and_title_rows(self, monkeypatch):
+        """Колонтитулы и титулы томов РД не являются материалами ведомости."""
+        table = [
+            ["№ п/п", "Наименование", "Ед. изм.", "Кол-во", "Примечание"],
+            ["", "Архитектурные решения", "м", "297,9", ""],
+            ["", "Лист 1", "шт", "1", ""],
+            ["", "Том 2", "", "", ""],
+            ["", "Монтаж кабеля", "м", "10", ""],
+        ]
+        _install_pdf_table(monkeypatch, table)
+
+        items = PDFSpecParser("vor_stamps.pdf").extract_items()
+
+        assert [item.raw_title for item in items] == ["Монтаж кабеля"]
+        assert [item.volume for item in items] == [Decimal("10")]
+
+    def test_pdf_parser_rejects_rows_without_volume(self, monkeypatch):
+        """Строки без количества не создают позиции и не тянут переносы."""
+        table = [
+            ["№ п/п", "Наименование", "Ед. изм.", "Кол-во", "Примечание"],
+            ["", "Материал без объема", "м2", "", ""],
+            ["", "Наименование", "м2", "", ""],
+            ["", "-", "м2", "", ""],
+            ["", "Монтаж потолка", "м2", "12", ""],
+        ]
+        _install_pdf_table(monkeypatch, table)
+
+        items = PDFSpecParser("vor_no_volume.pdf").extract_items()
+
+        assert [item.raw_title for item in items] == ["Монтаж потолка"]
+        assert [item.volume for item in items] == [Decimal("12")]
+
+
         """Форма ВОР ПК «ГРАНД-Смета»: рамка только у шапки, объем в графе 4.
 
         Строки данных идут без горизонтальных линий, поэтому find_tables()

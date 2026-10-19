@@ -413,10 +413,10 @@ def test_audit_export_view_stitches_rows(conn: sqlite3.Connection) -> None:
     cable = by_rd_code[CODE_CABLE]
     assert cable["project_name"] == PROJECT_NAME
     assert cable["smeta_code"] == CODE_CABLE
-    assert cable["rd_quantity"] == pytest.approx(150.0)
-    assert cable["smeta_quantity"] == pytest.approx(150.0)
-    assert cable["unit_price"] == pytest.approx(2500.0)
-    assert cable["total_cost"] == pytest.approx(375000.0)
+    assert Decimal(str(cable["rd_quantity"])) == Decimal("150.0")
+    assert Decimal(str(cable["smeta_quantity"])) == Decimal("150.0")
+    assert Decimal(str(cable["unit_price"])) == Decimal("2500.00")
+    assert Decimal(str(cable["total_cost"])) == Decimal("375000.00")
     assert cable["match_status"] == "AUTO"
     assert cable["rd_unit"] == "100 м"
 

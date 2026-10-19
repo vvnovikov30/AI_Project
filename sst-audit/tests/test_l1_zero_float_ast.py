@@ -261,6 +261,7 @@ class TestZeroFloatASTVisitorLogic:
         "models.py",
         "normalizer.py",
         "evaluator.py",
+        "db.py",
     ],
 )
 def test_production_core_modules_strictly_adhere_to_zero_float(
