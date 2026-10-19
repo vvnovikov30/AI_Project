@@ -220,6 +220,8 @@ POST_MIGRATION_INDEXES_SQL: Final[str] = """
 CREATE INDEX IF NOT EXISTS idx_smeta_items_parent ON smeta_items(session_id, parent_id);
 CREATE INDEX IF NOT EXISTS idx_rd_items_session ON rd_items(session_id);
 CREATE INDEX IF NOT EXISTS idx_smeta_items_session ON smeta_items(session_id);
+CREATE INDEX IF NOT EXISTS idx_rule_evaluations_match ON rule_evaluations(match_record_id);
+CREATE INDEX IF NOT EXISTS idx_rule_eval_lookup ON rule_evaluations(session_id, match_record_id);
 """
 
 # Числовые колонки, которые обязаны иметь TEXT-аффинити: REAL в SQLite

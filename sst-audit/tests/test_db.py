@@ -799,6 +799,20 @@ def test_init_db_migrates_legacy_rule_evaluations_and_parent_id(
             for row in connection.execute("PRAGMA table_info(smeta_items)")
         }
         assert "parent_id" in smeta_columns
+
+        index_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        assert {
+            "idx_rd_items_session",
+            "idx_smeta_items_session",
+            "idx_smeta_items_parent",
+            "idx_rule_evaluations_match",
+            "idx_rule_eval_lookup",
+        } <= index_names
     finally:
         connection.close()
 
