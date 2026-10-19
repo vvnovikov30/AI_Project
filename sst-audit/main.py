@@ -37,7 +37,7 @@ from db import backup_database
 import dispatcher
 import exporter
 from evaluator import DiscrepancyDetector
-from matcher import CascadeMatcher
+from matcher import CascadeMatcher, CompositeMatcher
 from models import CollisionSeverity, NormalizedItem
 from parsers import LSRParser, PDFLSRParser, PDFSpecParser, get_spec_parser
 
@@ -146,6 +146,11 @@ def match_items(
       меньше ``AMBIGUITY_MARGIN`` — автоматическое принятие связи;
     * неоднозначность (отрыв < ``AMBIGUITY_MARGIN``) отправляется в HITL.
 
+    Отрыв считается по дедуплицированному пулу: семантические клоны
+    (``clean_title`` + ``volume`` + ``canonical_unit``) схлопываются и не
+    создают ложную коллизию. Точное совпадение (``>= 95%``) с нулевой дельтой
+    объема получает ``AUTO`` без проверки отрыва (Exact Match Bypass).
+
     Обратный проход добавляет ``HITL_PENDING`` только для позиций РД, у
     которых вообще не нашлось ни одного сметного кандидата. Слабые кандидаты
     ниже порога отсечки не создают повторную карточку по той же паре.
@@ -194,25 +199,26 @@ def match_items(
             )
             continue
 
-        runner_up = (
-            Decimal(str(candidates[1][1])) if len(candidates) > 1 else Decimal("0")
+        selection = CompositeMatcher.resolve_match(
+            smeta_item,
+            [
+                (item, CompositeMatcher._decimal_score(score))
+                for item, score in candidates
+            ],
         )
-        ambiguous = bool(candidates[1:]) and (
-            best_score - runner_up
-        ) < AMBIGUITY_MARGIN
+        min_candidate_score = CompositeMatcher._decimal_score(MIN_MATCH_THRESHOLD)
         qualified_candidates = tuple(
-            (item, score)
-            for item, score in candidates
-            if Decimal(str(score)) >= MIN_MATCH_THRESHOLD
+            (item, float(score))
+            for item, score in selection.candidates
+            if score >= min_candidate_score
         )[:3]
 
-        is_auto = best_score >= AUTO_MATCH_THRESHOLD and not ambiguous
         decisions.append(
             MatchDecision(
                 smeta_item=smeta_item,
-                rd_item=best_item,
+                rd_item=selection.rd_item,
                 confidence=best_score,
-                status="AUTO" if is_auto else "HITL_PENDING",
+                status=selection.status.value,
                 method=MATCH_METHOD_CASCADE,
                 candidates=qualified_candidates,
             )

@@ -541,7 +541,9 @@ def test_match_items_marks_low_confidence_and_ambiguity() -> None:
         "Кабель силовой ВВГнг 3х1.5",
         None,
         UnitClass.LENGTH,
-        Decimal("10.0"),
+        # Дельта объема выше допуска отключает Exact Match Bypass, поэтому
+        # неоднозначность действительно проверяется по отрыву от Top-2.
+        Decimal("12.0"),
         21,
     )
     similar_rd = _rd_item(
@@ -612,7 +614,9 @@ def test_interactive_hitl_updates_link_and_rules(
         "Кабель силовой ВВГнг 3х1.5",
         "ART-1.5",
         UnitClass.LENGTH,
-        Decimal("10.0"),
+        # Дельта объема выше допуска: bypass не срабатывает, карточка HITL
+        # формируется из-за отрыва 3.85% < AMBIGUITY_MARGIN (5%).
+        Decimal("12.0"),
         30,
     )
     similar = _rd_item(
