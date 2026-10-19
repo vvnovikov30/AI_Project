@@ -4,7 +4,11 @@ from typing import Any, Dict, Final, Optional, Sequence
 
 from rapidfuzz import fuzz
 
-from evaluator import PredicateEvaluator, VolumeSufficiencyEvaluator
+from evaluator import (
+    PredicateEvaluator,
+    VolumeSufficiencyEvaluator,
+    calculate_volume_penalty,
+)
 from normalizer import is_dimension_compatible
 from models import (
     MatchRecord,
@@ -146,6 +150,8 @@ class CompositeMatcher:
     SCORE_QUANTUM: Final[Decimal] = Decimal("0.0001")
     AUTO_CONFIDENCE: Final[Decimal] = Decimal("0.7000")
     HITL_CONFIDENCE: Final[Decimal] = Decimal("0.4000")
+    CANDIDATE_MIN_CONFIDENCE: Final[Decimal] = Decimal("0.4000")
+    MAX_CANDIDATES: Final[int] = 3
     METHOD: Final[str] = "COMPOSITE_CASCADE"
 
     @classmethod
@@ -154,6 +160,75 @@ class CompositeMatcher:
         return (
             Decimal(str(round(raw_score, 4))) / Decimal("100")
         ).quantize(cls.SCORE_QUANTUM, rounding=ROUND_HALF_UP)
+
+    @classmethod
+    def calculate_pair_confidence(
+        cls, rd_item: NormalizedItem, smeta_item: NormalizedItem
+    ) -> tuple[Decimal, Decimal]:
+        """Возвращает базовую и итоговую уверенность пары.
+
+        Итоговая уверенность — это ``base_confidence * K_vol``, где
+        ``K_vol`` — мультипликативный :func:`evaluator.calculate_volume_penalty`.
+        Результат квантуется до ``0.0001`` строго на ``Decimal``.
+
+        :return: кортеж ``(base_confidence, final_confidence)``.
+        """
+        base_confidence = cls._decimal_score(
+            CascadeMatcher.calculate_score(rd_item, smeta_item)
+        )
+        vol_penalty = calculate_volume_penalty(rd_item.volume, smeta_item.volume)
+        final_confidence = (base_confidence * vol_penalty).quantize(
+            cls.SCORE_QUANTUM, rounding=ROUND_HALF_UP
+        )
+        return base_confidence, final_confidence
+
+    @staticmethod
+    def _candidate_key(item: NormalizedItem) -> tuple[str, Decimal, str]:
+        """Ключ уникальности кандидата: имя + объем + единица измерения."""
+        return (
+            item.raw_title.strip().lower(),
+            item.volume,
+            (item.raw_unit or item.canonical_unit.value).strip().lower(),
+        )
+
+    @classmethod
+    def rank_candidates(
+        cls,
+        smeta_item: NormalizedItem,
+        rd_items: Sequence[NormalizedItem],
+        limit: int = MAX_CANDIDATES,
+    ) -> list[tuple[NormalizedItem, Decimal]]:
+        """Формирует Top-N кандидатов РД с Volume Gate и дедупликацией.
+
+        Кандидат проходит отбор, только если его итоговая уверенность с учетом
+        мультипликативного штрафа за объем не ниже
+        :attr:`CANDIDATE_MIN_CONFIDENCE` (``0.40``). Дубликаты с одинаковыми
+        именем, объемом и единицей измерения схлопываются: в Top-N попадает
+        только наиболее уверенный представитель группы.
+        """
+        if not rd_items or limit <= 0:
+            return []
+
+        scored: list[tuple[NormalizedItem, Decimal]] = []
+        for rd_item in rd_items:
+            _, final_confidence = cls.calculate_pair_confidence(rd_item, smeta_item)
+            if final_confidence < cls.CANDIDATE_MIN_CONFIDENCE:
+                continue
+            scored.append((rd_item, final_confidence))
+
+        scored.sort(key=lambda pair: pair[1], reverse=True)
+
+        selected: list[tuple[NormalizedItem, Decimal]] = []
+        seen: set[tuple[str, Decimal, str]] = set()
+        for rd_item, final_confidence in scored:
+            key = cls._candidate_key(rd_item)
+            if key in seen:
+                continue
+            seen.add(key)
+            selected.append((rd_item, final_confidence))
+            if len(selected) >= limit:
+                break
+        return selected
 
     @staticmethod
     def build_parent_index(
@@ -186,8 +261,8 @@ class CompositeMatcher:
         ``R_CMP_VOLUME_DEFICIT``: превышение объема работы-родителя
         блокирует автоподтверждение связи.
         """
-        confidence = cls._decimal_score(
-            CascadeMatcher.calculate_score(rd_item, smeta_item)
+        _base_confidence, confidence = cls.calculate_pair_confidence(
+            rd_item, smeta_item
         )
         breakdown: RuleBreakdown = PredicateEvaluator.evaluate_pair(
             rd_item, smeta_item
