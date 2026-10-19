@@ -20,6 +20,68 @@ from models import (
 )
 from normalizer import evaluate_unit_gate, is_dimension_compatible
 
+
+# Volume Gate: границы мультипликативного штрафа за расхождение объемов.
+VOLUME_PENALTY_MISSING: Final[Decimal] = Decimal("0.70")
+VOLUME_PENALTY_ZERO: Final[Decimal] = Decimal("0.20")
+VOLUME_PENALTY_EXACT: Final[Decimal] = Decimal("1.00")
+
+# Кратность "на порядок" (10x) с допуском 10% на погрешность измерения:
+# 25 / 2.52 = 9.92 трактуется как номинальное расхождение в 10 раз.
+ORDER_OF_MAGNITUDE_RATIO: Final[Decimal] = Decimal("10.0")
+ORDER_OF_MAGNITUDE_TOLERANCE: Final[Decimal] = Decimal("0.9")
+
+
+def calculate_volume_penalty(
+    v_rd: Optional[Decimal], v_smeta: Optional[Decimal]
+) -> Decimal:
+    """Рассчитывает мультипликатор ``K_vol`` по кратности объемов.
+
+    Кратность определяется как ``R = max(V1, V2) / min(V1, V2)``. Функция
+    строго гарантирует, что при расхождении в 10 раз и более коэффициент не
+    превышает ``Decimal("0.20")``, то есть итоговая уверенность пары не может
+    быть выше 20% даже при идеальном лексическом совпадении.
+
+    Лестница штрафов:
+
+    * ``R <= 1.25`` — ``1.00`` (в пределах точности округления);
+    * ``R <= 2`` — ``0.80``;
+    * ``R <= 5`` — ``0.50``;
+    * ``5 < R < 9`` — ``0.30``;
+    * ``9 <= R < 50`` — ``0.20`` (потолок для расхождения на порядок);
+    * ``R >= 50`` — ``0.05`` (грубая ошибка кратности).
+
+    Отсутствие объема хотя бы у одной стороны дает мягкий штраф ``0.70``,
+    чтобы не отбрасывать пары без количественных данных.
+
+    :param v_rd: нормализованный объем позиции РД (``NormalizedItem.volume``);
+    :param v_smeta: нормализованный объем сметной позиции;
+    :return: коэффициент ``Decimal`` из диапазона ``0.05..1.00``.
+    """
+    if v_rd is None or v_smeta is None:
+        return VOLUME_PENALTY_MISSING
+
+    v1 = abs(v_rd)
+    v2 = abs(v_smeta)
+
+    if v1 == Decimal("0") or v2 == Decimal("0"):
+        return VOLUME_PENALTY_ZERO
+
+    ratio = max(v1, v2) / min(v1, v2)
+
+    if ratio <= Decimal("1.25"):
+        return VOLUME_PENALTY_EXACT
+    if ratio <= Decimal("2.0"):
+        return Decimal("0.80")
+    if ratio <= Decimal("5.0"):
+        return Decimal("0.50")
+    if ratio < ORDER_OF_MAGNITUDE_RATIO * ORDER_OF_MAGNITUDE_TOLERANCE:
+        return Decimal("0.30")
+    if ratio < Decimal("50.0"):
+        return VOLUME_PENALTY_ZERO
+    return Decimal("0.05")
+
+
 class PredicateEvaluator:
     """Компонентный аудит предикатов R01-R05 для пары «РД ↔ СМР».
 

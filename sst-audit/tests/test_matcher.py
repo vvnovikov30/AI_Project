@@ -415,3 +415,81 @@ class TestNormalizerEdgeCases:
         assert cls == UnitClass.COUNT
         assert qty == Decimal("3000.0")
         assert mult == Decimal("1000.0")
+
+
+class TestVolumeGateCandidates:
+    """Volume Gate и дедупликация Top-N кандидатов (Спринт 5.2)."""
+
+    def test_matcher_discards_candidates_with_heavy_volume_penalty(
+        self, monkeypatch
+    ):
+        """База 46.7% при расхождении 10x дает < 20% и отсекается порогом 0.40."""
+        monkeypatch.setattr(
+            CascadeMatcher,
+            "calculate_score",
+            classmethod(lambda cls, lsr, spec: 46.7),
+        )
+        smeta_item = _node(
+            "LSR_1", "Кабель силовой ВВГнг 3х2.5", UnitClass.LENGTH, "25", "м"
+        )
+        rd_item = _node(
+            "SPEC_1", "Кабель силовой ВВГнг 3х2.5", UnitClass.LENGTH, "2.52", "м"
+        )
+
+        base_confidence, final_confidence = CompositeMatcher.calculate_pair_confidence(
+            rd_item, smeta_item
+        )
+        assert base_confidence == Decimal("0.4670")
+        assert final_confidence == Decimal("0.0934")
+        assert final_confidence < Decimal("0.20")
+        assert CompositeMatcher.rank_candidates(smeta_item, [rd_item]) == []
+
+        record = CompositeMatcher.match_pair(rd_item, smeta_item)
+        assert record.confidence == final_confidence
+        assert record.status == "NO_MATCH"
+
+    def test_matcher_deduplicates_identical_candidates_in_top_n(self) -> None:
+        """Дубликаты с одинаковыми именем, объемом и единицей не двоятся в Top-3."""
+        smeta_item = _node(
+            "LSR_1", "Труба стальная 57х3.5", UnitClass.LENGTH, "10", "м"
+        )
+        first = _node(
+            "SPEC_1", "Труба стальная 57х3.5", UnitClass.LENGTH, "10", "м"
+        )
+        duplicate = _node(
+            "SPEC_2", "  труба стальная 57х3.5 ", UnitClass.LENGTH, "10", "м"
+        )
+        other_a = _node(
+            "SPEC_3", "Труба стальная 89х4", UnitClass.LENGTH, "10", "м"
+        )
+        other_b = _node(
+            "SPEC_4", "Труба стальная 108х4", UnitClass.LENGTH, "10", "м"
+        )
+
+        ranked = CompositeMatcher.rank_candidates(
+            smeta_item, [first, duplicate, other_a, other_b]
+        )
+
+        assert len(ranked) == CompositeMatcher.MAX_CANDIDATES
+        keys = [CompositeMatcher._candidate_key(item) for item, _ in ranked]
+        assert len(keys) == len(set(keys))
+        assert ranked[0][0].raw_id == "SPEC_1"
+        assert ranked[0][1] == Decimal("1.0000")
+        assert all(item.raw_id != "SPEC_2" for item, _ in ranked)
+
+    def test_matcher_keeps_candidates_above_threshold_with_matching_volumes(
+        self,
+    ) -> None:
+        """Равные объемы не штрафуются: кандидат проходит порог 0.40."""
+        smeta_item = _node(
+            "LSR_1", "Задвижка 30с41нж DN50 PN16", UnitClass.COUNT, "15", "шт"
+        )
+        rd_item = _node(
+            "SPEC_1", "Задвижка 30с41нж DN50 PN16", UnitClass.COUNT, "15", "шт"
+        )
+
+        ranked = CompositeMatcher.rank_candidates(smeta_item, [rd_item])
+
+        assert len(ranked) == 1
+        assert ranked[0][0] is rd_item
+        assert ranked[0][1] == Decimal("1.0000")
