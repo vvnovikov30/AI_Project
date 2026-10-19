@@ -58,6 +58,31 @@ TAG_OSN: Final[str] = "ОСН"
 # Порядок вывода: сначала базовый расчет, затем включение и исключение.
 DUAL_TAG_ORDER: Final[dict[str, int]] = {TAG_OSN: 0, TAG_VKL: 1, TAG_ISKL: 2}
 DUAL_SMETA_SUFFIXES: Final[frozenset[str]] = frozenset({".xlsx", ".xlsm", ".pdf"})
+# Кандидаты двухпапочного режима: ВОР/РД (.pdf и .xlsx) и сметы (XLSX/PDF).
+DUAL_FILE_SUFFIXES: Final[frozenset[str]] = frozenset({".pdf", ".xlsx", ".xlsm"})
+ROLE_VOR: Final[str] = "VOR"
+ROLE_SMETA: Final[str] = "SMETA"
+# Маркеры ролей. Короткие аббревиатуры проверяются по границе слова,
+# чтобы «ТЕР» не срабатывал внутри «материалы», а «ВОР» — внутри «СВОР».
+VOR_MARKERS: Final[tuple[str, ...]] = (
+    "дефектн",
+    "ведомост",
+    "вор",
+    "свор",
+    "боq",
+    "объем",
+    "объём",
+)
+SMETA_MARKERS: Final[tuple[str, ...]] = (
+    "лср",
+    "смета",
+    "рим",
+    "фер",
+    "тер",
+    "гэсн",
+)
+# Шифр и тег связки, найденной без явного кода раздела.
+FALLBACK_SECTION_CODE: Final[str] = "01-01"
 
 
 @dataclass(frozen=True)
@@ -136,11 +161,71 @@ def _copy_rank(path: Path) -> int:
     return 1 if re.search(r"\(\d+\)$", path.stem.strip()) else 0
 
 
-def pair_dual_directories(
+def _name_text(path: Path) -> str:
+    """Имя файла без расширения в сравнимом виде (нижний регистр, без ё)."""
+    return Path(path).stem.casefold().replace("ё", "е")
+
+
+def _has_marker(text: str, marker: str) -> bool:
+    """Проверяет маркер как подстроку либо как отдельную аббревиатуру.
+
+    Короткие обозначения (``ВОР``, ``ЛСР``, ``ТЕР``) требуют границы слова:
+    иначе «ТЕР» находится внутри «материалы», а «ВОР» — внутри «СВОР».
+    """
+    if len(marker) <= 4 and marker.isalpha():
+        pattern = rf"(?<![a-zа-я]){re.escape(marker)}(?![a-zа-я])"
+        return re.search(pattern, text) is not None
+    return marker in text
+
+
+def classify_file_role(path: str | Path) -> Optional[str]:
+    """Определяет роль файла: ведомость ВОР/РД либо сметный расчет.
+
+    * PDF по умолчанию считается томом РД/ВОР; сметный маркер перевешивает,
+      только если маркеров ВОР в имени нет (``ЛСР.pdf``, ``смета.pdf``).
+    * XLSX с маркерами ВОР и без маркеров сметы — ведомость.
+    * Остальные XLSX/XLSM — сметные кандидаты (в т.ч. без явных маркеров).
+
+    :return: ``ROLE_VOR``, ``ROLE_SMETA`` или ``None`` для служебных файлов.
+    """
+    candidate = Path(path)
+    if candidate.name.startswith("~$"):
+        return None
+    if candidate.suffix.lower() not in DUAL_FILE_SUFFIXES:
+        return None
+
+    text = _name_text(candidate)
+    vor_hit = any(_has_marker(text, marker) for marker in VOR_MARKERS)
+    smeta_hit = any(_has_marker(text, marker) for marker in SMETA_MARKERS)
+
+    if candidate.suffix.lower() == ".pdf":
+        if smeta_hit and not vor_hit:
+            return ROLE_SMETA
+        return ROLE_VOR
+    if vor_hit and not smeta_hit:
+        return ROLE_VOR
+    return ROLE_SMETA
+
+
+def _unique_candidates(paths: Sequence[Path]) -> list[Path]:
+    """Убирает дубли, когда папки ВОР и смет указывают на один каталог."""
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for item in paths:
+        candidate = Path(item)
+        key = str(candidate).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def _pair_by_section_codes(
     rd_files: Sequence[Path],
     smeta_files: Sequence[Path],
 ) -> list[DualPair]:
-    """Сопоставляет списки файлов ВОР/СВОР и ЛСР без обращения к диску.
+    """Связывает файлы по явному шифру ``NN-NN[-NN]`` в имени.
 
     Для одного шифра приоритет отдается СВОР перед ВОР. Дубли смет по паре
     ``(шифр, тег)`` схлопываются до первого файла в лексикографическом
@@ -148,8 +233,6 @@ def pair_dual_directories(
     """
     rd_by_code: dict[str, Path] = {}
     for rd_path in sorted(rd_files, key=lambda item: item.name.casefold()):
-        if rd_path.suffix.lower() != ".pdf":
-            continue
         code = extract_section_code(rd_path.name)
         if code is None:
             continue
@@ -162,10 +245,6 @@ def pair_dual_directories(
         smeta_files,
         key=lambda item: (_copy_rank(item), item.name.casefold()),
     ):
-        if smeta_path.suffix.lower() not in DUAL_SMETA_SUFFIXES:
-            continue
-        if smeta_path.name.startswith("~$"):
-            continue
         code = extract_section_code(smeta_path.name)
         if code is None:
             continue
@@ -190,6 +269,99 @@ def pair_dual_directories(
             pair.smeta_path.name.casefold(),
         ),
     )
+
+
+def _name_prefix(path: Path) -> str:
+    """Нормализованный префикс имени до первого разделителя.
+
+    ``Магазин_Анастасьевка__Дефектная_ведомость.xlsx`` -> ``магазин``;
+    ``Магазин_Анастасьевка__ЛСР_РИМ.xlsx`` -> ``магазин``.
+    """
+    tokens = [
+        token
+        for token in re.split(r"[\s_]+", _normalize(Path(path).stem))
+        if token
+    ]
+    return tokens[0] if tokens else ""
+
+
+def _pair_by_prefix(
+    rd_files: Sequence[Path],
+    smeta_files: Sequence[Path],
+) -> list[DualPair]:
+    """Связывает пары по общему корню имени объекта.
+
+    Используется только когда шифры ``NN-NN[-NN]`` не найдены и fallback
+    единственной пары не применим. Префикс короче трех символов и служебные
+    слова (``вор``, ``лср``, ``смета``) не считаются надежным корнем.
+    """
+    generic = {"вор", "свор", "лср", "смета", "дефектная", "ведомость"}
+    smeta_by_prefix: dict[str, list[Path]] = {}
+    for smeta_path in sorted(smeta_files, key=lambda item: item.name.casefold()):
+        prefix = _name_prefix(smeta_path)
+        if len(prefix) < 3 or prefix in generic:
+            continue
+        smeta_by_prefix.setdefault(prefix, []).append(smeta_path)
+
+    pairs: list[DualPair] = []
+    for rd_path in sorted(rd_files, key=lambda item: item.name.casefold()):
+        candidates = smeta_by_prefix.get(_name_prefix(rd_path))
+        if not candidates:
+            continue
+        smeta_path = candidates.pop(0)
+        pairs.append(
+            DualPair(
+                rd_path=rd_path,
+                smeta_path=smeta_path,
+                section_code=f"01-{len(pairs) + 1:02d}",
+                tag=classify_smeta_tag(smeta_path.name),
+            )
+        )
+    return sorted(
+        pairs,
+        key=lambda pair: (
+            pair.section_code,
+            DUAL_TAG_ORDER.get(pair.tag, len(DUAL_TAG_ORDER)),
+            pair.smeta_path.name.casefold(),
+        ),
+    )
+
+
+def pair_dual_directories(
+    rd_files: Sequence[Path],
+    smeta_files: Sequence[Path],
+) -> list[DualPair]:
+    """Сопоставляет списки файлов ВОР/РД и смет без обращения к диску.
+
+    Приоритет отдается явным шифрам разделов. Если ни одна связка по шифру
+    не найдена, включается single-pair fallback: ровно одна ведомость и
+    ровно одна смета образуют задачу ``01-01`` с тегом ``ОСН``. Для наборов
+    большего размера применяется сопоставление по общему префиксу имени
+    объекта (``Магазин_Анастасьевка``).
+    """
+    files = _unique_candidates([*rd_files, *smeta_files])
+    vor_candidates = [
+        path for path in files if classify_file_role(path) == ROLE_VOR
+    ]
+    smeta_candidates = [
+        path for path in files if classify_file_role(path) == ROLE_SMETA
+    ]
+
+    pairs = _pair_by_section_codes(vor_candidates, smeta_candidates)
+    if pairs:
+        return pairs
+
+    if len(vor_candidates) == 1 and len(smeta_candidates) == 1:
+        return [
+            DualPair(
+                rd_path=vor_candidates[0],
+                smeta_path=smeta_candidates[0],
+                section_code=FALLBACK_SECTION_CODE,
+                tag=classify_smeta_tag(smeta_candidates[0].name),
+            )
+        ]
+
+    return _pair_by_prefix(vor_candidates, smeta_candidates)
 
 
 def _normalize(text: str) -> str:
@@ -369,11 +541,13 @@ class ProjectDispatcher:
     def match_dual_directories(
         self, rd_dir: Path, smeta_dir: Path
     ) -> list[DualPair]:
-        """Сопоставляет папку ВОР/СВОР (PDF) с папкой сметных расчетов ЛСР.
+        """Сопоставляет папку ВОР/СВОР (PDF, XLSX) с папкой смет ЛСР.
 
         Один раздел может иметь несколько смет: базовую (``ОСН``), включение
         (``ВКЛ``) и исключение (``ИСКЛ``). Каждая связка получает собственный
         шифр и тег, поэтому далее запускается отдельная изолированная сессия.
+        Без явных шифров в именах работает single-pair fallback, затем —
+        сопоставление по общему префиксу объекта.
         """
         rd_root = Path(rd_dir)
         smeta_root = Path(smeta_dir)
@@ -382,32 +556,39 @@ class ProjectDispatcher:
         if not smeta_root.is_dir():
             raise FileNotFoundError(f"Папка смет ЛСР не найдена: {smeta_root}")
 
-        rd_files = [
-            path
-            for path in rd_root.iterdir()
-            if path.is_file() and path.suffix.lower() == ".pdf"
-        ]
-        smeta_files = [
-            path
-            for path in smeta_root.iterdir()
-            if path.is_file()
-            and path.suffix.lower() in DUAL_SMETA_SUFFIXES
-            and not path.name.startswith("~$")
-        ]
-        return pair_dual_directories(rd_files, smeta_files)
+        def _candidates(root: Path) -> list[Path]:
+            """Файлы-кандидаты обеих ролей: PDF, XLSX и XLSM без lock-копий."""
+            return [
+                path
+                for path in root.iterdir()
+                if path.is_file()
+                and path.suffix.lower() in DUAL_FILE_SUFFIXES
+                and not path.name.startswith("~$")
+            ]
+
+        return pair_dual_directories(
+            _candidates(rd_root), _candidates(smeta_root)
+        )
 
 
 __all__ = [
+    "DUAL_FILE_SUFFIXES",
     "DUAL_SMETA_SUFFIXES",
     "DUAL_TAG_ORDER",
     "DualPair",
+    "FALLBACK_SECTION_CODE",
     "MAPPING_RULES",
     "MIN_CONFIDENCE",
     "ProjectDispatcher",
+    "ROLE_SMETA",
+    "ROLE_VOR",
+    "SMETA_MARKERS",
     "SheetCandidate",
     "TAG_ISKL",
     "TAG_OSN",
     "TAG_VKL",
+    "VOR_MARKERS",
+    "classify_file_role",
     "classify_smeta_tag",
     "extract_section_code",
     "pair_dual_directories",

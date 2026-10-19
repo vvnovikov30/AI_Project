@@ -39,7 +39,7 @@ import exporter
 from evaluator import DiscrepancyDetector
 from matcher import CascadeMatcher
 from models import CollisionSeverity, NormalizedItem
-from parsers import LSRParser, PDFLSRParser, PDFSpecParser
+from parsers import LSRParser, PDFLSRParser, PDFSpecParser, get_spec_parser
 
 logger = logging.getLogger(__name__)
 
@@ -410,7 +410,9 @@ def run_pipeline(
     session_id = config.resolved_session_id()
 
     if rd_items is None:
-        rd_items = PDFSpecParser(config.rd_path).extract_items()
+        rd_items = get_spec_parser(
+            config.rd_path, pdf_parser_cls=PDFSpecParser
+        ).extract_items()
     if smeta_items is None:
         smeta_items = _parse_smeta_items(config.smeta_path, config.smeta_sheet)
 

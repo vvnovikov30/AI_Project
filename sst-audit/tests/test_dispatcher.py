@@ -8,6 +8,9 @@ import pytest
 from dispatcher import (
     MAPPING_RULES,
     ProjectDispatcher,
+    ROLE_SMETA,
+    ROLE_VOR,
+    classify_file_role,
     classify_smeta_tag,
     extract_section_code,
     pair_dual_directories,
@@ -202,3 +205,85 @@ def test_pair_dual_directories_is_pure_and_deduplicates() -> None:
     assert len(pairs) == 1
     assert pairs[0].rd_path.name == "02-01-05_СВОР.pdf"
     assert pairs[0].smeta_path.name == "02-01-05_ЛСР_исключение.xlsx"
+
+
+def test_single_pair_fallback_without_section_codes(tmp_path: Path) -> None:
+    """Единственная ведомость и единственная смета связываются как 01-01/ОСН."""
+    rd_dir = tmp_path / "rd"
+    smeta_dir = tmp_path / "smeta"
+    rd_dir.mkdir()
+    smeta_dir.mkdir()
+
+    rd_name = "Магазин_Анастасьевка_Дефектная_ведомость.xlsx"
+    smeta_name = "Магазин_Анастасьевка_ЛСР_по_Методике_2020_РИМ.xlsx"
+    (rd_dir / rd_name).write_bytes(b"")
+    (smeta_dir / smeta_name).write_bytes(b"")
+
+    pairs = ProjectDispatcher().match_dual_directories(rd_dir, smeta_dir)
+
+    assert len(pairs) == 1
+    pair = pairs[0]
+    assert (pair.section_code, pair.tag) == ("01-01", "ОСН")
+    assert pair.rd_path.name == rd_name
+    assert pair.smeta_path.name == smeta_name
+    assert pair.sheet_name == "01-01 ОСН"
+
+    # Дефектная ведомость и смета в одной папке: дубли кандидатов схлопываются.
+    flat_dir = tmp_path / "flat"
+    flat_dir.mkdir()
+    (flat_dir / rd_name).write_bytes(b"")
+    (flat_dir / smeta_name).write_bytes(b"")
+
+    same_dir_pairs = ProjectDispatcher().match_dual_directories(flat_dir, flat_dir)
+
+    assert len(same_dir_pairs) == 1
+    assert same_dir_pairs[0].section_code == "01-01"
+    assert same_dir_pairs[0].rd_path.name == rd_name
+    assert same_dir_pairs[0].smeta_path.name == smeta_name
+
+
+def test_excel_vor_role_detection() -> None:
+    """XLSX с маркерами ВОР отделяется от сметных расчетов в той же папке."""
+    assert classify_file_role("Дефектная_ведомость_Магазин.xlsx") == ROLE_VOR
+    assert classify_file_role("ВОР_ЭОМ.xlsx") == ROLE_VOR
+    assert classify_file_role("СВОР_объект.xlsx") == ROLE_VOR
+
+    assert classify_file_role("ЛСР_по_Методике_2020_РИМ.xlsx") == ROLE_SMETA
+    assert classify_file_role("Смета_на_монтаж.xlsx") == ROLE_SMETA
+    assert classify_file_role("ЛСР_ТЕР.xlsx") == ROLE_SMETA
+
+    # Сметный PDF и PDF тома РД различаются по маркерам, lock-копии отсекаются.
+    assert classify_file_role("02-01-03_ЛСР_исключение.pdf") == ROLE_SMETA
+    assert classify_file_role("02-01-03_ВОР.pdf") == ROLE_VOR
+    assert classify_file_role("~$ЛСР_РИМ.xlsx") is None
+    assert classify_file_role("readme.txt") is None
+
+
+def test_prefix_match_pairs_object_without_section_codes() -> None:
+    """Без шифров пары связываются по общему корню имени объекта."""
+    rd_files = [
+        Path("Магазин_Анастасьевка_Дефектная_ведомость.xlsx"),
+        Path("Школа_Дефектная_ведомость.xlsx"),
+    ]
+    smeta_files = [
+        Path("Магазин_Анастасьевка_ЛСР_РИМ.xlsx"),
+        Path("Школа_ЛСР.xlsx"),
+    ]
+
+    pairs = pair_dual_directories(rd_files, smeta_files)
+
+    assert [
+        (pair.section_code, pair.rd_path.name, pair.smeta_path.name)
+        for pair in pairs
+    ] == [
+        (
+            "01-01",
+            "Магазин_Анастасьевка_Дефектная_ведомость.xlsx",
+            "Магазин_Анастасьевка_ЛСР_РИМ.xlsx",
+        ),
+        (
+            "01-02",
+            "Школа_Дефектная_ведомость.xlsx",
+            "Школа_ЛСР.xlsx",
+        ),
+    ]
