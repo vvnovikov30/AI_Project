@@ -11,4 +11,10 @@ RapidFuzz==3.14.6        # MIT
 pydantic==2.13.5         # MIT
 rich==15.0.0             # MIT
 
+# --- Web API (FastAPI, тонкий слой) -----------------------------------------
+fastapi==0.165.0         # MIT
+uvicorn==0.54.0          # BSD-3-Clause
+python-multipart==0.0.34 # Apache-2.0
+httpx==0.28.1            # BSD-3-Clause (TestClient)
+
 # Тестовые зависимости вынесены в requirements-dev.txt и в поставку не входят.

@@ -1034,6 +1034,32 @@ def get_rule_evaluations(
     return evaluations
 
 
+def get_rd_item_payloads(
+    conn: sqlite3.Connection,
+    session_id: str,
+) -> dict[int, dict[str, Any] | None]:
+    """Возвращает аудиторский след позиций РД: ``{id: raw_payload}``.
+
+    Ключи упорядочены по ``id ASC``, то есть совпадают с порядком вставки
+    ``save_rd_items``: это позволяет восстановить идентификаторы после
+    пакетной вставки без N+1 и без SQL в прикладном слое. В ``pointer``
+    хранятся ``bbox`` и ``page_meta`` PDF, уже сериализованные строками
+    (Zero Float Policy).
+    """
+    rows = conn.execute(
+        """
+        SELECT id, raw_payload
+        FROM rd_items
+        WHERE session_id = ?
+        ORDER BY id ASC
+        """,
+        (str(session_id),),
+    ).fetchall()
+    return {
+        int(row["id"]): _deserialize_payload(row["raw_payload"]) for row in rows
+    }
+
+
 def get_smeta_items_map(
     conn: sqlite3.Connection,
     session_id: str,
@@ -1368,6 +1394,32 @@ def record_consent_152fz(
         )
         consent_id = int(cursor.lastrowid)
     return consent_id
+
+
+def has_active_consent(
+    conn: sqlite3.Connection,
+    user_id: str,
+    consent_type: str = "PDN_PROCESSING",
+) -> bool:
+    """Проверяет наличие активного согласия субъекта ПДн (152-ФЗ).
+
+    Учитывается только запись с ``accepted = 1``: отозванное или отклоненное
+    согласие не дает права на обработку персональных данных.
+
+    :param user_id: идентификатор субъекта ПДн в ``users``.
+    :param consent_type: тип согласия (по умолчанию обработка ПДн).
+    :return: ``True``, если действующее согласие зафиксировано.
+    """
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM consents_152fz
+        WHERE user_id = ? AND consent_type = ? AND accepted = 1
+        LIMIT 1
+        """,
+        (str(user_id), str(consent_type)),
+    ).fetchone()
+    return row is not None
 
 
 def record_arbitration_event(
