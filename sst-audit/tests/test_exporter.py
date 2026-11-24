@@ -331,7 +331,7 @@ def test_exporter_adjusted_ratio_applied(
     stored_ratio = conn.execute(
         "SELECT conversion_ratio FROM match_records WHERE id = ?", (pending_match_id,)
     ).fetchone()["conversion_ratio"]
-    assert stored_ratio == pytest.approx(2.0)
+    assert Decimal(str(stored_ratio)) == Decimal("2.0")
 
 
 def test_exporter_rejected_reason_in_comment(

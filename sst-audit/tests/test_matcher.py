@@ -205,6 +205,45 @@ class TestRuleBreakdownConfidence:
         assert breakdown.total_confidence == expected
 
 
+class TestMatchRecordUnitGate:
+    """Свойство is_unit_blocked распознает R05_UNT независимо от сводки."""
+
+    def test_is_unit_blocked_uses_rule_code_not_decimal_weight(self):
+        """FAILED R05_UNT блокирует связь, хотя RuleBreakdown не передан."""
+        from models import MatchRecord, RuleEvaluation
+
+        record = MatchRecord(
+            rd_item=_node(
+                "SPEC_1",
+                "Камера видеонаблюдения",
+                UnitClass.COUNT,
+                "4",
+                "шт",
+            ),
+            smeta_item=_node(
+                "LSR_2",
+                "Камера видеонаблюдения",
+                UnitClass.COUNT,
+                "4",
+                "м",
+                is_resource=True,
+                parent_id="LSR_1",
+            ),
+            confidence=Decimal("0.5"),
+            status="BLOCKED",
+            evaluations=[
+                RuleEvaluation(
+                    rule_code="R05_UNT",
+                    status="FAILED",
+                    weight=Decimal("0.20"),
+                )
+            ],
+        )
+
+        assert record.is_unit_blocked is True
+
+
+
 class TestParentCoverage:
     """Родительская расценка не должна попадать в SMETA_NOT_IN_RD."""
 

@@ -190,6 +190,40 @@ class TestLSRParserSynthetic:
         assert it_res2.parent_id == "LSR_10"
         assert it_res2.volume == Decimal("300")
 
+    def test_parse_closes_workbook_after_use(self, tmp_path):
+        """parse() освобождает книгу openpyxl, повторный close() идемпотентен."""
+        wb = openpyxl.Workbook()
+        wb.active.cell(row=1, column=1, value="ЛОКАЛЬНАЯ СМЕТА № 1")
+        file_path = tmp_path / "closing.xlsx"
+        wb.save(file_path)
+
+        parser = LSRParser(str(file_path))
+        assert parser._workbook_closed is False
+
+        assert parser.parse() == []
+        assert parser._workbook_closed is True
+
+        parser.close()
+        assert parser._workbook_closed is True
+
+    def test_parse_closes_workbook_on_exception(self, tmp_path, monkeypatch):
+        """Книга закрывается через finally даже при сбое разбора листа."""
+        wb = openpyxl.Workbook()
+        file_path = tmp_path / "closing_on_error.xlsx"
+        wb.save(file_path)
+
+        parser = LSRParser(str(file_path))
+
+        def _boom(_sheet_name=None):
+            raise RuntimeError("сбой разбора")
+
+        monkeypatch.setattr(parser, "_parse_impl", _boom)
+
+        with pytest.raises(RuntimeError, match="сбой разбора"):
+            parser.parse()
+        assert parser._workbook_closed is True
+
+
     def test_lsr_parser_detects_421pr_format(self, tmp_path):
         """421/пр: графы «Обоснование | Наименование | Ед. изм. | Количество».
 
@@ -439,6 +473,27 @@ class TestPDFSpecParserUnit:
         assert PDFSpecParser._resolve_quantity(
             row_shifted, continuation, unit_index
         ) == Decimal("1")
+
+    def test_parse_decimal_evaluates_uncalculated_formulas(self):
+        """Невычисленные формулы считаются рекурсивным спуском на Decimal."""
+        assert PDFSpecParser._parse_decimal("12+45+8") == Decimal("65")
+        assert PDFSpecParser._parse_decimal("2*15,5") == Decimal("31.0")
+        assert PDFSpecParser._parse_decimal("(2+3)*4") == Decimal("20")
+        assert PDFSpecParser._parse_decimal("100 - 25.5") == Decimal("74.5")
+        assert isinstance(PDFSpecParser._parse_decimal("2*15,5"), Decimal)
+
+    def test_parse_decimal_rejects_division_by_zero(self):
+        """Деление на ноль не превращается в первое число выражения."""
+        assert PDFSpecParser._parse_decimal("10/0") is None
+        assert PDFSpecParser._parse_decimal("(5+5)/(3-3)") is None
+
+    def test_parse_decimal_does_not_evaluate_dates_and_ciphers(self):
+        """Даты, шифры и сноски не вычисляются как арифметика."""
+        assert PDFSpecParser._parse_decimal("2025-11-01") == Decimal("2025")
+        assert PDFSpecParser._parse_decimal("08-03-574") == Decimal("8")
+        assert PDFSpecParser._parse_decimal("52.2*") == Decimal("52.2")
+        assert PDFSpecParser._parse_decimal("12,5¹") == Decimal("12.5")
+
 
     def test_section_headings_are_context_not_titles(self, monkeypatch):
         """Подзаголовки разделов дают context_section и не склеиваются с позициями.

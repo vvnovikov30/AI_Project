@@ -13,6 +13,17 @@ from models import NormalizedItem, CellPointer
 from normalizer import UnitNormalizer, DimensionLockExtractor
 
 
+def _flush_page_cache(page: Any) -> None:
+    """Освобождает кэш объектов pdfplumber-страницы после ее обработки.
+
+    Тестовые двойники страниц не имеют ``flush_cache``, поэтому вызов
+    выполняется только для реального ``PDFPage``.
+    """
+    flush = getattr(page, "flush_cache", None)
+    if callable(flush):
+        flush()
+
+
 _LSR_421_NOISE_PREFIXES: Final[tuple[str, ...]] = (
     "нр ",
     "нр от",
@@ -175,6 +186,22 @@ class LSRParser:
     def __init__(self, file_path: str):
         self.file_path = file_path
         self.wb = openpyxl.load_workbook(file_path, data_only=True)
+        self._workbook_closed = False
+
+    def __enter__(self) -> "LSRParser":
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Закрывает книгу openpyxl (идемпотентно, совместимо с ``with``)."""
+        if self._workbook_closed:
+            return
+        self._workbook_closed = True
+        workbook = getattr(self, "wb", None)
+        if workbook is not None:
+            workbook.close()
 
     def _resolve_merged_cells_map(self, ws) -> Dict[tuple, Any]:
         """Создает проекционную карту объединенных ячеек для O(1) поиска значений."""
@@ -823,6 +850,17 @@ class LSRParser:
         return items
 
     def parse(self, sheet_name: Optional[str] = None) -> List[NormalizedItem]:
+        """Парсит лист сметы и закрывает книгу openpyxl после разбора.
+
+        Обертка гарантирует освобождение файла/архива книги даже при
+        исключении; интерфейс ``LSRParser(path).parse()`` не изменился.
+        """
+        try:
+            return self._parse_impl(sheet_name)
+        finally:
+            self.close()
+
+    def _parse_impl(self, sheet_name: Optional[str] = None) -> List[NormalizedItem]:
         """Парсинг листа сметы в нормализованную плоскую коллекцию DTO.
 
         :param sheet_name: имя листа ``ЛС ...`` для пакетного/точечного
@@ -1231,6 +1269,21 @@ class _ColumnSchema:
     code_col: Optional[int] = None
     mass_col: Optional[int] = None
     column_count: Optional[int] = None
+
+
+# Невычисленные формулы в графах объема («12+45+8», «2*15,5», «(2+3)*4»).
+# Разбор детерминированный и только на Decimal: eval/ast.parse/float запрещены.
+_ARITHMETIC_TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\d+(?:[.,]\d+)?|[()+\-*/]"
+)
+_ARITHMETIC_FORBIDDEN_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"[^0-9()+\-*/.,]"
+)
+_ARITHMETIC_OPERATOR_PATTERN: Final[re.Pattern[str]] = re.compile(r"[+*/]|\d-\d")
+# Даты и шифры вида «2025-11-01» / «08-03-574» формулами не считаются.
+_DATE_OR_CODE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,3}[-/.]\d{1,2}[-/.]\d{3,}"
+)
 
 
 class PDFSpecParser:
@@ -2106,18 +2159,105 @@ class PDFSpecParser:
 
     @classmethod
     def _parse_decimal(cls, raw_value: Any) -> Optional[Decimal]:
-        """Извлекает объем из ячеек ``58,3``, ``1 020``, ``123.45`` и ``52.2*``."""
+        """Извлекает объем из ячеек ``58,3``, ``1 020``, ``123.45`` и ``52.2*``.
+
+        Невычисленные формулы («12+45+8», «2*15,5», «(2+3)*4») считаются
+        встроенным детерминированным парсером на ``Decimal``. Строки с
+        буквами, даты и шифры не вычисляются: для них сохраняется прежнее
+        извлечение первого числа.
+        """
         text = cls._cell_text(raw_value)
         if not text:
             return None
-        normalized = text.replace("*", "").replace(" ", "").replace(",", ".")
-        match = re.search(r"-?\d+(?:\.\d+)?", normalized)
+        # Сноски («12,5*», «7,2¹») снимаются до разбора формулы.
+        text = re.sub(r"^[*∗†‡]+\s*", "", text)
+        text = re.sub(r"\s*[*∗†‡¹²³⁴⁵⁶⁷⁸⁹⁰]+\s*$", "", text).strip()
+        compact = re.sub(r"\s+", "", text).replace(",", ".")
+        if not compact:
+            return None
+        if cls._looks_like_arithmetic(compact):
+            return cls._evaluate_arithmetic(compact)
+        match = re.search(r"-?\d+(?:\.\d+)?", compact)
         if match is None:
             return None
         try:
             return Decimal(match.group(0))
         except InvalidOperation:
             return None
+
+    @staticmethod
+    def _looks_like_arithmetic(expression: str) -> bool:
+        """Отличает невычисленную формулу от числа, даты или шифра."""
+        if _ARITHMETIC_FORBIDDEN_PATTERN.search(expression):
+            return False
+        if _DATE_OR_CODE_PATTERN.fullmatch(expression):
+            return False
+        return _ARITHMETIC_OPERATOR_PATTERN.search(expression) is not None
+
+    @staticmethod
+    def _evaluate_arithmetic(expression: str) -> Optional[Decimal]:
+        """Считает выражение ``+ - * /`` со скобками строго в ``Decimal``.
+
+        Рекурсивный спуск по строковым токенам: приоритет операций и скобки
+        разбираются без ``eval``/``ast``, каждое число преобразуется в
+        ``Decimal`` напрямую из строки. ``None`` возвращается при делении на
+        ноль и при синтаксической ошибке.
+        """
+        tokens = _ARITHMETIC_TOKEN_PATTERN.findall(expression)
+        if not tokens or "".join(tokens) != expression:
+            return None
+        position = 0
+
+        def peek() -> Optional[str]:
+            return tokens[position] if position < len(tokens) else None
+
+        def parse_expression() -> Decimal:
+            nonlocal position
+            value = parse_term()
+            while peek() in ("+", "-"):
+                operator = tokens[position]
+                position += 1
+                right = parse_term()
+                value = value + right if operator == "+" else value - right
+            return value
+
+        def parse_term() -> Decimal:
+            nonlocal position
+            value = parse_factor()
+            while peek() in ("*", "/"):
+                operator = tokens[position]
+                position += 1
+                right = parse_factor()
+                value = value * right if operator == "*" else value / right
+            return value
+
+        def parse_factor() -> Decimal:
+            nonlocal position
+            token = peek()
+            if token is None:
+                raise InvalidOperation("Незавершенное выражение")
+            if token in ("+", "-"):
+                position += 1
+                factor = parse_factor()
+                return factor if token == "+" else -factor
+            if token == "(":
+                position += 1
+                value = parse_expression()
+                if peek() != ")":
+                    raise InvalidOperation("Несбалансированные скобки")
+                position += 1
+                return value
+            position += 1
+            return Decimal(token.replace(",", "."))
+
+        try:
+            result = parse_expression()
+        except ArithmeticError:
+            # DecimalException и ZeroDivisionError наследуются от ArithmeticError.
+            return None
+        if position != len(tokens):
+            return None
+        return result
 
     @staticmethod
     def _is_column_number_row(row: List[str]) -> bool:
@@ -2393,165 +2533,170 @@ class PDFSpecParser:
 
             for p_idx in page_numbers:
                 page = pdf.pages[p_idx - 1]
-                fast_raw_text: Optional[str] = None
+                try:
+                    fast_raw_text: Optional[str] = None
 
-                if preselected_pages is None:
-                    # Резервный путь (тестовые двойники либо сбой открытия
-                    # PDFium): прежний текстовый префильтр pdfplumber.
-                    extractor = getattr(page, "extract_text", None)
-                    if not callable(extractor):
-                        # Текстовый слой недоступен — фильтр не применяется.
-                        raw_page_text: Optional[str] = None
+                    if preselected_pages is None:
+                        # Резервный путь (тестовые двойники либо сбой открытия
+                        # PDFium): прежний текстовый префильтр pdfplumber.
+                        extractor = getattr(page, "extract_text", None)
+                        if not callable(extractor):
+                            # Текстовый слой недоступен — фильтр не применяется.
+                            raw_page_text: Optional[str] = None
+                        else:
+                            try:
+                                raw_page_text = extractor() or ""
+                            except Exception:
+                                raw_page_text = None
+                        if raw_page_text is None:
+                            pass  # поведение до оптимизации: страница разбирается
+                        else:
+                            page_text = self._marker_text(raw_page_text)
+                            has_spec = self._text_has_spec_markers(page_text)
+                            has_vor = self._text_has_vor_markers(page_text)
+                            is_continuation = (
+                                vor_continuation
+                                and self._text_is_vor_continuation(page_text)
+                            )
+                            if not has_spec and not has_vor and not is_continuation:
+                                # Страницы чертежей, планов и однолинейных схем не
+                                # доходят до построения таблиц по тысячам линий.
+                                continue
+                            vor_continuation = (not has_spec) and (
+                                has_vor or is_continuation
+                            )
                     else:
-                        try:
-                            raw_page_text = extractor() or ""
-                        except Exception:
-                            raw_page_text = None
-                    if raw_page_text is None:
-                        pass  # поведение до оптимизации: страница разбирается
-                    else:
-                        page_text = self._marker_text(raw_page_text)
-                        has_spec = self._text_has_spec_markers(page_text)
-                        has_vor = self._text_has_vor_markers(page_text)
-                        is_continuation = (
-                            vor_continuation
-                            and self._text_is_vor_continuation(page_text)
-                        )
-                        if not has_spec and not has_vor and not is_continuation:
-                            # Страницы чертежей, планов и однолинейных схем не
-                            # доходят до построения таблиц по тысячам линий.
-                            continue
-                        vor_continuation = (not has_spec) and (
-                            has_vor or is_continuation
-                        )
-                else:
-                    fast_raw_text = (self._fast_page_texts or {}).get(p_idx)
-                    fast_text = self._marker_text(fast_raw_text or "")
-                    # Лист с растровой таблицей: в текстовом слое только
-                    # штамп. pdfplumber не извлечет из картинки ни строк, ни
-                    # количеств, поэтому дорогой разбор такого листа
-                    # пропускается (для OCR нужен отдельный движок).
-                    if (
-                        fast_text
-                        and self._text_has_spec_markers(fast_text)
-                        and not self._text_has_table_rows(fast_text)
-                        and not any(
-                            marker in fast_text
-                            for marker in _SPEC_TABLE_PAGE_MARKERS
-                        )
-                    ):
-                        continue
-
-                # Сшивка строк не переходит через границу листа: мусор
-                # с чертежей и схем не перетекает в спецификацию.
-                carried_over_row: Optional[List[str]] = None
-
-                table = self._extract_page_table(page)
-                if not table:
-                    continue
-                table = self._repair_table_encoding(page, table, fast_raw_text)
-
-                page_schema = self._detect_table_schema(table)
-                if page_schema is not None:
-                    current_schema = page_schema
-
-                has_marker: Optional[bool] = None
-                if fast_raw_text is not None:
-                    marker_text = self._marker_text(fast_raw_text)
-                    has_marker = bool(
-                        _SPEC_MARK_PATTERN.search(marker_text)
-                        or _SPEC_TITLE_PATTERN.search(marker_text)
-                    )
-                if not self._is_specification_page(
-                    page, table, current_schema, has_marker
-                ):
-                    continue
-
-                for row in table:
-                    if not row or not any(row):
-                        continue
-                    if self._is_column_number_row(row):
-                        continue
-                    if current_schema is None:
-                        continue
-
-                    raw_title = self._resolve_title(row, current_schema)
-                    raw_unit, unit_index = self._resolve_unit(row, current_schema)
-                    if current_schema.kind == "VOR":
-                        # Опечатки единиц ВОР правятся до UnitNormalizer.
-                        raw_unit = self._clean_vor_unit(raw_unit)
-                    row_schema = self._effective_schema(
-                        row, current_schema, unit_index
-                    )
-                    parsed_qty = self._resolve_quantity(
-                        row, row_schema, unit_index
-                    )
-
-                    if parsed_qty is None:
-                        # Шапка/штамп не участвует ни в разделах, ни в
-                        # сшивке переносов наименований.
-                        if _is_table_header_artifact(
-                            raw_title
-                        ) or _is_stamp_or_title_artifact(raw_title):
-                            carried_over_row = None
-                            continue
-                        section = self._resolve_vor_section(row, current_schema)
-                        if section:
-                            current_section = section
-                            carried_over_row = None
-                        elif (
-                            not raw_unit
-                            and raw_title
-                            and self._is_section_heading(raw_title)
+                        fast_raw_text = (self._fast_page_texts or {}).get(p_idx)
+                        fast_text = self._marker_text(fast_raw_text or "")
+                        # Лист с растровой таблицей: в текстовом слое только
+                        # штамп. pdfplumber не извлечет из картинки ни строк, ни
+                        # количеств, поэтому дорогой разбор такого листа
+                        # пропускается (для OCR нужен отдельный движок).
+                        if (
+                            fast_text
+                            and self._text_has_spec_markers(fast_text)
+                            and not self._text_has_table_rows(fast_text)
+                            and not any(
+                                marker in fast_text
+                                for marker in _SPEC_TABLE_PAGE_MARKERS
+                            )
                         ):
-                            # Подзаголовок раздела — только контекст, не позиция
-                            # и не продолжение наименования предыдущей строки.
-                            current_section = raw_title
-                            carried_over_row = None
-                        elif raw_title and not self._is_service_value(raw_title):
-                            carried_over_row = row
-                        continue
+                            continue
 
-                    if not raw_title and carried_over_row is not None:
-                        raw_title = self._resolve_title(
-                            carried_over_row, current_schema
+                    # Сшивка строк не переходит через границу листа: мусор
+                    # с чертежей и схем не перетекает в спецификацию.
+                    carried_over_row: Optional[List[str]] = None
+
+                    table = self._extract_page_table(page)
+                    if not table:
+                        continue
+                    table = self._repair_table_encoding(page, table, fast_raw_text)
+
+                    page_schema = self._detect_table_schema(table)
+                    if page_schema is not None:
+                        current_schema = page_schema
+
+                    has_marker: Optional[bool] = None
+                    if fast_raw_text is not None:
+                        marker_text = self._marker_text(fast_raw_text)
+                        has_marker = bool(
+                            _SPEC_MARK_PATTERN.search(marker_text)
+                            or _SPEC_TITLE_PATTERN.search(marker_text)
                         )
-
-                    if not raw_title or self._is_service_value(raw_title):
-                        carried_over_row = None
-                        continue
-
-                    # Метрологический барьер: шапки таблиц, штампы томов и
-                    # строки без осмысленного наименования не являются
-                    # материалами/работами ведомости.
-                    if _is_table_header_artifact(raw_title):
-                        carried_over_row = None
-                        continue
-                    if _is_stamp_or_title_artifact(
-                        raw_title, self._resolve_code(row, row_schema)
+                    if not self._is_specification_page(
+                        page, table, current_schema, has_marker
                     ):
-                        carried_over_row = None
-                        continue
-                    if not _has_measured_title(raw_title):
-                        carried_over_row = None
-                        continue
-                    if str(parsed_qty).strip() in ("", "None", "unknown"):
-                        carried_over_row = None
                         continue
 
-                    items.append(
-                        self._build_item(
-                            row_schema,
-                            row,
-                            raw_title,
-                            raw_unit,
-                            parsed_qty,
-                            current_section,
-                            p_idx,
-                            len(items) + 1,
+                    for row in table:
+                        if not row or not any(row):
+                            continue
+                        if self._is_column_number_row(row):
+                            continue
+                        if current_schema is None:
+                            continue
+
+                        raw_title = self._resolve_title(row, current_schema)
+                        raw_unit, unit_index = self._resolve_unit(row, current_schema)
+                        if current_schema.kind == "VOR":
+                            # Опечатки единиц ВОР правятся до UnitNormalizer.
+                            raw_unit = self._clean_vor_unit(raw_unit)
+                        row_schema = self._effective_schema(
+                            row, current_schema, unit_index
                         )
-                    )
-                    carried_over_row = None
+                        parsed_qty = self._resolve_quantity(
+                            row, row_schema, unit_index
+                        )
+
+                        if parsed_qty is None:
+                            # Шапка/штамп не участвует ни в разделах, ни в
+                            # сшивке переносов наименований.
+                            if _is_table_header_artifact(
+                                raw_title
+                            ) or _is_stamp_or_title_artifact(raw_title):
+                                carried_over_row = None
+                                continue
+                            section = self._resolve_vor_section(row, current_schema)
+                            if section:
+                                current_section = section
+                                carried_over_row = None
+                            elif (
+                                not raw_unit
+                                and raw_title
+                                and self._is_section_heading(raw_title)
+                            ):
+                                # Подзаголовок раздела — только контекст, не позиция
+                                # и не продолжение наименования предыдущей строки.
+                                current_section = raw_title
+                                carried_over_row = None
+                            elif raw_title and not self._is_service_value(raw_title):
+                                carried_over_row = row
+                            continue
+
+                        if not raw_title and carried_over_row is not None:
+                            raw_title = self._resolve_title(
+                                carried_over_row, current_schema
+                            )
+
+                        if not raw_title or self._is_service_value(raw_title):
+                            carried_over_row = None
+                            continue
+
+                        # Метрологический барьер: шапки таблиц, штампы томов и
+                        # строки без осмысленного наименования не являются
+                        # материалами/работами ведомости.
+                        if _is_table_header_artifact(raw_title):
+                            carried_over_row = None
+                            continue
+                        if _is_stamp_or_title_artifact(
+                            raw_title, self._resolve_code(row, row_schema)
+                        ):
+                            carried_over_row = None
+                            continue
+                        if not _has_measured_title(raw_title):
+                            carried_over_row = None
+                            continue
+                        if str(parsed_qty).strip() in ("", "None", "unknown"):
+                            carried_over_row = None
+                            continue
+
+                        items.append(
+                            self._build_item(
+                                row_schema,
+                                row,
+                                raw_title,
+                                raw_unit,
+                                parsed_qty,
+                                current_section,
+                                p_idx,
+                                len(items) + 1,
+                            )
+                        )
+                        carried_over_row = None
+                finally:
+                    # Кэш объектов страницы pdfplumber держит все линии/символы
+                    # листа: освобождаем его сразу после обработки страницы.
+                    _flush_page_cache(page)
 
         return items
 
@@ -3052,132 +3197,155 @@ class PDFLSRParser:
 
         with pdfplumber.open(self.file_path) as pdf:
             for page_number, page in enumerate(pdf.pages, start=1):
-                lines = self._page_lines(page)
-                page_layout, body_top = self._page_layout(page, lines, layout)
-                if page_layout is None:
-                    continue
-                layout = page_layout
-
-                for line in lines:
-                    if line[0]["top"] < body_top:
+                try:
+                    lines = self._page_lines(page)
+                    page_layout, body_top = self._page_layout(page, lines, layout)
+                    if page_layout is None:
                         continue
-                    cells = self._row_cells(line, layout)
-                    position_text = cells.get(layout.position_col, "")
-                    code_text = cells.get(layout.code_col, "")
-                    title_text = cells.get(layout.title_col, "")
+                    layout = page_layout
 
-                    if _PDF_LSR_SECTION_PATTERN.match(position_text or title_text):
-                        section = _squash_spaces(
-                            " ".join(
-                                part
-                                for part in (position_text, code_text, title_text)
-                                if part
+                    for line in lines:
+                        if line[0]["top"] < body_top:
+                            continue
+                        cells = self._row_cells(line, layout)
+                        position_text = cells.get(layout.position_col, "")
+                        code_text = cells.get(layout.code_col, "")
+                        title_text = cells.get(layout.title_col, "")
+
+                        if _PDF_LSR_SECTION_PATTERN.match(
+                            position_text or title_text
+                        ):
+                            section = _squash_spaces(
+                                " ".join(
+                                    part
+                                    for part in (
+                                        position_text,
+                                        code_text,
+                                        title_text,
+                                    )
+                                    if part
+                                )
+                            )
+                            last_idx = None
+                            continue
+
+                        if LSRParser.TOTAL_ROW_PATTERN.match(title_text):
+                            total = self._cell_number(
+                                cells, layout.total_cost_col
+                            )
+                            if total is None:
+                                total = self._cell_number(
+                                    cells, layout.unit_price_col
+                                )
+                            if total is not None and pending_idx is not None:
+                                self._apply_position_total(
+                                    items[pending_idx], total
+                                )
+                                pending_idx = None
+                            last_idx = None
+                            continue
+
+                        if _PDF_LSR_SERVICE_PATTERN.match(title_text):
+                            last_idx = None
+                            continue
+
+                        position_is_number = bool(
+                            _PDF_LSR_POSITION_PATTERN.match(position_text)
+                        )
+                        if not position_is_number and not code_text:
+                            if title_text and last_idx is not None:
+                                self._append_title(items[last_idx], title_text)
+                            continue
+
+                        unit_text = _squash_spaces(cells.get(layout.unit_col, ""))
+                        quantity = self._cell_number(cells, layout.qty_total_col)
+                        if quantity is None:
+                            quantity = self._cell_number(
+                                cells, layout.qty_unit_col
+                            )
+                        if (
+                            code_text
+                            and last_idx is not None
+                            and not unit_text
+                            and quantity is None
+                            and not title_text
+                        ):
+                            # Шифр перенесен на следующую физическую строку
+                            # («ГЭСНр 65-02-» + «008-01»).
+                            self._append_code(items[last_idx], code_text)
+                            continue
+                        if not unit_text or quantity is None:
+                            last_idx = None
+                            continue
+                        if _PDF_LSR_LABOR_CODE_PATTERN.match(
+                            code_text
+                        ) or _PDF_LSR_MACHINE_CODE_PATTERN.match(code_text):
+                            last_idx = None
+                            continue
+
+                        is_parent = self._is_rate_row(code_text, position_text)
+                        is_nested = bool(
+                            not is_parent
+                            and parent_id is not None
+                            and not (
+                                position_is_number
+                                and not re.search(r"[.,]", position_text)
                             )
                         )
-                        last_idx = None
-                        continue
-
-                    if LSRParser.TOTAL_ROW_PATTERN.match(title_text):
-                        total = self._cell_number(cells, layout.total_cost_col)
-                        if total is None:
-                            total = self._cell_number(cells, layout.unit_price_col)
-                        if total is not None and pending_idx is not None:
-                            self._apply_position_total(items[pending_idx], total)
-                            pending_idx = None
-                        last_idx = None
-                        continue
-
-                    if _PDF_LSR_SERVICE_PATTERN.match(title_text):
-                        last_idx = None
-                        continue
-
-                    position_is_number = bool(
-                        _PDF_LSR_POSITION_PATTERN.match(position_text)
-                    )
-                    if not position_is_number and not code_text:
-                        if title_text and last_idx is not None:
-                            self._append_title(items[last_idx], title_text)
-                        continue
-
-                    unit_text = _squash_spaces(cells.get(layout.unit_col, ""))
-                    quantity = self._cell_number(cells, layout.qty_total_col)
-                    if quantity is None:
-                        quantity = self._cell_number(cells, layout.qty_unit_col)
-                    if (
-                        code_text
-                        and last_idx is not None
-                        and not unit_text
-                        and quantity is None
-                        and not title_text
-                    ):
-                        # Шифр перенесен на следующую физическую строку
-                        # («ГЭСНр 65-02-» + «008-01»).
-                        self._append_code(items[last_idx], code_text)
-                        continue
-                    if not unit_text or quantity is None:
-                        last_idx = None
-                        continue
-                    if _PDF_LSR_LABOR_CODE_PATTERN.match(
-                        code_text
-                    ) or _PDF_LSR_MACHINE_CODE_PATTERN.match(code_text):
-                        last_idx = None
-                        continue
-
-                    is_parent = self._is_rate_row(code_text, position_text)
-                    is_nested = bool(
-                        not is_parent
-                        and parent_id is not None
-                        and not (
-                            position_is_number
-                            and not re.search(r"[.,]", position_text)
+                        sequence = len(items) + 1
+                        raw_id = f"PDF_LSR_{sequence}"
+                        canonical_unit, volume, multiplier = (
+                            UnitNormalizer.normalize(unit_text, quantity)
                         )
-                    )
-                    sequence = len(items) + 1
-                    raw_id = f"PDF_LSR_{sequence}"
-                    canonical_unit, volume, multiplier = UnitNormalizer.normalize(
-                        unit_text, quantity
-                    )
-                    pointer = CellPointer(
-                        doc_type="LSR",
-                        file_name=self.file_path,
-                        sheet_name=f"Page {page_number}",
-                        row_idx=sequence,
-                        col_letter=openpyxl.utils.get_column_letter(
-                            layout.position_col + 1
-                        ),
-                        coordinate=f"p.{page_number} [row {sequence}]",
-                    )
-                    items.append(
-                        NormalizedItem(
-                            raw_id=raw_id,
-                            code=self._normalize_code(code_text) or None,
-                            raw_title=title_text,
-                            clean_title=LSRParser._clean_estimate_title(title_text),
-                            raw_unit=unit_text,
-                            canonical_unit=canonical_unit,
-                            unit_multiplier=multiplier,
-                            volume=volume,
-                            dimensions=DimensionLockExtractor.extract(title_text),
-                            context_section=section,
-                            pointer=pointer,
-                            is_resource=not is_parent,
-                            parent_id=parent_id if is_nested else None,
-                            unit_price=self._cell_number(
-                                cells, layout.unit_price_col
+                        pointer = CellPointer(
+                            doc_type="LSR",
+                            file_name=self.file_path,
+                            sheet_name=f"Page {page_number}",
+                            row_idx=sequence,
+                            col_letter=openpyxl.utils.get_column_letter(
+                                layout.position_col + 1
                             ),
-                            total_cost=self._cell_number(
-                                cells, layout.total_cost_col
-                            ),
+                            coordinate=f"p.{page_number} [row {sequence}]",
                         )
-                    )
-                    if is_parent:
-                        parent_id = raw_id
-                        pending_idx = len(items) - 1
-                    elif not is_nested:
-                        # Самостоятельная ресурсная позиция без расценки:
-                        # блок «Всего по позиции» относится к ней самой.
-                        pending_idx = len(items) - 1
-                    last_idx = len(items) - 1
+                        items.append(
+                            NormalizedItem(
+                                raw_id=raw_id,
+                                code=self._normalize_code(code_text) or None,
+                                raw_title=title_text,
+                                clean_title=LSRParser._clean_estimate_title(
+                                    title_text
+                                ),
+                                raw_unit=unit_text,
+                                canonical_unit=canonical_unit,
+                                unit_multiplier=multiplier,
+                                volume=volume,
+                                dimensions=DimensionLockExtractor.extract(
+                                    title_text
+                                ),
+                                context_section=section,
+                                pointer=pointer,
+                                is_resource=not is_parent,
+                                parent_id=parent_id if is_nested else None,
+                                unit_price=self._cell_number(
+                                    cells, layout.unit_price_col
+                                ),
+                                total_cost=self._cell_number(
+                                    cells, layout.total_cost_col
+                                ),
+                            )
+                        )
+                        if is_parent:
+                            parent_id = raw_id
+                            pending_idx = len(items) - 1
+                        elif not is_nested:
+                            # Самостоятельная ресурсная позиция без расценки:
+                            # блок «Всего по позиции» относится к ней самой.
+                            pending_idx = len(items) - 1
+                        last_idx = len(items) - 1
+                finally:
+                    # Кэш объектов страницы pdfplumber держит все линии/символы
+                    # листа: освобождаем его сразу после обработки страницы.
+                    _flush_page_cache(page)
 
         return items
 
