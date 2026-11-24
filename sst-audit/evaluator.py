@@ -371,18 +371,29 @@ class DiscrepancyDetector:
     }
 
     @classmethod
+    def waste_coefficient(cls, title: Optional[str]) -> Decimal:
+        """Единый норматив технологических отходов по наименованию позиции.
+
+        SSOT норматива: и ``evaluate()``, и сервисный слой HITL
+        (``review_service.ReviewCard``) берут коэффициент только отсюда, чтобы
+        вердикт карточки и расчетное ядро не расходились.
+        """
+        text = (title or "").lower()
+        if "арматур" in text:
+            return cls.WASTE_COEFFICIENTS["REBAR"] #[cite: 1]
+        if "бетон" in text:
+            return cls.WASTE_COEFFICIENTS["CONCRETE"] #[cite: 1]
+        if "кабел" in text:
+            return cls.WASTE_COEFFICIENTS["CABLE"] #[cite: 1]
+        return cls.WASTE_COEFFICIENTS["DEFAULT"]
+
+    @classmethod
     def evaluate(cls, lsr: NormalizedItem, spec: NormalizedItem, score: Decimal) -> CollisionRecord:
         v_spec = spec.volume
         v_lsr = lsr.volume
 
-        # Определение коэффициента отхода
-        k_waste = cls.WASTE_COEFFICIENTS["DEFAULT"]
-        if "арматур" in lsr.clean_title:
-            k_waste = cls.WASTE_COEFFICIENTS["REBAR"] #[cite: 1]
-        elif "бетон" in lsr.clean_title:
-            k_waste = cls.WASTE_COEFFICIENTS["CONCRETE"] #[cite: 1]
-        elif "кабел" in lsr.clean_title:
-            k_waste = cls.WASTE_COEFFICIENTS["CABLE"] #[cite: 1]
+        # Определение коэффициента отхода (единый источник — waste_coefficient)
+        k_waste = cls.waste_coefficient(lsr.clean_title)
 
         v_spec_adjusted = v_spec * (Decimal("1.0") + k_waste) #[cite: 1]
         allowed_delta = cls.ABS_TOLERANCE + (cls.REL_TOLERANCE * v_spec_adjusted) #[cite: 1]

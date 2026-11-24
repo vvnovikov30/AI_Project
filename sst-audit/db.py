@@ -14,6 +14,10 @@
   ``Decimal`` сохраняется полностью (``str(Decimal)`` на записи,
   ``Decimal(str)`` на чтении). Расчетное ядро остается целиком на
   ``Decimal``.
+* Журнал арбитража ``arbitration_events`` — append-only: API модуля не
+  содержит update/delete для него (воспроизводимость экспертных решений).
+* Персональные данные минимизированы (152-ФЗ): в ``users`` хранится только
+  необратимый хэш логина (``login_hash``) и маска контакта для UI.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
 from itertools import count
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -50,6 +55,12 @@ VALID_SESSION_STATUSES: Final[frozenset[str]] = frozenset(
 VALID_MATCH_STATUSES: Final[frozenset[str]] = frozenset({"AUTO", "HITL_PENDING", "RESOLVED"})
 VALID_REVIEW_DECISIONS: Final[frozenset[str]] = frozenset({"APPROVED", "REJECTED", "ADJUSTED"})
 VALID_RULE_STATUSES: Final[frozenset[str]] = RULE_EVALUATION_STATUSES
+VALID_USER_ROLES: Final[frozenset[str]] = frozenset({"user", "reviewer", "admin"})
+# Версия формы согласия по умолчанию: фиксируется в consents_152fz.doc_version.
+DEFAULT_CONSENT_DOC_VERSION: Final[str] = "1.0"
+# Алгоритм необратимого хэширования логина (152-ФЗ, минимизация ПДн).
+LOGIN_HASH_ALGORITHM: Final[str] = "sha256"
+LOGIN_MASK_HIDDEN: Final[str] = "***"
 
 # Счетчик уникальных имен SAVEPOINT для вложенных транзакций.
 _SAVEPOINT_SEQ: Iterator[int] = count(1)
@@ -61,12 +72,24 @@ SQLNumber: TypeAlias = str | None
 RuleEvaluationInput: TypeAlias = RuleEvaluation | Mapping[str, Any]
 
 SCHEMA_SQL: Final[str] = """
+-- Минимизация ПДн (ст. 5 152-ФЗ): хранится только необратимый хэш логина
+-- (``login_hash``) и опциональная маска для UI. Сырой e-mail/логин в БД не
+-- попадает, поэтому утечка SSOT не раскрывает идентификаторы субъектов.
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    login_hash TEXT NOT NULL UNIQUE,
+    contact_mask TEXT,
+    role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'reviewer', 'admin')),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     project_name TEXT NOT NULL,
     rd_filename TEXT NOT NULL,
     smeta_filename TEXT NOT NULL,
     smeta_sheet TEXT,
+    user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     status TEXT CHECK (status IN ('CREATED', 'MATCHED', 'REVIEWED', 'EXPORTED')) DEFAULT 'CREATED'
 );
@@ -118,10 +141,42 @@ CREATE TABLE IF NOT EXISTS expert_reviews (
     reviewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Согласия субъекта ПДн (152-ФЗ): фиксируется факт, версия документа и
+-- технические метаданные. Числовые значения в ``client_meta`` попадают в
+-- JSON строками (см. ``_serialize_payload``).
+CREATE TABLE IF NOT EXISTS consents_152fz (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+    session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+    consent_type TEXT NOT NULL,
+    doc_version TEXT NOT NULL,
+    accepted INTEGER NOT NULL CHECK (accepted IN (0, 1)),
+    client_meta JSON,
+    accepted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Append-only журнал арбитража (воспроизводимость по ст. 8 ФЗ № 73-ФЗ).
+-- API модуля намеренно не содержит update/delete для этой таблицы: записи
+-- только добавляются (``record_arbitration_event``) и читаются.
+CREATE TABLE IF NOT EXISTS arbitration_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    match_record_id INTEGER NOT NULL REFERENCES match_records(id) ON DELETE CASCADE,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    old_payload JSON,
+    new_payload JSON,
+    comment TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_rd_items_session ON rd_items(session_id);
 CREATE INDEX IF NOT EXISTS idx_smeta_items_session ON smeta_items(session_id);
 CREATE INDEX IF NOT EXISTS idx_match_records_session_status ON match_records(session_id, status);
 CREATE INDEX IF NOT EXISTS idx_expert_reviews_match ON expert_reviews(match_record_id);
+CREATE INDEX IF NOT EXISTS idx_consents_user ON consents_152fz(user_id);
+CREATE INDEX IF NOT EXISTS idx_arbitration_events_session_match
+    ON arbitration_events(session_id, match_record_id);
 
 CREATE VIEW IF NOT EXISTS v_audit_export AS
 SELECT
@@ -226,6 +281,12 @@ CREATE INDEX IF NOT EXISTS idx_rule_eval_lookup ON rule_evaluations(session_id, 
 -- поэтому они пересоздаются после миграции, а не только в SCHEMA_SQL.
 CREATE INDEX IF NOT EXISTS idx_match_records_session_status ON match_records(session_id, status);
 CREATE INDEX IF NOT EXISTS idx_expert_reviews_match ON expert_reviews(match_record_id);
+CREATE INDEX IF NOT EXISTS idx_consents_user ON consents_152fz(user_id);
+CREATE INDEX IF NOT EXISTS idx_arbitration_events_session_match
+    ON arbitration_events(session_id, match_record_id);
+-- idx_sessions_user живет только здесь: SCHEMA_SQL выполняется до миграции
+-- sessions.user_id, и на легаси-БД CREATE INDEX упал бы с "no such column".
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 """
 
 # Числовые колонки, которые обязаны иметь TEXT-аффинити: REAL в SQLite
@@ -296,8 +357,13 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 def _migrate_sessions_schema(conn: sqlite3.Connection) -> None:
     """Добавляет новые колонки в уже существующую БД без потери данных."""
-    if "smeta_sheet" not in _table_columns(conn, "sessions"):
+    columns = _table_columns(conn, "sessions")
+    if "smeta_sheet" not in columns:
         conn.execute("ALTER TABLE sessions ADD COLUMN smeta_sheet TEXT")
+    if "user_id" not in columns:
+        # REFERENCES добавляется отдельным CREATE TABLE в SCHEMA_SQL: ALTER
+        # TABLE на легаси-БД ограничен и не должен ломать существующие данные.
+        conn.execute("ALTER TABLE sessions ADD COLUMN user_id TEXT")
 
 
 def _migrate_smeta_items_schema(conn: sqlite3.Connection) -> None:
@@ -571,20 +637,24 @@ def create_session(
     rd_file: str,
     smeta_file: str,
     smeta_sheet: str | None = None,
+    *,
+    user_id: str | None = None,
 ) -> str:
     """Регистрирует сессию аудита и возвращает ее идентификатор.
 
     :param smeta_sheet: имя листа ``ЛС ...``, если сессия относится к одному
         разделу многолистовой сметы (пакетный ночной режим).
+    :param user_id: владелец сессии в таблице ``users`` (опционально; по
+        умолчанию ``None`` — обратная совместимость с CLI и пайплайном).
     """
     with transaction(conn):
         conn.execute(
             """
             INSERT INTO sessions
-                (id, project_name, rd_filename, smeta_filename, smeta_sheet)
-            VALUES (?, ?, ?, ?, ?)
+                (id, project_name, rd_filename, smeta_filename, smeta_sheet, user_id)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (session_id, project_name, rd_file, smeta_file, smeta_sheet),
+            (session_id, project_name, rd_file, smeta_file, smeta_sheet, user_id),
         )
     return session_id
 
@@ -1033,29 +1103,56 @@ def update_match_link(
     match_id: int,
     rd_item_id: int | None,
     confidence_score: Decimal | int | str,
+    *,
+    actor: str = "system",
+    comment: str | None = None,
 ) -> None:
     """Уточняет связь по решению эксперта (кандидат РД, выбранный в HITL).
+
+    Изменение и аудиторский след ``LINK_UPDATED`` пишутся в одной транзакции:
+    журнал ``arbitration_events`` не может разойтись с ``match_records``.
 
     :param rd_item_id: идентификатор выбранной позиции РД либо ``None``,
         если связь отклонена.
     :raises ValueError: связь с указанным id не найдена.
     """
+    new_confidence = _to_sql_number(confidence_score)
     with transaction(conn):
-        cursor = conn.execute(
+        current = conn.execute(
+            """
+            SELECT session_id, rd_item_id, confidence_score
+            FROM match_records
+            WHERE id = ?
+            """,
+            (match_id,),
+        ).fetchone()
+        if current is None:
+            raise ValueError(f"Связь '{match_id}' не найдена")
+
+        conn.execute(
             """
             UPDATE match_records
             SET rd_item_id = ?, confidence_score = ?
             WHERE id = ?
             """,
-            (
-                rd_item_id,
-                _to_sql_number(confidence_score),
-                match_id,
-            ),
+            (rd_item_id, new_confidence, match_id),
         )
-
-    if cursor.rowcount == 0:
-        raise ValueError(f"Связь '{match_id}' не найдена")
+        record_arbitration_event(
+            conn,
+            str(current["session_id"]),
+            match_id,
+            actor,
+            "LINK_UPDATED",
+            old_payload={
+                "rd_item_id": current["rd_item_id"],
+                "confidence_score": _to_sql_number(current["confidence_score"]),
+            },
+            new_payload={
+                "rd_item_id": rd_item_id,
+                "confidence_score": new_confidence,
+            },
+            comment=comment,
+        )
 
 
 def record_expert_review(
@@ -1069,6 +1166,10 @@ def record_expert_review(
 ) -> int:
     """Фиксирует экспертизу связи и переводит ее в статус RESOLVED.
 
+    Запись решения и событие ``REVIEW_<DECISION>`` в ``arbitration_events``
+    выполняются в одной транзакции: журнал арбитража воспроизводим и не может
+    содержать «полурешений».
+
     :return: идентификатор созданной записи ``expert_reviews``.
     """
     if decision not in VALID_REVIEW_DECISIONS:
@@ -1079,7 +1180,19 @@ def record_expert_review(
     if not reviewer or not reviewer.strip():
         raise ValueError("reviewer_name не может быть пустым")
 
+    reviewer_name = reviewer.strip()
+    adjusted = _to_sql_number(adjusted_ratio)
+
     with transaction(conn):
+        current = conn.execute(
+            """
+            SELECT session_id, status, rd_item_id, conversion_ratio
+            FROM match_records
+            WHERE id = ?
+            """,
+            (match_id,),
+        ).fetchone()
+
         cursor = conn.execute(
             """
             INSERT INTO expert_reviews
@@ -1089,9 +1202,9 @@ def record_expert_review(
             """,
             (
                 match_id,
-                reviewer.strip(),
+                reviewer_name,
                 decision,
-                _to_sql_number(adjusted_ratio),
+                adjusted,
                 reason_code,
                 comment,
             ),
@@ -1101,7 +1214,226 @@ def record_expert_review(
             "UPDATE match_records SET status = 'RESOLVED' WHERE id = ?",
             (match_id,),
         )
+        if current is not None:
+            # Отсутствующая связь обрабатывается штатным FK-ограничением
+            # expert_reviews, поэтому событие пишется только для существующей.
+            record_arbitration_event(
+                conn,
+                str(current["session_id"]),
+                match_id,
+                reviewer_name,
+                f"REVIEW_{decision}",
+                old_payload={
+                    "status": current["status"],
+                    "rd_item_id": current["rd_item_id"],
+                    "conversion_ratio": _to_sql_number(current["conversion_ratio"]),
+                },
+                new_payload={
+                    "status": "RESOLVED",
+                    "rd_item_id": current["rd_item_id"],
+                    "conversion_ratio": _to_sql_number(current["conversion_ratio"]),
+                    "decision": decision,
+                    "adjusted_ratio": adjusted,
+                    "reason_code": reason_code,
+                    "comment": comment,
+                },
+                comment=comment,
+            )
     return review_id
+
+
+def normalize_login(login: str) -> str:
+    """Нормализует логин/e-mail перед необратимым хэшированием.
+
+    Приведение к ``casefold`` и удаление пробелов гарантируют, что
+    ``Ivanov@Company.ru`` и `` ivanov@company.ru `` дают один и тот же хэш.
+    """
+    return str(login or "").strip().casefold()
+
+
+def hash_login(login: str, *, salt: str = "") -> str:
+    """Возвращает криптографический хэш нормализованного логина (152-ФЗ).
+
+    Сырой e-mail в БД не хранится: в ``users.login_hash`` попадает только
+    необратимый дайджест (``sha256``), поэтому SSOT не содержит ПДн в открытом
+    виде. ``salt`` позволяет использовать проектную соль без смены схемы.
+
+    :raises ValueError: пустой логин после нормализации.
+    """
+    normalized = normalize_login(login)
+    if not normalized:
+        raise ValueError("Логин не может быть пустым")
+    digest_source = f"{salt}{normalized}".encode("utf-8")
+    return hashlib.new(LOGIN_HASH_ALGORITHM, digest_source).hexdigest()
+
+
+def mask_login(login: str) -> str:
+    """Формирует маску для UI (``e***@company.ru``) без хранения сырого логина."""
+    normalized = str(login or "").strip()
+    if not normalized:
+        return ""
+    local, separator, domain = normalized.partition("@")
+    head = local[:1] if local else ""
+    masked_local = f"{head}{LOGIN_MASK_HIDDEN}"
+    return f"{masked_local}{separator}{domain}" if separator else masked_local
+
+
+def create_user(
+    conn: sqlite3.Connection,
+    user_id: str,
+    login_hash: str,
+    contact_mask: str | None = None,
+    role: str = "user",
+) -> str:
+    """Регистрирует субъекта ПДн по необратимому хэшу логина.
+
+    :param login_hash: результат ``hash_login``; сырой логин/e-mail не
+        передается и не хранится.
+    :raises ValueError: пустой ``user_id``/``login_hash`` либо неизвестная роль.
+    :raises sqlite3.IntegrityError: ``login_hash`` уже зарегистрирован.
+    """
+    if not user_id or not str(user_id).strip():
+        raise ValueError("user_id не может быть пустым")
+    if not login_hash or not str(login_hash).strip():
+        raise ValueError("login_hash не может быть пустым")
+    if role not in VALID_USER_ROLES:
+        raise ValueError(
+            f"Недопустимая роль '{role}'. Разрешены: {sorted(VALID_USER_ROLES)}"
+        )
+
+    with transaction(conn):
+        conn.execute(
+            """
+            INSERT INTO users (id, login_hash, contact_mask, role)
+            VALUES (?, ?, ?, ?)
+            """,
+            (str(user_id), str(login_hash), contact_mask, role),
+        )
+    return str(user_id)
+
+
+def get_user_by_login_hash(
+    conn: sqlite3.Connection,
+    login_hash: str,
+) -> sqlite3.Row | None:
+    """Находит пользователя по хэшу логина (поиск без раскрытия ПДн)."""
+    return conn.execute(
+        """
+        SELECT id, login_hash, contact_mask, role, created_at
+        FROM users
+        WHERE login_hash = ?
+        """,
+        (str(login_hash),),
+    ).fetchone()
+
+
+def record_consent_152fz(
+    conn: sqlite3.Connection,
+    consent_type: str,
+    doc_version: str,
+    accepted: bool = True,
+    user_id: str | None = None,
+    session_id: str | None = None,
+    client_meta: object = None,
+) -> int:
+    """Фиксирует согласие субъекта ПДн и возвращает id записи.
+
+    :param consent_type: тип согласия (``PDN_PROCESSING``, ``OFFER`` и т.п.).
+    :param doc_version: версия документа, с которой ознакомлен субъект.
+    :param client_meta: технические метаданные; сериализуются
+        ``_serialize_payload`` с ``default=str``, поэтому ``Decimal`` внутри
+        словаря превращается в строку без ``TypeError``.
+    :raises ValueError: пустой ``consent_type`` либо ``doc_version``.
+    """
+    if not consent_type or not str(consent_type).strip():
+        raise ValueError("consent_type не может быть пустым")
+    if not doc_version or not str(doc_version).strip():
+        raise ValueError("doc_version не может быть пустым")
+
+    with transaction(conn):
+        cursor = conn.execute(
+            """
+            INSERT INTO consents_152fz
+                (user_id, session_id, consent_type, doc_version, accepted, client_meta)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                session_id,
+                str(consent_type).strip(),
+                str(doc_version).strip(),
+                int(bool(accepted)),
+                _serialize_payload(client_meta),
+            ),
+        )
+        consent_id = int(cursor.lastrowid)
+    return consent_id
+
+
+def record_arbitration_event(
+    conn: sqlite3.Connection,
+    session_id: str,
+    match_record_id: int,
+    actor: str,
+    action: str,
+    old_payload: object = None,
+    new_payload: object = None,
+    comment: str | None = None,
+) -> int:
+    """Добавляет запись в append-only журнал арбитража (ст. 8 ФЗ № 73-ФЗ).
+
+    Журнал не поддерживает обновление и удаление: любое действие фиксируется
+    отдельным событием, что обеспечивает воспроизводимость экспертных решений.
+    ``old_payload``/``new_payload`` сериализуются ``_serialize_payload`` со
+    ``default=str``: ``Decimal`` сохраняется строкой (Zero Float Policy).
+
+    :return: идентификатор созданного события.
+    :raises ValueError: пустой ``actor`` либо ``action``.
+    """
+    if not actor or not str(actor).strip():
+        raise ValueError("actor не может быть пустым")
+    if not action or not str(action).strip():
+        raise ValueError("action не может быть пустым")
+
+    with transaction(conn):
+        cursor = conn.execute(
+            """
+            INSERT INTO arbitration_events
+                (session_id, match_record_id, actor, action,
+                 old_payload, new_payload, comment)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(session_id),
+                int(match_record_id),
+                str(actor).strip(),
+                str(action).strip(),
+                _serialize_payload(old_payload),
+                _serialize_payload(new_payload),
+                comment,
+            ),
+        )
+        event_id = int(cursor.lastrowid)
+    return event_id
+
+
+def get_arbitration_events(
+    conn: sqlite3.Connection,
+    session_id: str,
+    match_record_id: int | None = None,
+) -> list[sqlite3.Row]:
+    """Читает журнал арбитража сессии в хронологическом порядке (id ASC)."""
+    sql = (
+        "SELECT id, session_id, match_record_id, actor, action, "
+        "old_payload, new_payload, comment, created_at "
+        "FROM arbitration_events WHERE session_id = ?"
+    )
+    params: list[Any] = [session_id]
+    if match_record_id is not None:
+        sql += " AND match_record_id = ?"
+        params.append(int(match_record_id))
+    sql += " ORDER BY id ASC"
+    return list(conn.execute(sql, params).fetchall())
 
 
 # ----------------------------------------------------------------------

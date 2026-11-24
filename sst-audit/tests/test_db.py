@@ -2,19 +2,29 @@
 
 from collections.abc import Iterator
 from decimal import Decimal
+import json
 import sqlite3
 
 import pytest
 
 from db import (
     SCHEMA_SQL,
+    VALID_USER_ROLES,
     backup_database,
     create_session,
+    create_user,
+    get_arbitration_events,
     get_connection,
     get_pending_reviews,
     get_rule_evaluations,
     get_smeta_items_map,
+    get_user_by_login_hash,
+    hash_login,
     init_db,
+    mask_login,
+    normalize_login,
+    record_arbitration_event,
+    record_consent_152fz,
     record_expert_review,
     save_matches,
     save_rd_items,
@@ -25,6 +35,7 @@ from db import (
     update_session_status,
 )
 from models import RuleEvaluation
+import db
 
 SESSION_ID = "session-001"
 
@@ -35,6 +46,9 @@ EXPECTED_TABLES = {
     "match_records",
     "rule_evaluations",
     "expert_reviews",
+    "users",
+    "consents_152fz",
+    "arbitration_events",
 }
 
 
@@ -957,5 +971,378 @@ class TestDatabaseBackup:
         assert snapshots[1].name == "rotate_20200103_000000.db"
         assert not (backup_dir / "rotate_20200101_000000.db").exists()
         assert not (backup_dir / "rotate_20200102_000000.db").exists()
+
+
+# ----------------------------------------------------------------------
+# 152-ФЗ: пользователи по хэшу, согласия и append-only журнал арбитража
+# ----------------------------------------------------------------------
+
+
+def _seed_pending_match(connection: sqlite3.Connection) -> int:
+    """Создает цепочку session -> items -> HITL_PENDING match без ревью."""
+    create_session(connection, SESSION_ID, "ЖК Север", "rd.pdf", "smeta.xlsx")
+    save_rd_items(
+        connection,
+        SESSION_ID,
+        [
+            {
+                "row_idx": 7,
+                "code": "ART-1",
+                "description": "Арматура А500С",
+                "unit": "т",
+                "quantity": Decimal("2.0"),
+            },
+            {
+                "row_idx": 8,
+                "code": "CBL-2",
+                "description": "Кабель силовой ВВГнг 3х1.5",
+                "unit": "м",
+                "quantity": Decimal("100.0"),
+            },
+        ],
+    )
+    save_smeta_items(
+        connection,
+        SESSION_ID,
+        [
+            {
+                "row_idx": 3,
+                "code": "08-02-001-01",
+                "description": "Прокладка кабеля",
+                "unit": "м",
+                "quantity": Decimal("104.0"),
+                "unit_price": Decimal("100.00"),
+                "total_cost": Decimal("10400.00"),
+            }
+        ],
+    )
+    save_matches(
+        connection,
+        SESSION_ID,
+        [
+            {
+                "rd_item_id": _first_id(connection, "rd_items"),
+                "smeta_item_id": _first_id(connection, "smeta_items"),
+                "confidence_score": Decimal("62.5"),
+                "conversion_ratio": Decimal("1.0"),
+                "match_method": "FUZZY_CASCADE",
+                "status": "HITL_PENDING",
+            }
+        ],
+    )
+    return _first_id(connection, "match_records")
+
+
+def test_arbitration_events_are_append_only(conn: sqlite3.Connection) -> None:
+    """Журнал арбитража доступен только на добавление и чтение (append-only)."""
+    for forbidden in (
+        "update_arbitration_event",
+        "delete_arbitration_event",
+        "clear_arbitration_events",
+    ):
+        assert not hasattr(db, forbidden), forbidden
+
+    match_id = _seed_pending_match(conn)
+    first_id = record_arbitration_event(
+        conn,
+        SESSION_ID,
+        match_id,
+        "ivanov",
+        "LINK_UPDATED",
+        old_payload={"rd_item_id": None},
+        new_payload={"rd_item_id": 1},
+    )
+    second_id = record_arbitration_event(
+        conn,
+        SESSION_ID,
+        match_id,
+        "petrova",
+        "REVIEW_REJECTED",
+        comment="Семантика",
+    )
+
+    events = get_arbitration_events(conn, SESSION_ID)
+    assert [event["id"] for event in events] == [first_id, second_id]
+    assert [event["action"] for event in events] == [
+        "LINK_UPDATED",
+        "REVIEW_REJECTED",
+    ]
+    # Первое событие не перезаписано вторым (нет UPDATE-семантики).
+    assert json.loads(events[0]["new_payload"]) == {"rd_item_id": 1}
+    assert get_arbitration_events(conn, SESSION_ID, match_id) == events
+    assert get_arbitration_events(conn, "other-session") == []
+
+
+def test_arbitration_event_payload_keeps_decimal_as_text(
+    conn: sqlite3.Connection,
+) -> None:
+    """Decimal в payload журнала сохраняется строкой (Zero Float Policy)."""
+    match_id = _seed_pending_match(conn)
+    record_arbitration_event(
+        conn,
+        SESSION_ID,
+        match_id,
+        "ivanov",
+        "LINK_UPDATED",
+        old_payload={"conversion_ratio": Decimal("1.0000")},
+        new_payload={"delta_volume": Decimal("-2.750")},
+        comment="Пересчет",
+    )
+
+    event = get_arbitration_events(conn, SESSION_ID, match_id)[0]
+    assert json.loads(event["old_payload"]) == {"conversion_ratio": "1.0000"}
+    assert json.loads(event["new_payload"]) == {"delta_volume": "-2.750"}
+    assert event["comment"] == "Пересчет"
+
+    with pytest.raises(ValueError, match="actor"):
+        record_arbitration_event(conn, SESSION_ID, match_id, "  ", "LINK_UPDATED")
+    with pytest.raises(ValueError, match="action"):
+        record_arbitration_event(conn, SESSION_ID, match_id, "ivanov", "  ")
+
+
+def test_update_match_link_writes_arbitration_event(conn: sqlite3.Connection) -> None:
+    """Уточнение связи и событие LINK_UPDATED фиксируются одной транзакцией."""
+    match_id = _seed_pending_match(conn)
+
+    update_match_link(
+        conn,
+        match_id,
+        None,
+        Decimal("0"),
+        actor="petrova",
+        comment="Отклонено вручную",
+    )
+
+    events = get_arbitration_events(conn, SESSION_ID, match_id)
+    assert len(events) == 1
+    event = events[0]
+    assert event["action"] == "LINK_UPDATED"
+    assert event["actor"] == "petrova"
+    assert event["comment"] == "Отклонено вручную"
+    assert json.loads(event["new_payload"]) == {
+        "rd_item_id": None,
+        "confidence_score": "0",
+    }
+    assert json.loads(event["old_payload"])["rd_item_id"] is not None
+
+    match = conn.execute(
+        "SELECT rd_item_id, confidence_score FROM match_records WHERE id = ?",
+        (match_id,),
+    ).fetchone()
+    assert match["rd_item_id"] is None
+    assert match["confidence_score"] == "0"
+
+
+def test_update_match_link_missing_leaves_no_event(conn: sqlite3.Connection) -> None:
+    """Отсутствующая связь не оставляет «висячего» события в журнале."""
+    _seed_pending_match(conn)
+
+    with pytest.raises(ValueError, match="не найдена"):
+        update_match_link(conn, 4242, None, Decimal("0"))
+
+    assert conn.execute(
+        "SELECT COUNT(*) AS c FROM arbitration_events"
+    ).fetchone()["c"] == 0
+
+
+def test_record_expert_review_writes_event_and_rolls_back(
+    conn: sqlite3.Connection,
+) -> None:
+    """Решение эксперта и событие REVIEW_* атомарны: отказ не оставляет следа."""
+    match_id = _seed_pending_match(conn)
+
+    review_id = record_expert_review(
+        conn,
+        match_id,
+        "  ivanov  ",
+        "APPROVED",
+        comment="Подтверждено",
+    )
+
+    events = get_arbitration_events(conn, SESSION_ID, match_id)
+    assert [event["action"] for event in events] == ["REVIEW_APPROVED"]
+    assert events[0]["actor"] == "ivanov"
+    payload = json.loads(events[0]["new_payload"])
+    assert payload["decision"] == "APPROVED"
+    assert payload["status"] == "RESOLVED"
+    assert events[0]["comment"] == "Подтверждено"
+
+    with pytest.raises(ValueError, match="Недопустимое решение"):
+        record_expert_review(conn, match_id, "ivanov", "MAYBE")
+
+    assert len(get_arbitration_events(conn, SESSION_ID, match_id)) == 1
+    assert conn.execute(
+        "SELECT COUNT(*) AS c FROM expert_reviews"
+    ).fetchone()["c"] == 1
+    review = conn.execute(
+        "SELECT reviewer_name, decision FROM expert_reviews WHERE id = ?",
+        (review_id,),
+    ).fetchone()
+    assert review["reviewer_name"] == "ivanov"
+    assert review["decision"] == "APPROVED"
+
+
+def test_users_are_stored_only_as_login_hash(conn: sqlite3.Connection) -> None:
+    """В ``users`` нет сырого e-mail: только sha256-хэш и маска для UI."""
+    assert normalize_login("  Ivanov@Company.RU ") == "ivanov@company.ru"
+    digest = hash_login("Ivanov@Company.RU")
+    assert digest == hash_login(" ivanov@company.ru ")
+    assert len(digest) == 64
+    assert "ivanov@company.ru" not in digest
+    assert hash_login("ivanov@company.ru", salt="pepper") != digest
+    assert mask_login("ivanov@company.ru") == "i***@company.ru"
+    assert mask_login("") == ""
+
+    with pytest.raises(ValueError, match="Логин"):
+        hash_login("   ")
+
+    create_user(
+        conn,
+        "user-1",
+        digest,
+        contact_mask=mask_login("ivanov@company.ru"),
+        role="reviewer",
+    )
+    row = get_user_by_login_hash(conn, digest)
+    assert row is not None
+    assert row["id"] == "user-1"
+    assert row["role"] == "reviewer"
+    assert row["contact_mask"] == "i***@company.ru"
+    assert get_user_by_login_hash(conn, hash_login("other@company.ru")) is None
+
+    dump = " ".join(
+        str(tuple(record)) for record in conn.execute("SELECT * FROM users")
+    )
+    assert "ivanov@company.ru" not in dump
+
+    assert VALID_USER_ROLES == frozenset({"user", "reviewer", "admin"})
+    with pytest.raises(ValueError, match="роль"):
+        create_user(conn, "user-2", hash_login("x@y.ru"), role="root")
+    with pytest.raises(ValueError, match="login_hash"):
+        create_user(conn, "user-3", "   ")
+    with pytest.raises(sqlite3.IntegrityError):
+        create_user(conn, "user-4", digest)
+
+    create_session(
+        conn,
+        "session-owned",
+        "ЖК Север",
+        "rd.pdf",
+        "smeta.xlsx",
+        user_id="user-1",
+    )
+    owner = conn.execute(
+        "SELECT user_id FROM sessions WHERE id = 'session-owned'"
+    ).fetchone()
+    assert owner["user_id"] == "user-1"
+
+
+def test_record_consent_152fz_persists_metadata(conn: sqlite3.Connection) -> None:
+    """Согласие фиксируется с версией документа и метаданными клиента."""
+    create_user(conn, "user-1", hash_login("ivanov@company.ru"))
+    create_session(
+        conn,
+        "session-owned",
+        "ЖК Север",
+        "rd.pdf",
+        "smeta.xlsx",
+        user_id="user-1",
+    )
+
+    consent_id = record_consent_152fz(
+        conn,
+        "PDN_PROCESSING",
+        "1.0",
+        True,
+        user_id="user-1",
+        session_id="session-owned",
+        client_meta={"attempt": 2, "delta": Decimal("2.5"), "channel": "cli"},
+    )
+    row = conn.execute(
+        "SELECT * FROM consents_152fz WHERE id = ?",
+        (consent_id,),
+    ).fetchone()
+    assert row["accepted"] == 1
+    assert row["user_id"] == "user-1"
+    assert row["session_id"] == "session-owned"
+    assert row["doc_version"] == "1.0"
+    meta = json.loads(row["client_meta"])
+    assert meta["attempt"] == 2
+    assert meta["delta"] == "2.5"
+    assert meta["channel"] == "cli"
+
+    declined_id = record_consent_152fz(conn, "OFFER", "2.1", False, user_id="user-1")
+    declined = conn.execute(
+        "SELECT accepted FROM consents_152fz WHERE id = ?",
+        (declined_id,),
+    ).fetchone()
+    assert declined["accepted"] == 0
+
+    with pytest.raises(ValueError, match="consent_type"):
+        record_consent_152fz(conn, "  ", "1.0")
+    with pytest.raises(ValueError, match="doc_version"):
+        record_consent_152fz(conn, "PDN_PROCESSING", "  ")
+
+
+def test_init_db_migrates_legacy_sessions_to_152fz(tmp_path) -> None:
+    """Легаси-БД получает sessions.user_id и индекс idx_sessions_user."""
+    connection = get_connection(tmp_path / "legacy_152fz.db")
+    try:
+        connection.execute(
+            """
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                project_name TEXT NOT NULL,
+                rd_filename TEXT NOT NULL,
+                smeta_filename TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'CREATED'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO sessions (id, project_name, rd_filename, smeta_filename)
+            VALUES ('legacy', 'Старый проект', 'rd.pdf', 'smeta.xlsx')
+            """
+        )
+        connection.commit()
+
+        init_db(connection)
+        init_db(connection)
+
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(sessions)")
+        }
+        assert "user_id" in columns
+        assert "smeta_sheet" in columns
+
+        indexes = {
+            row["name"]
+            for row in connection.execute("PRAGMA index_list(sessions)")
+        }
+        assert "idx_sessions_user" in indexes
+
+        legacy = connection.execute(
+            "SELECT user_id FROM sessions WHERE id = 'legacy'"
+        ).fetchone()
+        assert legacy["user_id"] is None
+
+        create_user(connection, "user-1", hash_login("ivanov@company.ru"))
+        create_session(
+            connection,
+            "session-owned",
+            "Новый проект",
+            "rd.pdf",
+            "smeta.xlsx",
+            user_id="user-1",
+        )
+        owned = connection.execute(
+            "SELECT user_id FROM sessions WHERE id = 'session-owned'"
+        ).fetchone()
+        assert owned["user_id"] == "user-1"
+    finally:
+        connection.close()
 
 
