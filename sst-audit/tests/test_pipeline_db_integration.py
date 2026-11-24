@@ -357,7 +357,7 @@ def test_pipeline_filters_noise_below_min_threshold(conn: sqlite3.Connection) ->
     assert match["status"] == "AUTO"
     assert match["match_method"] == "NO_MATCH"
     assert match["rd_item_id"] is None
-    assert match["confidence_score"] == 0
+    assert Decimal(str(match["confidence_score"])) == Decimal("0")
     assert db.get_pending_reviews(conn, "it-session-noise") == []
 
 
@@ -387,7 +387,7 @@ def test_pipeline_handles_empty_rd_gracefully(conn: sqlite3.Connection) -> None:
     assert match is not None
     assert match["status"] == "AUTO"
     assert match["rd_item_id"] is None
-    assert match["confidence_score"] == 0
+    assert Decimal(str(match["confidence_score"])) == Decimal("0")
 
     rule = conn.execute(
         "SELECT rule_code, status FROM rule_evaluations WHERE match_record_id = ?",
@@ -656,7 +656,7 @@ def test_interactive_hitl_updates_link_and_rules(
         "SELECT id FROM rd_items WHERE code = 'ART-2.5'"
     ).fetchone()["id"]
     assert match["rd_item_id"] == selected_id
-    assert match["confidence_score"] == pytest.approx(96.153846, rel=1e-4)
+    assert float(match["confidence_score"]) == pytest.approx(96.153846, rel=1e-4)
 
     review = conn.execute(
         "SELECT * FROM expert_reviews WHERE match_record_id = ?",

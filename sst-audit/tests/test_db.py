@@ -172,6 +172,8 @@ def test_db_schema_numeric_columns_are_text(conn: sqlite3.Connection) -> None:
         "rd_items": {"quantity"},
         "smeta_items": {"quantity", "unit_price", "total_cost"},
         "rule_evaluations": {"score_weight"},
+        "match_records": {"confidence_score", "conversion_ratio"},
+        "expert_reviews": {"adjusted_ratio"},
     }
     for table, columns in expected.items():
         declared = {
@@ -355,7 +357,7 @@ def test_save_and_retrieve_audit_data(conn: sqlite3.Connection) -> None:
     assert len(pending) == 1
     assert pending[0]["rd_code"] == "ФССЦ-21.1.06.04-0012"
     assert pending[0]["smeta_code"] == "08-02-001-01"
-    assert pending[0]["confidence_score"] == pytest.approx(91.5)
+    assert Decimal(str(pending[0]["confidence_score"])) == Decimal("91.5")
 
     review_id = record_expert_review(
         conn,
@@ -384,7 +386,7 @@ def test_save_and_retrieve_audit_data(conn: sqlite3.Connection) -> None:
     assert row["match_method"] == "FUZZY_CASCADE"
     assert row["match_status"] == "RESOLVED"
     assert row["decision"] == "ADJUSTED"
-    assert row["adjusted_ratio"] == pytest.approx(0.1)
+    assert Decimal(str(row["adjusted_ratio"])) == Decimal("0.1")
     assert row["reject_reason_code"] == "RATIO_MISMATCH"
     assert row["reviewer_name"] == "Инженер ПТО"
 
@@ -659,6 +661,29 @@ def test_init_db_migrates_legacy_real_columns_to_text(tmp_path) -> None:
                 parent_id INTEGER,
                 raw_payload JSON
             );
+            DROP TABLE expert_reviews;
+            DROP TABLE match_records;
+            CREATE TABLE match_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                rd_item_id INTEGER REFERENCES rd_items(id) ON DELETE CASCADE,
+                smeta_item_id INTEGER REFERENCES smeta_items(id) ON DELETE CASCADE,
+                confidence_score REAL NOT NULL,
+                conversion_ratio REAL DEFAULT 1.0,
+                match_method TEXT NOT NULL,
+                status TEXT DEFAULT 'AUTO'
+            );
+            CREATE TABLE expert_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_record_id INTEGER NOT NULL
+                    REFERENCES match_records(id) ON DELETE CASCADE,
+                reviewer_name TEXT NOT NULL,
+                decision TEXT,
+                adjusted_ratio REAL,
+                reject_reason_code TEXT,
+                comment TEXT,
+                reviewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
             INSERT INTO sessions (id, project_name, rd_filename, smeta_filename)
             VALUES ('legacy', 'Старый проект', 'rd.pdf', 'smeta.xlsx');
             INSERT INTO rd_items
@@ -671,8 +696,11 @@ def test_init_db_migrates_legacy_real_columns_to_text(tmp_path) -> None:
                     10.0, 2500.0, 25000.0);
             INSERT INTO match_records
                 (session_id, rd_item_id, smeta_item_id,
-                 confidence_score, match_method)
-            VALUES ('legacy', 1, 1, 90, 'FUZZY_CASCADE');
+                 confidence_score, conversion_ratio, match_method)
+            VALUES ('legacy', 1, 1, 90.5, 2.0, 'FUZZY_CASCADE');
+            INSERT INTO expert_reviews
+                (match_record_id, reviewer_name, decision, adjusted_ratio)
+            VALUES (1, 'Петров', 'ADJUSTED', 1.25);
             """
         )
         connection.commit()
@@ -683,12 +711,36 @@ def test_init_db_migrates_legacy_real_columns_to_text(tmp_path) -> None:
         for table, columns in {
             "rd_items": ("quantity",),
             "smeta_items": ("quantity", "unit_price", "total_cost"),
+            "match_records": ("confidence_score", "conversion_ratio"),
+            "expert_reviews": ("adjusted_ratio",),
         }.items():
             declared = {
                 row["name"]: str(row["type"]).upper()
                 for row in connection.execute(f"PRAGMA table_info({table})")
             }
             assert all(declared[column] == "TEXT" for column in columns)
+
+        match_row = connection.execute(
+            "SELECT confidence_score, conversion_ratio FROM match_records"
+        ).fetchone()
+        assert match_row["confidence_score"] == "90.5"
+        assert match_row["conversion_ratio"] == "2.0"
+        review_row = connection.execute(
+            "SELECT adjusted_ratio FROM expert_reviews"
+        ).fetchone()
+        assert review_row["adjusted_ratio"] == "1.25"
+
+        # Пересборка таблиц удаляет их индексы: init_db обязан их пересоздать.
+        index_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        assert {
+            "idx_match_records_session_status",
+            "idx_expert_reviews_match",
+        } <= index_names
 
         rd_row = connection.execute(
             "SELECT quantity FROM rd_items WHERE session_id = 'legacy'"

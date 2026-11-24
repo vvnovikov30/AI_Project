@@ -376,7 +376,7 @@ class MatchRecord:
         if self.breakdown is not None and self.breakdown.is_blocked:
             return True
         return any(
-            evaluation.rule_code == RuleBreakdown.R05_UNT
+            evaluation.rule_code == "R05_UNT"
             and evaluation.status == "FAILED"
             for evaluation in self.evaluations
         )

@@ -101,8 +101,8 @@ CREATE TABLE IF NOT EXISTS match_records (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     rd_item_id INTEGER REFERENCES rd_items(id) ON DELETE CASCADE,
     smeta_item_id INTEGER REFERENCES smeta_items(id) ON DELETE CASCADE,
-    confidence_score REAL NOT NULL,
-    conversion_ratio REAL DEFAULT 1.0,
+    confidence_score TEXT NOT NULL,
+    conversion_ratio TEXT DEFAULT '1.0',
     match_method TEXT NOT NULL,
     status TEXT DEFAULT 'AUTO' CHECK (status IN ('AUTO', 'HITL_PENDING', 'RESOLVED'))
 );
@@ -112,7 +112,7 @@ CREATE TABLE IF NOT EXISTS expert_reviews (
     match_record_id INTEGER NOT NULL REFERENCES match_records(id) ON DELETE CASCADE,
     reviewer_name TEXT NOT NULL,
     decision TEXT CHECK (decision IN ('APPROVED', 'REJECTED', 'ADJUSTED')),
-    adjusted_ratio REAL,
+    adjusted_ratio TEXT,
     reject_reason_code TEXT,
     comment TEXT,
     reviewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -222,6 +222,10 @@ CREATE INDEX IF NOT EXISTS idx_rd_items_session ON rd_items(session_id);
 CREATE INDEX IF NOT EXISTS idx_smeta_items_session ON smeta_items(session_id);
 CREATE INDEX IF NOT EXISTS idx_rule_evaluations_match ON rule_evaluations(match_record_id);
 CREATE INDEX IF NOT EXISTS idx_rule_eval_lookup ON rule_evaluations(session_id, match_record_id);
+-- Пересборка match_records/expert_reviews (REAL -> TEXT) удаляет их индексы,
+-- поэтому они пересоздаются после миграции, а не только в SCHEMA_SQL.
+CREATE INDEX IF NOT EXISTS idx_match_records_session_status ON match_records(session_id, status);
+CREATE INDEX IF NOT EXISTS idx_expert_reviews_match ON expert_reviews(match_record_id);
 """
 
 # Числовые колонки, которые обязаны иметь TEXT-аффинити: REAL в SQLite
@@ -230,6 +234,8 @@ NUMERIC_TEXT_COLUMNS: Final[dict[str, tuple[str, ...]]] = {
     "rd_items": ("quantity",),
     "smeta_items": ("quantity", "unit_price", "total_cost"),
     "rule_evaluations": ("score_weight",),
+    "match_records": ("confidence_score", "conversion_ratio"),
+    "expert_reviews": ("adjusted_ratio",),
 }
 
 

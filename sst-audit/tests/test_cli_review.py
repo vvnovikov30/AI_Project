@@ -216,7 +216,7 @@ def test_cli_review_reject_flow_with_reason(
     match = _match(conn, match_id)
     assert match["status"] == "RESOLVED"
     assert match["rd_item_id"] is not None
-    assert match["confidence_score"] > 0
+    assert Decimal(str(match["confidence_score"])) > 0
 
     assert outcome.rejected == 1
     assert outcome.remaining == 0
