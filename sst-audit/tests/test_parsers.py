@@ -1,11 +1,12 @@
 import os
+from io import BytesIO
 from pathlib import Path
 import re
 from decimal import Decimal
 import openpyxl
 import pytest
 
-from models import UnitClass
+from models import CellPointer, NormalizedItem, UnitClass
 import parsers
 from parsers import (
     ExcelVORParser,
@@ -1502,4 +1503,320 @@ def test_get_spec_parser_selects_parser_by_suffix(tmp_path: Path) -> None:
 
     assert isinstance(parser, _StubPDFParser)
     assert parser.path.endswith("vor.PDF")
+
+
+# ==============================================================================
+# 7. ИСТОЧНИКИ В ПАМЯТИ (BytesIO), display_name И ГЕОМЕТРИЯ PDF
+# ==============================================================================
+
+
+def _lsr_workbook_bytes() -> bytes:
+    """Собирает минимальную смету 421/пр и отдает байты книги (источник в памяти)."""
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Смета"
+    worksheet.cell(row=2, column=1, value="№ п/п")
+    worksheet.cell(row=2, column=2, value="Обоснование")
+    worksheet.cell(row=2, column=3, value="Наименование работ и затрат")
+    worksheet.cell(row=2, column=6, value="Единица измерения")
+    worksheet.cell(row=2, column=7, value="Количество")
+    worksheet.cell(row=3, column=1, value="1")
+    worksheet.cell(row=3, column=2, value="ТЕР10-01-060-01")
+    worksheet.cell(row=3, column=3, value="Установка и крепление наличников")
+    worksheet.cell(row=3, column=6, value="м")
+    worksheet.cell(row=3, column=7, value="12,5")
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def _vor_workbook_bytes() -> bytes:
+    """Собирает минимальную ведомость работ с шапкой в первой строке."""
+    workbook = openpyxl.Workbook()
+    worksheet = workbook.active
+    worksheet.title = "ВОР"
+    worksheet.append(["Наименование работ", "Ед. изм.", "Кол-во"])
+    worksheet.append(["Монтаж водосточного желоба", "м", "12,5"])
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+class _PdfProbe:
+    """Двойник ``pdfplumber.open``: запоминает источник и страницы листа."""
+
+    def __init__(self, pages) -> None:
+        self._pages = list(pages)
+        self.sources: list[object] = []
+
+    def open(self, source):
+        """Возвращает контекстный менеджер вместо реального разбора PDF."""
+        self.sources.append(source)
+        probe = self
+
+        class _FakePDF:
+            pages = probe._pages
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        return _FakePDF()
+
+
+class TestParsersPackageSurface:
+    """Разбиение parsers.py на пакет не меняет точку импорта модуля."""
+
+    def test_public_classes_are_reexported(self) -> None:
+        """Классы парсеров доступны из ``parsers``, как и до разбиения."""
+        assert parsers.LSRParser.__module__ == "parsers.lsr_excel"
+        assert parsers.ExcelVORParser.__module__ == "parsers.vor_excel"
+        assert parsers.PDFSpecParser.__module__ == "parsers.spec_pdf"
+        assert parsers.PDFLSRParser.__module__ == "parsers.lsr_pdf"
+        assert callable(parsers.get_spec_parser)
+
+    def test_library_modules_are_patchable_through_package(self) -> None:
+        """Подмена ``parsers.pdfplumber.open`` действует на все модули пакета."""
+        import pdfplumber
+        import pypdfium2
+
+        assert parsers.pdfplumber is pdfplumber
+        assert parsers.pdfium is pypdfium2
+        assert parsers.openpyxl is openpyxl
+
+    def test_private_seams_are_reexported(self) -> None:
+        """Служебные классы и хелперы остаются доступны тестам и пайплайну."""
+        assert parsers._ColumnSchema.__module__ == "parsers.spec_pdf"
+        assert parsers._LSR4bLayout.__module__ == "parsers.lsr_excel"
+        assert parsers._LSRColumnLayout.__module__ == "parsers.lsr_pdf"
+        assert parsers._flush_page_cache.__module__ == "parsers.common"
+        assert callable(parsers._prepare_source)
+        assert callable(parsers._coordinate_text)
+
+
+class TestInMemorySources:
+    """Парсеры принимают BytesIO и не закрывают поток вызывающего кода."""
+
+    def test_lsr_parser_reads_xlsx_stream_with_display_name(self) -> None:
+        """Смета из потока: имя файла в CellPointer берется из display_name."""
+        stream = BytesIO(_lsr_workbook_bytes())
+        parser = LSRParser(stream, display_name="смета_upload.xlsx")
+        try:
+            items = parser.parse()
+        finally:
+            parser.close()
+
+        assert [item.volume for item in items] == [Decimal("12.5")]
+        assert parser.file_name == "смета_upload.xlsx"
+        assert items[0].pointer.file_name == "смета_upload.xlsx"
+        assert stream.closed is False
+
+    def test_lsr_parser_stream_without_display_name_uses_fallback(self) -> None:
+        """Поток без имени подписывается ``in_memory.xlsx``, а не временным путем."""
+        stream = BytesIO(_lsr_workbook_bytes())
+        stream.seek(10)  # поток может прийти с ненулевой позиции
+        parser = LSRParser(stream)
+        try:
+            items = parser.parse()
+        finally:
+            parser.close()
+
+        assert items[0].pointer.file_name == "in_memory.xlsx"
+        assert stream.closed is False
+
+    def test_excel_vor_parser_reads_xlsx_stream(self) -> None:
+        """Дефектная ведомость из потока читается read-only загрузчиком."""
+        stream = BytesIO(_vor_workbook_bytes())
+        items = ExcelVORParser(stream, display_name="вор_upload.xlsx").extract_items()
+
+        assert [item.volume for item in items] == [Decimal("12.5")]
+        assert items[0].pointer.file_name == "вор_upload.xlsx"
+        assert stream.closed is False
+
+    def test_pdf_spec_parser_reads_pdf_stream(self, monkeypatch) -> None:
+        """Спецификация из потока: pdfplumber получает буфер, поток не закрыт."""
+        table = [
+            ["№", "Наименование вида работ", "Ед.изм", "Объем работ"],
+            ["", "Монтаж водосточного желоба", "пм.", "58,3"],
+        ]
+
+        class _FakePage:
+            width = 842.0
+            height = 595.0
+
+            def extract_text(self):
+                return "ВЕДОМОСТЬ ОБЪЕМОВ РАБОТ"
+
+            def within_bbox(self, _bbox):
+                return self
+
+            def extract_table(self, _settings):
+                return table
+
+        probe = _PdfProbe([_FakePage()])
+        monkeypatch.setattr(parsers.pdfplumber, "open", probe.open)
+
+        stream = BytesIO(b"%PDF-1.7 in-memory document")
+        items = PDFSpecParser(stream, display_name="том_РД.pdf").extract_items()
+
+        assert [item.volume for item in items] == [Decimal("58.3")]
+        assert items[0].pointer.file_name == "том_РД.pdf"
+        assert probe.sources and not isinstance(probe.sources[0], (str, Path))
+        assert stream.closed is False
+
+    def test_pdf_lsr_parser_reads_pdf_stream(self, monkeypatch) -> None:
+        """Смета из векторного PDF: pdfplumber получает буфер, поток не закрыт."""
+        probe = _PdfProbe([])
+        monkeypatch.setattr(parsers.pdfplumber, "open", probe.open)
+
+        stream = BytesIO(b"%PDF-1.7 in-memory document")
+        parser = PDFLSRParser(stream, display_name="смета_upload.pdf")
+        items = parser.parse()
+
+        assert items == []
+        assert parser.file_name == "смета_upload.pdf"
+        assert probe.sources and not isinstance(probe.sources[0], (str, Path))
+        assert stream.closed is False
+
+    def test_get_spec_parser_dispatches_stream_by_display_name(self) -> None:
+        """Фабрика выбирает Excel-парсер для потока по расширению display_name."""
+        xlsx_parser = get_spec_parser(
+            BytesIO(_vor_workbook_bytes()), display_name="вор.xlsx"
+        )
+        assert isinstance(xlsx_parser, ExcelVORParser)
+        assert xlsx_parser.file_name == "вор.xlsx"
+
+        class _StubPDFParser:
+            def __init__(self, source, display_name: str | None = None) -> None:
+                self.source = source
+                self.display_name = display_name
+
+        pdf_parser = get_spec_parser(
+            BytesIO(b"%PDF-1.7"), display_name="том.pdf", pdf_parser_cls=_StubPDFParser
+        )
+        assert isinstance(pdf_parser, _StubPDFParser)
+        assert pdf_parser.display_name == "том.pdf"
+
+
+class TestCellPointerGeometryPersistence:
+    """bbox и page_meta попадают в raw_payload только при наличии геометрии."""
+
+    @staticmethod
+    def _make_item(**pointer_kwargs) -> NormalizedItem:
+        """Создает позицию ВОР с заданным аудиторским указателем."""
+        pointer = CellPointer(
+            doc_type="VOR",
+            file_name="vor.pdf",
+            sheet_name="Page 1",
+            row_idx=1,
+            col_letter="D",
+            coordinate="p.1 [row 1]",
+            **pointer_kwargs,
+        )
+        return NormalizedItem(
+            raw_id="VOR_1",
+            code=None,
+            raw_title="Монтаж водосточного желоба",
+            clean_title="монтаж водосточного желоба",
+            raw_unit="пм.",
+            canonical_unit=UnitClass.LENGTH,
+            unit_multiplier=Decimal("1.0"),
+            volume=Decimal("58.3"),
+            dimensions={},
+            context_section="Фасады",
+            pointer=pointer,
+        )
+
+    def test_geometry_is_persisted_as_strings(self) -> None:
+        """Координаты и метаданные листа сохраняются строками (Zero Float)."""
+        item = self._make_item(
+            bbox=("0", "10.5", "300", "20.25"),
+            page_meta={"width": "842.0", "height": "595.0", "rotation": 90},
+        )
+
+        pointer = item._persistence_payload()["pointer"]
+
+        assert pointer["bbox"] == ["0", "10.5", "300", "20.25"]
+        assert pointer["page_meta"] == {
+            "width": "842.0",
+            "height": "595.0",
+            "rotation": 90,
+        }
+
+    def test_legacy_payload_without_geometry_keeps_shape(self) -> None:
+        """Старые позиции не приобретают новых ключей: формат снапшота стабилен."""
+        pointer = self._make_item()._persistence_payload()["pointer"]
+
+        assert "bbox" not in pointer
+        assert "page_meta" not in pointer
+        assert pointer["file_name"] == "vor.pdf"
+
+    def test_pdf_extraction_persists_page_meta(self, monkeypatch) -> None:
+        """Метаданные листа (размеры) попадают в payload даже без bbox строк."""
+        table = [
+            ["№", "Наименование вида работ", "Ед.изм", "Объем работ"],
+            ["", "Монтаж водосточного желоба", "пм.", "58,3"],
+        ]
+
+        class _FakePage:
+            width = 842.0
+            height = 595.0
+
+            def extract_text(self):
+                return "ВЕДОМОСТЬ ОБЪЕМОВ РАБОТ"
+
+            def within_bbox(self, _bbox):
+                return self
+
+            def extract_table(self, _settings):
+                return table
+
+        probe = _PdfProbe([_FakePage()])
+        monkeypatch.setattr(parsers.pdfplumber, "open", probe.open)
+
+        items = PDFSpecParser("vor.pdf").extract_items()
+        pointer = items[0]._persistence_payload()["pointer"]
+
+        assert pointer["page_meta"] == {"width": "842.0", "height": "595.0"}
+        assert "bbox" not in pointer
+
+    def test_pdf_extraction_persists_row_bbox(self, monkeypatch) -> None:
+        """bbox строки из find_tables() сериализуется строками координат."""
+        table = [
+            ["№", "Наименование вида работ", "Ед.изм", "Объем работ"],
+            ["", "Монтаж водосточного желоба", "пм.", "58,3"],
+        ]
+
+        class _Row:
+            def __init__(self, top: float) -> None:
+                self.bbox = (10.0, top, 300.0, top + 12.5)
+
+        class _Table:
+            rows = [_Row(20.0), _Row(35.0)]
+
+            def extract(self):
+                return table
+
+        class _FakePage:
+            width = 842.0
+            height = 595.0
+
+            def extract_text(self):
+                return "ВЕДОМОСТЬ ОБЪЕМОВ РАБОТ"
+
+            def find_tables(self, _settings):
+                return [_Table()]
+
+        probe = _PdfProbe([_FakePage()])
+        monkeypatch.setattr(parsers.pdfplumber, "open", probe.open)
+
+        items = PDFSpecParser("vor.pdf").extract_items()
+
+        assert len(items) == 1
+        pointer = items[0]._persistence_payload()["pointer"]
+        # Позиция берется из второй строки таблицы (первая — шапка).
+        assert pointer["bbox"] == ["10.0", "35.0", "300.0", "47.5"]
+        assert pointer["page_meta"] == {"width": "842.0", "height": "595.0"}
 

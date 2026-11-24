@@ -50,6 +50,11 @@ class CellPointer:
     row_idx: int
     col_letter: str
     coordinate: str      # Например, 'C24' или 'p. 12 [bbox]'
+    # Геометрия строки PDF (x0, top, x1, bottom) строками: ``float`` в модели
+    # запрещен (Zero Float Policy), приводится через ``parsers.common``.
+    bbox: Optional[tuple[str, str, str, str]] = None
+    # Метаданные листа PDF: {'width': '842.0', 'height': '595.0', 'rotation': 90}.
+    page_meta: Optional[Dict[str, Any]] = None
 
 @dataclass
 class NormalizedItem:
@@ -73,9 +78,11 @@ class NormalizedItem:
         """Аудиторский след позиции для JSON-колонки ``raw_payload``.
 
         Все числовые значения сериализуются строками, чтобы не терять
-        точность ``Decimal`` при JSON-кодировании.
+        точность ``Decimal`` при JSON-кодировании. Ключи ``bbox`` и
+        ``page_meta`` добавляются только когда геометрия действительно
+        извлечена: формат старых снапшотов не меняется.
         """
-        return {
+        payload: Dict[str, Any] = {
             "raw_id": self.raw_id,
             "raw_title": self.raw_title,
             "clean_title": self.clean_title,
@@ -96,6 +103,12 @@ class NormalizedItem:
                 "coordinate": self.pointer.coordinate,
             },
         }
+        pointer = payload["pointer"]
+        if self.pointer.bbox is not None:
+            pointer["bbox"] = list(self.pointer.bbox)
+        if self.pointer.page_meta is not None:
+            pointer["page_meta"] = dict(self.pointer.page_meta)
+        return payload
 
     def to_rd_record(self) -> Dict[str, Any]:
         """Экспорт позиции РД в запись для ``db.save_rd_items()``.
