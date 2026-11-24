@@ -1,8 +1,8 @@
 """Интерактивный терминальный интерфейс сметчика (HITL) на базе Rich.
 
-Модуль читает очередь ``HITL_PENDING`` из SQLite (SSOT), показывает карточку
-сравнения РД и сметы и фиксирует экспертное решение в ``expert_reviews``.
-После разбора очереди сессия переводится в статус ``REVIEWED``.
+Тонкий слой представления: вся доменная логика (очередь, расчет дельт,
+запись решений и журнала арбитража) живет в ``review_service``. Модуль
+отвечает только за отрисовку карточки, диалог с оператором и CLI-аргументы.
 
 Запуск::
 
@@ -13,9 +13,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
-from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-import json
 from pathlib import Path
 import sqlite3
 from typing import Final, Optional
@@ -26,134 +24,24 @@ from rich.table import Table
 from rich.text import Text
 
 import db
-from evaluator import DiscrepancyDetector
-from matcher import CascadeMatcher
-from models import CellPointer, NormalizedItem, UnitClass
-from normalizer import DimensionLockExtractor, UnitNormalizer
-
-DEFAULT_REVIEWER: Final[str] = "estimator_cli"
-LATEST_SESSION: Final[str] = "latest"
-CONFIDENCE_WARN_THRESHOLD: Final[Decimal] = Decimal("50.0")
-# Синхронизировано с main.MIN_MATCH_THRESHOLD: шум ниже 40% не показываем.
-MIN_CANDIDATE_SCORE: Final[Decimal] = Decimal("40.0")
-MAX_CANDIDATES: Final[int] = 3
-ONE: Final[Decimal] = Decimal("1.0")
-PERCENT: Final[Decimal] = Decimal("100")
-
-# Коды причин отклонения: клавиша -> (код в БД, пояснение для сметчика).
-REJECT_REASONS: Final[dict[str, tuple[str, str]]] = {
-    "1": ("SEMANTIC_MISMATCH", "Семантика: описание относится к другому ресурсу"),
-    "2": ("UNIT_MULTIPLICITY", "Единицы измерения или кратность (например, 100 м)"),
-    "3": ("PARSER_ERROR", "Ошибка парсера: данные извлечены неверно"),
-    "4": ("OTHER", "Иное (уточните комментарием)"),
-}
-VALID_COMMANDS: Final[frozenset[str]] = frozenset(
-    {"1", "2", "3", "A", "R", "C", "S", "Q"}
+import review_service
+from review_service import (
+    CONFIDENCE_WARN_THRESHOLD,
+    DEFAULT_REVIEWER,
+    LATEST_SESSION,
+    PERCENT,
+    REJECT_REASONS,
+    VALID_COMMANDS,
+    CandidateMatch,
+    ReviewCard,
+    ReviewOutcome,
 )
-CLOSED_SESSION_STATUSES: Final[frozenset[str]] = frozenset({"REVIEWED", "EXPORTED"})
 
-
-@dataclass(frozen=True)
-class CandidateMatch:
-    """Кандидат РД для выбора сметчиком (score >= 40%)."""
-
-    rd_item_id: int
-    score: Decimal
-    description: str
-    unit: str
-    quantity: Decimal
-
-
-@dataclass(frozen=True)
-class ReviewCard:
-    """Данные карточки сравнения одной связи для терминального ревью."""
-
-    match_id: int
-    index: int
-    total: int
-    confidence: Decimal
-    conversion_ratio: Decimal
-    rd_code: Optional[str]
-    rd_description: Optional[str]
-    rd_unit: Optional[str]
-    rd_quantity: Optional[Decimal]
-    smeta_code: Optional[str]
-    smeta_description: Optional[str]
-    smeta_unit: Optional[str]
-    smeta_quantity: Optional[Decimal]
-    unit_price: Optional[Decimal]
-    total_cost: Optional[Decimal]
-    candidates: tuple[CandidateMatch, ...] = ()
-
-    @property
-    def is_paired(self) -> bool:
-        """Признак наличия обеих сторон связи (РД и позиция сметы)."""
-        return self.rd_quantity is not None and self.smeta_quantity is not None
-
-    @property
-    def waste_coefficient(self) -> Decimal:
-        """Норматив технологических отходов по наименованию позиции сметы."""
-        title = (self.smeta_description or "").lower()
-        coefficients = DiscrepancyDetector.WASTE_COEFFICIENTS
-        if "арматур" in title:
-            return coefficients["REBAR"]
-        if "бетон" in title:
-            return coefficients["CONCRETE"]
-        if "кабел" in title:
-            return coefficients["CABLE"]
-        return coefficients["DEFAULT"]
-
-    def adjusted_rd_volume(self, ratio: Optional[Decimal] = None) -> Optional[Decimal]:
-        """Объем РД с учетом коэффициента приведения и норматива отходов."""
-        if self.rd_quantity is None:
-            return None
-        effective_ratio = self.conversion_ratio if ratio is None else ratio
-        return self.rd_quantity * effective_ratio * (ONE + self.waste_coefficient)
-
-    def delta_volume(self, ratio: Optional[Decimal] = None) -> Optional[Decimal]:
-        """Дельта объема: смета минус приведенный объем РД (>0 — завышение)."""
-        adjusted = self.adjusted_rd_volume(ratio)
-        if adjusted is None or self.smeta_quantity is None:
-            return None
-        return self.smeta_quantity - adjusted
-
-    def allowed_delta(self, ratio: Optional[Decimal] = None) -> Optional[Decimal]:
-        """Допустимое расхождение по регламенту ``DiscrepancyDetector``."""
-        adjusted = self.adjusted_rd_volume(ratio)
-        if adjusted is None:
-            return None
-        return (
-            DiscrepancyDetector.ABS_TOLERANCE
-            + DiscrepancyDetector.REL_TOLERANCE * adjusted
-        )
-
-    def delta_cost(self, ratio: Optional[Decimal] = None) -> Optional[Decimal]:
-        """Стоимостная оценка расхождения, если в смете заполнена цена."""
-        if self.unit_price is None or self.unit_price == 0:
-            return None
-        delta = self.delta_volume(ratio)
-        if delta is None:
-            return None
-        return delta * self.unit_price
-
-
-@dataclass(frozen=True)
-class ReviewOutcome:
-    """Итоги сеанса ревью."""
-
-    session_id: str
-    total: int
-    approved: int
-    rejected: int
-    adjusted: int
-    skipped: int
-    remaining: int
-    session_status: str
-
-    @property
-    def processed(self) -> int:
-        """Количество записей, по которым сохранено решение."""
-        return self.approved + self.rejected + self.adjusted
+# Константы и модели домена реэкспортируются из review_service: внешний код
+# (тесты, скрипты) продолжает импортировать их из cli_review без изменений.
+CLOSED_SESSION_STATUSES: Final[frozenset[str]] = (
+    review_service.CLOSED_SESSION_STATUSES
+)
 
 
 # ----------------------------------------------------------------------
@@ -161,251 +49,25 @@ class ReviewOutcome:
 # ----------------------------------------------------------------------
 
 
-def _to_decimal(value: object) -> Decimal:
-    """Приводит значение SQLite (REAL/TEXT) к Decimal без потери точности."""
-    if value is None:
-        return Decimal("0")
-    if isinstance(value, Decimal):
-        return value
-    return Decimal(str(value))
-
-
-def _optional_decimal(value: object) -> Optional[Decimal]:
-    """Возвращает Decimal либо None (для отсутствующей стороны связи)."""
-    if value is None:
-        return None
-    return _to_decimal(value)
-
-
-def _text_or_none(value: object) -> Optional[str]:
-    """Нормализует текстовое поле: пустые строки превращает в None."""
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def _format_quantity(value: Optional[Decimal]) -> str:
-    """Форматирует количество без экспоненты и лишних нулей."""
-    if value is None:
-        return "—"
-    try:
-        quantized = value.quantize(Decimal("0.001"))
-    except InvalidOperation:
-        return f"{value:f}"
-    if quantized == 0:
-        return "0"
-    text = f"{quantized:f}"
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    return text
-
-
-def _format_ratio(value: Decimal) -> str:
-    """Форматирует коэффициент приведения с четырьмя знаками."""
-    return f"{value:.4f}"
-
-
-def _format_money(value: Optional[Decimal]) -> str:
-    """Форматирует денежное значение."""
-    if value is None:
-        return "—"
-    return f"{value:,.2f}"
-
-
-def _format_percent(value: Optional[Decimal], *, signed: bool = False) -> str:
-    """Форматирует процент."""
-    if value is None:
-        return "—"
-    return f"{value:+.2f}%" if signed else f"{value:.2f}%"
-
-
-def _format_delta(value: Optional[Decimal]) -> str:
-    """Форматирует дельту объема со знаком."""
-    if value is None:
-        return "—"
-    return f"{value:+.3f}"
-
-
 def _confidence_style(score: Decimal) -> str:
     """Цвет заголовка карточки: красный для низкой уверенности."""
     return "red" if score < CONFIDENCE_WARN_THRESHOLD else "yellow"
 
 
-def _verdict(card: ReviewCard, ratio: Optional[Decimal] = None) -> tuple[str, str]:
-    """Текст и стиль вердикта по количественному расхождению."""
-    delta = card.delta_volume(ratio)
-    allowed = card.allowed_delta(ratio)
-    if delta is None or allowed is None:
-        return "Расчет недоступен: отсутствует пара РД/смета", "dim"
-    if abs(delta) > allowed:
-        if delta > 0:
-            return "Завышение объема в смете", "red"
-        return "Занижение объема относительно РД", "yellow"
-    return "В пределах допуска", "green"
-
-
-def _payload_from_row(row: sqlite3.Row) -> dict[str, object]:
-    """Читает аудиторский JSON-след позиции, устойчиво к старым записям."""
-    raw = row["raw_payload"]
-    if not raw:
-        return {}
-    try:
-        payload = json.loads(raw)
-    except (TypeError, ValueError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def _normalized_from_row(
-    row: sqlite3.Row,
-    *,
-    is_smeta: bool,
-) -> NormalizedItem:
-    """Восстанавливает ``NormalizedItem`` из строки SSOT для пересчета score."""
-    payload = _payload_from_row(row)
-    quantity = _to_decimal(row["quantity"]) or Decimal("0")
-    raw_unit = str(payload.get("raw_unit") or row["unit"] or "")
-    raw_title = str(payload.get("raw_title") or row["description"] or "")
-
-    canonical_value = payload.get("canonical_unit")
-    try:
-        canonical_unit = UnitClass(str(canonical_value))
-    except ValueError:
-        canonical_unit, _, _ = UnitNormalizer.normalize(raw_unit, quantity)
-
-    multiplier_value = payload.get("unit_multiplier")
-    if multiplier_value is not None:
-        try:
-            unit_multiplier = Decimal(str(multiplier_value))
-        except InvalidOperation:
-            unit_multiplier = Decimal("1.0")
-    else:
-        _, _, unit_multiplier = UnitNormalizer.normalize(raw_unit, quantity)
-
-    dimensions_raw = payload.get("dimensions")
-    dimensions = (
-        {str(key): str(value) for key, value in dimensions_raw.items()}
-        if isinstance(dimensions_raw, dict)
-        else DimensionLockExtractor.extract(raw_title)
-    )
-
-    pointer_raw = payload.get("pointer")
-    pointer_payload = pointer_raw if isinstance(pointer_raw, dict) else {}
-    pointer = CellPointer(
-        doc_type=str(
-            pointer_payload.get("doc_type") or ("LSR" if is_smeta else "SPECIFICATION")
-        ),
-        file_name=str(pointer_payload.get("file_name") or ""),
-        sheet_name=str(pointer_payload.get("sheet_name") or ""),
-        row_idx=int(pointer_payload.get("row_idx") or 1),
-        col_letter=str(pointer_payload.get("col_letter") or "A"),
-        coordinate=str(pointer_payload.get("coordinate") or "—"),
-    )
-
-    unit_price = (
-        _optional_decimal(row["unit_price"])
-        if is_smeta and "unit_price" in row.keys()
-        else None
-    )
-    total_cost = (
-        _optional_decimal(row["total_cost"])
-        if is_smeta and "total_cost" in row.keys()
-        else None
-    )
-
-    return NormalizedItem(
-        raw_id=str(payload.get("raw_id") or f"DB_{row['id']}"),
-        code=_text_or_none(row["code"]),
-        raw_title=raw_title,
-        clean_title=str(payload.get("clean_title") or raw_title.lower()),
-        raw_unit=raw_unit,
-        canonical_unit=canonical_unit,
-        unit_multiplier=unit_multiplier,
-        volume=quantity,
-        dimensions=dimensions,
-        context_section=str(payload.get("context_section") or "Default_Section"),
-        pointer=pointer,
-        is_resource=bool(payload.get("is_resource", is_smeta)),
-        parent_id=(
-            str(payload["parent_id"]) if payload.get("parent_id") is not None else None
-        ),
-        unit_price=unit_price,
-        total_cost=total_cost,
-    )
-
-
-def _candidates_for_row(
-    conn: sqlite3.Connection,
-    row: sqlite3.Row,
-) -> tuple[CandidateMatch, ...]:
-    """Возвращает top-3 кандидатов РД со score >= ``MIN_CANDIDATE_SCORE``."""
-    smeta_item_id = row["smeta_item_id"]
-    if smeta_item_id is None:
-        return ()
-
-    smeta_row = conn.execute(
-        "SELECT * FROM smeta_items WHERE id = ?",
-        (int(smeta_item_id),),
-    ).fetchone()
-    if smeta_row is None:
-        return ()
-
-    rd_rows = conn.execute(
-        "SELECT * FROM rd_items WHERE session_id = ? ORDER BY id ASC",
-        (str(row["session_id"]),),
-    ).fetchall()
-    if not rd_rows:
-        return ()
-
-    smeta_item = _normalized_from_row(smeta_row, is_smeta=True)
-    scored: list[tuple[NormalizedItem, Decimal, sqlite3.Row]] = []
-    for rd_row in rd_rows:
-        rd_item = _normalized_from_row(rd_row, is_smeta=False)
-        score = Decimal(str(CascadeMatcher.calculate_score(smeta_item, rd_item)))
-        if score >= MIN_CANDIDATE_SCORE:
-            scored.append((rd_item, score, rd_row))
-
-    scored.sort(key=lambda entry: entry[1], reverse=True)
-    return tuple(
-        CandidateMatch(
-            rd_item_id=int(rd_row["id"]),
-            score=score,
-            description=str(rd_row["description"] or ""),
-            unit=str(rd_row["unit"] or ""),
-            quantity=_to_decimal(rd_row["quantity"]) or Decimal("0"),
-        )
-        for _, score, rd_row in scored[:MAX_CANDIDATES]
-    )
-
-
-def _card_from_row(
-    row: sqlite3.Row,
-    *,
-    index: int,
-    total: int,
-    candidates: Sequence[CandidateMatch] = (),
-) -> ReviewCard:
-    """Собирает карточку из строки ``PENDING_REVIEWS_SQL``."""
-    conversion = row["conversion_ratio"]
-    return ReviewCard(
-        match_id=int(row["match_id"]),
-        index=index,
-        total=total,
-        confidence=_to_decimal(row["confidence_score"]),
-        conversion_ratio=(ONE if conversion is None else _to_decimal(conversion)),
-        rd_code=_text_or_none(row["rd_code"]),
-        rd_description=_text_or_none(row["rd_description"]),
-        rd_unit=_text_or_none(row["rd_unit"]),
-        rd_quantity=_optional_decimal(row["rd_quantity"]),
-        smeta_code=_text_or_none(row["smeta_code"]),
-        smeta_description=_text_or_none(row["smeta_description"]),
-        smeta_unit=_text_or_none(row["smeta_unit"]),
-        smeta_quantity=_optional_decimal(row["smeta_quantity"]),
-        unit_price=_optional_decimal(row["unit_price"]),
-        total_cost=_optional_decimal(row["total_cost"]),
-        candidates=tuple(candidates),
-    )
+# Доменные хелперы — единые реализации из review_service (без дублирования).
+_to_decimal = review_service._to_decimal
+_optional_decimal = review_service._optional_decimal
+_text_or_none = review_service._text_or_none
+_format_quantity = review_service.format_quantity
+_format_ratio = review_service.format_ratio
+_format_money = review_service.format_money
+_format_percent = review_service.format_percent
+_format_delta = review_service.format_delta
+_verdict = review_service.verdict
+_payload_from_row = review_service._payload_from_row
+_normalized_from_row = review_service._normalized_from_row
+_candidates_for_row = review_service.candidates_for_row
+_card_from_row = review_service._card_from_row
 
 
 # ----------------------------------------------------------------------
@@ -631,101 +293,10 @@ def _prompt_ratio(console: Console) -> Optional[Decimal]:
 # ----------------------------------------------------------------------
 
 
-def _apply_approval(
-    conn: sqlite3.Connection,
-    card: ReviewCard,
-    reviewer: str,
-) -> None:
-    """Фиксирует подтверждение связи (для записи без пары — отсутствие пары)."""
-    comment = None if card.is_paired else "Подтверждено отсутствие пары РД/смета"
-    with db.transaction(conn):
-        db.record_expert_review(
-            conn,
-            card.match_id,
-            reviewer,
-            "APPROVED",
-            comment=comment,
-        )
-
-
-def _apply_candidate_selection(
-    conn: sqlite3.Connection,
-    card: ReviewCard,
-    candidate: CandidateMatch,
-    position: int,
-    reviewer: str,
-) -> None:
-    """Фиксирует выбор сметчиком одного из top-3 кандидатов РД."""
-    comment = f"Выбран кандидат №{position}: {candidate.description}"
-    with db.transaction(conn):
-        db.update_match_link(
-            conn,
-            card.match_id,
-            candidate.rd_item_id,
-            candidate.score,
-        )
-        db.record_expert_review(
-            conn,
-            card.match_id,
-            reviewer,
-            "APPROVED",
-            comment=comment,
-        )
-
-
-def _apply_rejection(
-    conn: sqlite3.Connection,
-    card: ReviewCard,
-    reviewer: str,
-    reason_code: str,
-    comment: Optional[str],
-) -> None:
-    """Фиксирует отклонение связи, сохраняя лучшего кандидата (top-1).
-
-    Связь с РД не обнуляется: эксперт фиксирует ошибочность сопоставления,
-    но ``rd_item_id`` остается для трассируемости и последующего разбора.
-    """
-    with db.transaction(conn):
-        if card.candidates:
-            top = card.candidates[0]
-            db.update_match_link(
-                conn,
-                card.match_id,
-                top.rd_item_id,
-                top.score,
-            )
-        db.record_expert_review(
-            conn,
-            card.match_id,
-            reviewer,
-            "REJECTED",
-            reason_code=reason_code,
-            comment=comment,
-        )
-
-
-def _apply_adjustment(
-    conn: sqlite3.Connection,
-    card: ReviewCard,
-    reviewer: str,
-    ratio: Decimal,
-) -> Optional[Decimal]:
-    """Сохраняет скорректированный коэффициент и новую дельту в аудит."""
-    delta = card.delta_volume(ratio)
-    comment = (
-        f"Коэффициент приведения: {_format_ratio(card.conversion_ratio)} -> "
-        f"{_format_ratio(ratio)}; дельта объема: {_format_delta(delta)}"
-    )
-    with db.transaction(conn):
-        db.record_expert_review(
-            conn,
-            card.match_id,
-            reviewer,
-            "ADJUSTED",
-            adjusted_ratio=ratio,
-            comment=comment,
-        )
-    return delta
+_apply_approval = review_service.apply_approval
+_apply_candidate_selection = review_service.apply_candidate_selection
+_apply_rejection = review_service.apply_rejection
+_apply_adjustment = review_service.apply_adjustment
 
 
 # ----------------------------------------------------------------------
@@ -733,52 +304,8 @@ def _apply_adjustment(
 # ----------------------------------------------------------------------
 
 
-def resolve_session_id(conn: sqlite3.Connection, session: str) -> str:
-    """Возвращает ID сессии; ``latest`` — последняя созданная сессия."""
-    value = (session or "").strip()
-    if value.lower() == LATEST_SESSION:
-        row = conn.execute(
-            "SELECT id FROM sessions ORDER BY created_at DESC, rowid DESC LIMIT 1"
-        ).fetchone()
-        if row is None:
-            raise LookupError("В базе нет ни одной сессии аудита.")
-        return str(row["id"])
-
-    row = conn.execute("SELECT id FROM sessions WHERE id = ?", (value,)).fetchone()
-    if row is None:
-        raise LookupError(f"Сессия '{value}' не найдена.")
-    return str(row["id"])
-
-
-def _finalize_session(conn: sqlite3.Connection, session_id: str) -> str:
-    """Переводит сессию в ``REVIEWED``, если очередь HITL полностью разобрана."""
-    row = conn.execute(
-        "SELECT status FROM sessions WHERE id = ?", (session_id,)
-    ).fetchone()
-    if row is None:
-        raise LookupError(f"Сессия '{session_id}' не найдена.")
-    current_status = str(row["status"])
-
-    total_matches = conn.execute(
-        "SELECT COUNT(*) AS c FROM match_records WHERE session_id = ?",
-        (session_id,),
-    ).fetchone()["c"]
-    open_matches = conn.execute(
-        """
-        SELECT COUNT(*) AS c FROM match_records
-        WHERE session_id = ? AND status NOT IN ('AUTO', 'RESOLVED')
-        """,
-        (session_id,),
-    ).fetchone()["c"]
-
-    if (
-        int(total_matches) > 0
-        and int(open_matches) == 0
-        and current_status not in CLOSED_SESSION_STATUSES
-    ):
-        db.update_session_status(conn, session_id, "REVIEWED")
-        return "REVIEWED"
-    return current_status
+resolve_session_id = review_service.resolve_session_id
+_finalize_session = review_service.finalize_session
 
 
 def _render_summary(console: Console, outcome: ReviewOutcome) -> None:
@@ -817,8 +344,9 @@ def run_review(
     reviewer = reviewer.strip()
     console = console or Console()
 
-    pending = db.get_pending_reviews(conn, session_id)
-    if not pending:
+    # Пакетная загрузка: 3 SQL-запроса независимо от длины очереди (без N+1).
+    cards = review_service.load_pending_cards(conn, session_id)
+    if not cards:
         console.print(
             Panel(
                 "Очередь HITL пуста. Все позиции верифицированы",
@@ -839,19 +367,13 @@ def run_review(
             session_status=session_status,
         )
 
-    total = len(pending)
+    total = len(cards)
     approved = 0
     rejected = 0
     adjusted = 0
     skipped = 0
 
-    for index, row in enumerate(pending, start=1):
-        card = _card_from_row(
-            row,
-            index=index,
-            total=total,
-            candidates=_candidates_for_row(conn, row),
-        )
+    for card in cards:
         render_card(console, card)
         quit_requested = False
 
@@ -932,7 +454,7 @@ def run_review(
             )
             break
 
-    remaining = len(db.get_pending_reviews(conn, session_id))
+    remaining = review_service.pending_count(conn, session_id)
     session_status = _finalize_session(conn, session_id)
     outcome = ReviewOutcome(
         session_id=session_id,

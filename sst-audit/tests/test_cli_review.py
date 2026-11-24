@@ -15,6 +15,8 @@ from rich.console import Console
 import pytest
 
 import db
+import cli_review
+import review_service
 from cli_review import DEFAULT_REVIEWER, resolve_session_id, run_review
 
 SESSION_ID = "cli-session-001"
@@ -318,4 +320,70 @@ def test_resolve_session_id_latest_and_explicit(
 
     with pytest.raises(LookupError):
         resolve_session_id(conn, "missing-session")
+
+
+def test_cli_reexports_service_layer_symbols() -> None:
+    """CLI остается совместимым: доменные функции — реэкспорт из сервиса."""
+    assert cli_review._apply_approval is review_service.apply_approval
+    assert (
+        cli_review._apply_candidate_selection
+        is review_service.apply_candidate_selection
+    )
+    assert cli_review._apply_rejection is review_service.apply_rejection
+    assert cli_review._apply_adjustment is review_service.apply_adjustment
+    assert cli_review._finalize_session is review_service.finalize_session
+    assert cli_review.resolve_session_id is review_service.resolve_session_id
+    assert cli_review._candidates_for_row is review_service.candidates_for_row
+    assert cli_review._card_from_row is review_service._card_from_row
+    assert cli_review._format_ratio is review_service.format_ratio
+    assert cli_review._format_delta is review_service.format_delta
+    assert cli_review._verdict is review_service.verdict
+    assert cli_review.ReviewCard is review_service.ReviewCard
+    assert cli_review.ReviewOutcome is review_service.ReviewOutcome
+    assert cli_review.CandidateMatch is review_service.CandidateMatch
+    assert cli_review.REJECT_REASONS is review_service.REJECT_REASONS
+    assert DEFAULT_REVIEWER == review_service.DEFAULT_REVIEWER
+
+
+def test_cli_review_approve_writes_arbitration_event(
+    conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Поток A пишет REVIEW_APPROVED в append-only журнал арбитража."""
+    match_id = _seed_session(conn)
+    assert match_id is not None
+    _feed(monkeypatch, "A")
+    console, _ = _console()
+
+    run_review(conn, SESSION_ID, reviewer="ivanov", console=console)
+
+    events = db.get_arbitration_events(conn, SESSION_ID, match_id)
+    assert [event["action"] for event in events] == ["REVIEW_APPROVED"]
+    assert events[0]["actor"] == "ivanov"
+
+
+def test_cli_review_uses_service_layer_queue_loader(
+    conn: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLI загружает карточки через сервис, а не отдельными запросами."""
+    match_id = _seed_session(conn)
+    assert match_id is not None
+    calls: list[str] = []
+    original = review_service.load_pending_cards
+
+    def _tracked(connection, session_id, **kwargs):
+        calls.append(session_id)
+        # Trace-хук CLI не передает, но сервис обязан вернуть очередь целиком.
+        return original(connection, session_id, **kwargs)
+
+    monkeypatch.setattr(review_service, "load_pending_cards", _tracked)
+    _feed(monkeypatch, "S")
+    console, stream = _console()
+
+    outcome = run_review(conn, SESSION_ID, console=console)
+
+    assert calls == [SESSION_ID]
+    assert outcome.remaining == 1
+    assert "Связь #" in stream.getvalue()
 
